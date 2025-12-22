@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ai-agent-history-rag.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV_PATH__</string>
+        <string>--directory</string>
+        <string>__PROJECT_DIR__</string>
+        <string>run</string>
+        <string>ai-agent-history-rag-daemon</string>
+        <string>start</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Client mode: uncomment and set your server URL -->
+        <!--
+        <key>CLAUDE_HISTORY_RAG_SERVER_URL</key>
+        <string>http://your-server:8765</string>
+        <key>CLAUDE_HISTORY_RAG_MACHINE_ID</key>
+        <string>my-mac</string>
+        -->
+
+        <!-- Server mode: configure embedding server -->
+        <key>CLAUDE_RAG_EMBEDDING_BASE_URL</key>
+        <string>http://localhost:11434/v1</string>
+        <key>CLAUDE_RAG_EMBEDDING_MODEL</key>
+        <string>nomic-embed-text</string>
+        <key>CLAUDE_RAG_BATCH_SIZE</key>
+        <string>32</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude-history-rag/launchd-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude-history-rag/launchd-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+</dict>
+</plist>

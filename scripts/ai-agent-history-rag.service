@@ -1,0 +1,40 @@
+# Linux systemd service for ai-agent-history-rag daemon
+#
+# Installation:
+#   1. Edit this file to set your paths and environment variables
+#   2. Copy to: ~/.config/systemd/user/ai-agent-history-rag.service
+#   3. Run: systemctl --user daemon-reload
+#   4. Run: systemctl --user enable --now ai-agent-history-rag
+#
+# Commands:
+#   Status:  systemctl --user status ai-agent-history-rag
+#   Logs:    journalctl --user -u ai-agent-history-rag -f
+#   Stop:    systemctl --user stop ai-agent-history-rag
+#   Start:   systemctl --user start ai-agent-history-rag
+#   Restart: systemctl --user restart ai-agent-history-rag
+
+[Unit]
+Description=AI Agent History RAG Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/uv --directory %h/path/to/claude-history-rag-mcp run ai-agent-history-rag-daemon start
+Restart=on-failure
+RestartSec=10
+
+# Environment variables - uncomment and edit as needed
+# Client mode (connects to central server):
+#Environment="CLAUDE_HISTORY_RAG_SERVER_URL=http://your-server:8765"
+#Environment="CLAUDE_HISTORY_RAG_MACHINE_ID=my-machine"
+
+# Server mode (local embeddings):
+#Environment="CLAUDE_RAG_EMBEDDING_BASE_URL=http://localhost:11434/v1"
+#Environment="CLAUDE_RAG_EMBEDDING_MODEL=nomic-embed-text"
+
+# Common settings:
+#Environment="CLAUDE_RAG_BATCH_SIZE=32"
+#Environment="CLAUDE_RAG_LOG_LEVEL=INFO"
+
+[Install]
+WantedBy=default.target

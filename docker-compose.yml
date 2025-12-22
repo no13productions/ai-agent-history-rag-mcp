@@ -1,0 +1,58 @@
+# Claude History RAG Server - Docker Compose
+#
+# Prerequisites: An OpenAI-compatible embedding server (Ollama, vLLM, etc.)
+#   ollama serve && ollama pull bge-m3
+#
+# Quick start:
+#   docker compose up -d
+#
+# Dashboard: http://localhost:4680/dashboard
+# API: http://localhost:4680/api/
+
+services:
+  ai-agent-history-rag-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-agent-history-rag-server
+    environment:
+      # Embedding configuration - points to host machine's Ollama
+      # Use host.docker.internal on Mac/Windows, or host IP on Linux
+      - CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL=${CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL:?Set in .env}
+      - CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=${CLAUDE_HISTORY_RAG_EMBEDDING_MODEL:-bge-m3}
+      - CLAUDE_HISTORY_RAG_EMBEDDING_API_KEY=${CLAUDE_HISTORY_RAG_EMBEDDING_API_KEY:-}
+      # Server configuration
+      - CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=0.0.0.0
+      - CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT=4680
+      # Database paths (inside container)
+      - CLAUDE_HISTORY_RAG_DB_PATH=/data/db/lancedb
+      - CLAUDE_HISTORY_RAG_STATE_PATH=/data/state/state.json
+      - CLAUDE_HISTORY_RAG_AUTH_STATE_PATH=/data/state/auth.json
+      # Auth (PSK)
+      - CLAUDE_HISTORY_RAG_AUTH_ENABLED=${CLAUDE_HISTORY_RAG_AUTH_ENABLED:-true}
+      - CLAUDE_HISTORY_RAG_SERVER_PSK=${CLAUDE_HISTORY_RAG_SERVER_PSK:-}
+      # Performance tuning
+      - CLAUDE_HISTORY_RAG_BATCH_SIZE=${CLAUDE_HISTORY_RAG_BATCH_SIZE:-32}
+      - CLAUDE_HISTORY_RAG_LOG_LEVEL=${CLAUDE_HISTORY_RAG_LOG_LEVEL:-INFO}
+    volumes:
+      # Persistent data (LanceDB, state)
+      - ai-agent-history-rag-db:/data/db
+      - ai-agent-history-rag-state:/data/state
+    ports:
+      - "${CLAUDE_HISTORY_RAG_PORT:-4680}:4680"
+    extra_hosts:
+      # Allow container to reach host's localhost (Linux)
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -z \"$CLAUDE_HISTORY_RAG_AUTH_ENABLED\" ] || [ \"$CLAUDE_HISTORY_RAG_AUTH_ENABLED\" = \"false\" ]; then curl -fsS http://localhost:4680/health; elif [ -n \"$CLAUDE_HISTORY_RAG_SERVER_PSK\" ]; then curl -fsS -H \"Authorization: Bearer $CLAUDE_HISTORY_RAG_SERVER_PSK\" http://localhost:4680/health; else exit 1; fi"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  ai-agent-history-rag-db:
+    name: ai-agent-history-rag-db
+  ai-agent-history-rag-state:
+    name: ai-agent-history-rag-state

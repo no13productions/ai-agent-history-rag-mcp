@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ai-agent-history-rag.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brandon/.local/bin/uv</string>
+        <string>--directory</string>
+        <string>/Users/brandon/develop/claude-history-rag-mcp</string>
+        <string>run</string>
+        <string>ai-agent-history-rag-daemon</string>
+        <string>start</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_HISTORY_RAG_OLLAMA_HOST</key>
+        <string>http://192.168.4.204:11434</string>
+        <key>CLAUDE_HISTORY_RAG_OLLAMA_MODEL</key>
+        <string>bge-m3</string>
+        <key>CLAUDE_HISTORY_RAG_BATCH_SIZE</key>
+        <string>64</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brandon/.claude-history-rag/launchd-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/brandon/.claude-history-rag/launchd-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brandon/develop/claude-history-rag-mcp</string>
+</dict>
+</plist>
