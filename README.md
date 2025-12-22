@@ -838,6 +838,18 @@ All checks passed!
 2. View pending uploads: `cat ~/.claude-history-rag/client_state.json`
 3. Stale uploads (>72h) are automatically cleared
 
+## Wish List
+
+The project roadmap includes a major refactor to introduce a **Storage Abstraction Layer** to decouple the system from LanceDB and provide flexible deployment options:
+
+- **Storage Abstraction Layer**: Interface to support multiple vector store backends.
+- **Backend Options**:
+  - **SQLite + sqlite-vec**: Zero-dependency embedded option (ideal for single-user/all-in-one).
+  - **Qdrant**: High-performance option (via sidecar container) for power users.
+  - **LanceDB**: Maintain current support as a high-throughput embedded option.
+- **Cloud Integration**: Direct connection to managed cloud vector databases.
+- **Management Dashboard**: Unified UI to manage storage backends, configure remote endpoints, and visualize usage.
+
 ## License
 
 MIT
