@@ -682,14 +682,37 @@ class VectorStore:
         if row_count >= VECTOR_INDEX_THRESHOLD:
             self.create_vector_index()
 
-        # Compact the table to reclaim space
+        # Compact files and clean up old versions
         try:
-            table.compact_files()
-            logger.info("Compacted table files")
-        except Exception as e:
-            logger.warning(f"Failed to compact files: {type(e).__name__}")
+            from datetime import timedelta
 
-        logger.info("Store optimization complete")
+            # Use new optimize API which handles both compaction and cleanup
+            # This replaces the deprecated compact_files() and cleanup_old_versions()
+            cleanup_seconds = settings.optimization_cleanup_older_than_seconds
+            delete_unverified = settings.optimization_delete_unverified
+
+            logger.info(
+                f"Running optimization (cleanup_older_than={cleanup_seconds}s, "
+                f"delete_unverified={delete_unverified})"
+            )
+
+            table.optimize(
+                cleanup_older_than=timedelta(seconds=cleanup_seconds),
+                delete_unverified=delete_unverified,
+            )
+            logger.info("Database optimization complete")
+        except Exception as e:
+            logger.warning(
+                f"Validation during optimization failed (this is expected if files are changing): {e}"
+            )
+            # Fallback to simple compaction if full optimization fails
+            try:
+                table.compact_files()
+                logger.info("Fallback: Compacted table files")
+            except Exception as compact_err:
+                logger.warning(f"Fallback compaction also failed: {compact_err}")
+
+        logger.info("Store optimization routine finished")
 
     async def optimize_async(self) -> None:
         """Optimize the database asynchronously."""

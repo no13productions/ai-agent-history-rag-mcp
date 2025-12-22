@@ -10,8 +10,8 @@ from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
 
-# Optimization interval in seconds (1 hour)
-OPTIMIZE_INTERVAL = 3600
+# Optimization interval in seconds (15 minutes)
+OPTIMIZE_INTERVAL = 900
 
 
 def _validate_path_safe(path: Path, allowed_prefixes: list[Path]) -> Path:
@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     gc_after_files: bool = True  # Enable garbage collection after file batches
     defer_startup_indexing: bool = False  # If True, skip initial indexing on startup
     startup_indexing_delay_ms: int = 0  # Delay between files during startup (ms, 0=no delay)
+
+    # Optimization Settings
+    optimization_cleanup_older_than_seconds: int = 3600  # Default 1 hour
+    optimization_delete_unverified: bool = True  # Default to True to reclaim space aggressively
 
     # ============================================================
     # Status Server Settings
