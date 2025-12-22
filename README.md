@@ -840,4 +840,4 @@ All checks passed!
 
 ## License
 
-THIS IS NOT CURRENLTY LICENSABLE
+MIT
