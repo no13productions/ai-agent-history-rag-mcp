@@ -5,7 +5,7 @@ import socket
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-from pydantic import ConfigDict, field_validator, model_validator
+from pydantic import ConfigDict, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,21 @@ def _get_default_machine_id() -> str:
 class Settings(BaseSettings):
     """Application settings from environment variables."""
 
-    db_path: Path = Path.home() / ".claude-history-rag" / "lancedb"
+    # Storage Settings
+    storage_backend: str = "sqlite"  # "sqlite" or "qdrant"
+    
+    # SQLite Settings
+    sqlite_db_path: Path = Path.home() / ".claude-history-rag" / "history.db"
+
+    @property
+    def db_path(self) -> Path:
+        """Alias for sqlite_db_path for backward compatibility (used for log/pid location)."""
+        return self.sqlite_db_path
+    
+    # Qdrant Settings
+    qdrant_url: str | None = None  # e.g. "http://localhost:6333"
+    qdrant_api_key: SecretStr | None = None
+    qdrant_collection: str = "conversations"
     state_path: Path = Path.home() / ".claude-history-rag" / "state.json"
     projects_path: Path = Path.home() / ".claude" / "projects"
     codex_sessions_path: Path = Path.home() / ".codex" / "sessions"
@@ -92,7 +106,7 @@ class Settings(BaseSettings):
     #   - OpenAI: https://api.openai.com/v1
     embedding_base_url: str = "http://localhost:11434/v1"  # Default to Ollama
     embedding_model: str = "nomic-embed-text"
-    embedding_api_key: str = ""  # Optional, for OpenAI or auth-required endpoints
+    embedding_api_key: SecretStr = SecretStr("")  # Optional, for OpenAI or auth-required endpoints
 
     # ============================================================
     # General Settings
@@ -118,8 +132,8 @@ class Settings(BaseSettings):
     # Auth Settings
     # ============================================================
     auth_enabled: bool = True
-    server_psk: str = ""  # Optional env override for server PSK
-    client_psk: str = ""  # Optional env override for client PSK
+    server_psk: SecretStr = SecretStr("")  # Optional env override for server PSK
+    client_psk: SecretStr = SecretStr("")  # Optional env override for client PSK
     auth_state_path: Path = Path.home() / ".claude-history-rag" / "auth.json"
     client_auth_path: Path = Path.home() / ".claude-history-rag" / "client_auth.json"
 
@@ -213,7 +227,7 @@ class Settings(BaseSettings):
         return v
 
     @field_validator(
-        "db_path",
+        "sqlite_db_path",
         "state_path",
         "codex_state_path",
         "gemini_state_path",
@@ -292,9 +306,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_paths_unique(self) -> "Settings":
         """Validate that db_path and state_path are different."""
-        if self.db_path == self.state_path:
+        if self.sqlite_db_path == self.state_path:
             raise ValueError(
-                f"db_path and state_path must be different: both are set to {self.db_path}"
+                f"sqlite_db_path and state_path must be different: both are set to {self.sqlite_db_path}"
             )
         if self.codex_state_path == self.state_path:
             raise ValueError(

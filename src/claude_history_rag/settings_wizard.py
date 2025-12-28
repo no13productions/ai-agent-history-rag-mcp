@@ -12,11 +12,18 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
+from pydantic import ValidationError, SecretStr
+
 from claude_history_rag.config import Settings
 
 ENV_PREFIX = "CLAUDE_HISTORY_RAG_"
 MANAGED_FIELDS = [
     "db_path",
+    "storage_backend",
+    "sqlite_db_path",
+    "qdrant_url",
+    "qdrant_api_key",
+    "qdrant_collection",
     "state_path",
     "projects_path",
     "codex_sessions_path",
@@ -522,6 +529,52 @@ def run_wizard() -> int:
         prompt_string("Antigravity state file path", str(current_values["antigravity_state_path"]))
     )
 
+    print_header("Storage Backend")
+    storage_backend = prompt_choice(
+        "Select storage backend",
+        ["sqlite", "qdrant"],
+        str(current_values.get("storage_backend") or "sqlite"),
+    )
+    
+    # Initialize defaults
+    sqlite_db_path = current_values.get("sqlite_db_path")
+    qdrant_url = current_values.get("qdrant_url")
+    qdrant_api_key = current_values.get("qdrant_api_key")
+    qdrant_collection = current_values.get("qdrant_collection")
+
+    if storage_backend == "sqlite":
+        # SQLite settings
+        default_sqlite = str(current_values.get("sqlite_db_path") or Path.home() / ".claude-history-rag" / "history.db")
+        sqlite_db_path = Path(prompt_string("SQLite DB path", default_sqlite))
+        # Clear Qdrant settings if switching? No, keep them just in case.
+    else:
+        # Qdrant settings
+        # Auto-fill localhost for Qdrant URL without prompting as requested
+        if not qdrant_url:
+            print("[INFO] Auto-configuring Qdrant URL to http://localhost:6333")
+            qdrant_url = "http://localhost:6333"
+        else:
+            # If already set, maybe confirm? No, user asked to "automatically fill in localhost without prompting".
+            # But if it is *already set* (e.g. valid config), we should probably keep it or show it?
+            # "automatically fills in localhost without prompting user" implies if they pick Qdrant, we just assume localhost.
+            # But if they had a custom URL before, we shouldn't overwrite it blindly?
+            # I'll stick to: If it's valid, keep it. If empty/default, set to localhost. 
+            pass  # Keep existing value if present? 
+            # Actually, to follow "without prompting", I won't prompt. 
+            # If I don't prompt, I must ensure I have a value.
+            if not qdrant_url:
+                 qdrant_url = "http://localhost:6333"
+        
+        # We still need API KEY and Collection
+        qdrant_api_key = prompt_string(
+            "Qdrant API Key (optional)", 
+            unwrap(current_values.get("qdrant_api_key"))
+        )
+        qdrant_collection = prompt_string(
+            "Qdrant Collection", 
+            str(current_values.get("qdrant_collection") or "history_rag")
+        )
+
     print_header("Client/Server Mode")
     server_url = prompt_url(
         "Central server URL (leave empty for server/standalone)",
@@ -539,13 +592,18 @@ def run_wizard() -> int:
         "Upload retry delay seconds", int(current_values["upload_retry_delay_seconds"])
     )
 
+    def unwrap(val: Any) -> str:
+        if isinstance(val, SecretStr):
+             return val.get_secret_value()
+        return str(val or "")
+
     print_header("Embedding Settings")
     embedding_base_url = prompt_url(
         "Embedding base URL", str(current_values["embedding_base_url"]), allow_empty=False
     )
     embedding_model = prompt_string("Embedding model", str(current_values["embedding_model"]))
     embedding_api_key = prompt_string(
-        "Embedding API key (optional)", str(current_values.get("embedding_api_key") or "")
+        "Embedding API key (optional)", unwrap(current_values.get("embedding_api_key"))
     )
 
     print_header("General Settings")
@@ -588,11 +646,11 @@ def run_wizard() -> int:
     auth_enabled = prompt_bool("Require PSK authentication", bool(current_values["auth_enabled"]))
     server_psk = prompt_string(
         "Server PSK (optional override)",
-        str(current_values.get("server_psk") or ""),
+        unwrap(current_values.get("server_psk")),
     )
     client_psk = prompt_string(
         "Client PSK (optional override)",
-        str(current_values.get("client_psk") or ""),
+        unwrap(current_values.get("client_psk")),
     )
     auth_state_path = Path(
         prompt_string("Auth state path", str(current_values["auth_state_path"]))
@@ -603,6 +661,11 @@ def run_wizard() -> int:
 
     new_values = {
         "db_path": db_path,
+        "storage_backend": storage_backend,
+        "sqlite_db_path": sqlite_db_path,
+        "qdrant_url": qdrant_url,
+        "qdrant_api_key": qdrant_api_key,
+        "qdrant_collection": qdrant_collection,
         "state_path": state_path,
         "projects_path": projects_path,
         "codex_sessions_path": codex_sessions_path,

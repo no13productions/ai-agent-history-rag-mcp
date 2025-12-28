@@ -180,7 +180,34 @@ def main():
         action="store_true",
         help="Run in standalone mode with built-in watcher/indexer (default: lightweight mode)",
     )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers.add_parser("doctor", help="Run system diagnostics")
+    subparsers.add_parser("settings", help="Run interactive settings wizard")
+    subparsers.add_parser("install", help="Run interactive installer")
+    
+    daemon_parser = subparsers.add_parser("daemon", help="Manage background daemon")
+    daemon_parser.add_argument("daemon_args", nargs=argparse.REMAINDER, help="Daemon commands (start, stop, status)")
+
     args = parser.parse_args()
+
+    # Handle subcommands
+    if args.command == "doctor":
+        from claude_history_rag.doctor import main as doctor_main
+        sys.exit(doctor_main())
+    elif args.command == "settings":
+        from claude_history_rag.settings_wizard import main as settings_main
+        sys.exit(settings_main())
+    elif args.command == "install":
+        from claude_history_rag.installer import main as installer_main
+        sys.exit(installer_main())
+    elif args.command == "daemon":
+        from claude_history_rag.daemon import main as daemon_main
+        # Fix sys.argv for daemon: remove 'daemon' subcommand
+        # original: [script, daemon, start] -> [script, start]
+        if len(sys.argv) > 1 and sys.argv[1] == "daemon":
+             sys.argv.pop(1)
+        sys.exit(daemon_main())
 
     # Set up dual logging: stderr for MCP + file for debugging
     log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

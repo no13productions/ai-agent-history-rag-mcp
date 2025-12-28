@@ -48,10 +48,10 @@ Everything runs locally - embeddings, storage, and search all happen on one mach
 ┌─────────────────────────────────────────────────────────────┐
 │                     Local Machine                            │
 │                                                              │
-│  Claude Code ──► MCP Server ──► Daemon ──► LanceDB          │
-│                                    │                         │
-│                              Embeddings (Ollama/OpenAI API) │
-└─────────────────────────────────────────────────────────────┘
+│  Claude Code ──► MCP Server ──► Daemon ──► Storage (SQLite/Qdrant) │
+│                                    │                               │
+│                              Embeddings (Ollama/OpenAI API)        │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Multi-Machine Mode (Client/Server)
@@ -77,8 +77,8 @@ Consolidate conversation history from multiple machines to a central server:
 │  API Endpoints ◄── Status Server (port 4680)                │
 │       │                                                      │
 │       ▼                                                      │
-│  Embedder ──► LanceDB ──► Search API                        │
-│  (Ollama/vLLM/OpenAI)                                       │
+│  Embedder ──► Storage ──► Search API                        │
+│  (Ollama/vLLM)           (Qdrant/SQLite)                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -135,7 +135,7 @@ pip install -e ".[client]"
 The install wizard configures everything for you - MCP servers, daemon service, and all settings:
 
 ```bash
-uv run ai-agent-history-rag-install
+uv run ai-agent-history-rag install
 ```
 
 The wizard will:
@@ -315,7 +315,11 @@ Add to `~/.config/Claude/claude_desktop_config.json`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_HISTORY_RAG_DB_PATH` | `~/.claude-history-rag/lancedb` | LanceDB database location |
+| `CLAUDE_HISTORY_RAG_STORAGE_BACKEND` | `sqlite` | Storage backend: `sqlite` or `qdrant` |
+| `CLAUDE_HISTORY_RAG_SQLITE_DB_PATH` | `~/.claude-history-rag/history.db` | SQLite database location |
+| `CLAUDE_HISTORY_RAG_QDRANT_URL` | `None` | Qdrant server URL (e.g. `http://localhost:6333`) |
+| `CLAUDE_HISTORY_RAG_QDRANT_API_KEY` | `None` | Qdrant API key |
+| `CLAUDE_HISTORY_RAG_QDRANT_COLLECTION` | `history_rag` | Qdrant collection name |
 | `CLAUDE_HISTORY_RAG_STATE_PATH` | `~/.claude-history-rag/state.json` | File position state |
 | `CLAUDE_HISTORY_RAG_PROJECTS_PATH` | `~/.claude/projects` | Claude Code projects directory |
 | `CLAUDE_HISTORY_RAG_CODEX_SESSIONS_PATH` | `~/.codex/sessions` | Codex session history directory |
@@ -393,8 +397,8 @@ The server supports multiple embedding models. Choose based on your priorities:
 
 **Switching models** requires re-indexing:
 ```bash
-# Delete existing index
-rm -rf ~/.claude-history-rag/lancedb/
+# Delete existing index (if switching models abruptly)
+rm ~/.claude-history-rag/history.db
 
 # Set new model
 export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=mxbai-embed-large
@@ -412,13 +416,12 @@ The package provides seven command-line tools:
 
 | Command | Description |
 |---------|-------------|
-| `ai-agent-history-rag` | MCP server (lightweight mode by default) |
-| `ai-agent-history-rag-daemon` | Background daemon for indexing |
-| `ai-agent-history-rag-install` | Interactive installation wizard |
-| `ai-agent-history-rag-doctor` | Diagnostic and troubleshooting tool |
-| `ai-agent-history-rag-settings` | Interactive settings wizard |
-| `ai-agent-history-rag-uninstall` | Uninstall wizard (removes configs/services/data) |
-| `ai-agent-history-rag-docker` | Docker deployment wizard for central server |
+| `ai-agent-history-rag` | Main entry point (use `doctor`, `settings`, `install`, `daemon` subcommands) |
+| `ai-agent-history-rag-daemon` | (Deprecated) Background daemon for indexing |
+| `ai-agent-history-rag-install` | (Deprecated) Interactive installation wizard |
+| `ai-agent-history-rag-doctor` | (Deprecated) Diagnostic tool |
+| `ai-agent-history-rag-settings` | (Deprecated) Interactive settings wizard |
+| `ai-agent-history-rag-docker` | (Deprecated) Docker deployment wizard |
 
 Run with `uv run <command>` or directly if installed globally.
 
@@ -430,16 +433,16 @@ Run the indexer and status server as a standalone background daemon:
 
 ```bash
 # Start the daemon
-uv run ai-agent-history-rag-daemon start
+uv run ai-agent-history-rag daemon start
 
 # Check daemon status
-uv run ai-agent-history-rag-daemon status
+uv run ai-agent-history-rag daemon status
 
 # Stop the daemon
-uv run ai-agent-history-rag-daemon stop
+uv run ai-agent-history-rag daemon stop
 
 # Restart the daemon
-uv run ai-agent-history-rag-daemon restart
+uv run ai-agent-history-rag daemon restart
 ```
 
 The daemon:
@@ -450,7 +453,7 @@ The daemon:
 
 **Server mode log output**:
 ```
-Starting daemon [SERVER] | db=~/.claude-history-rag/lancedb | embedding_url=http://localhost:11434/v1 | embedding_model=nomic-embed-text
+Starting daemon [SERVER] | backend=sqlite | embedding_url=http://localhost:11434/v1 | embedding_model=nomic-embed-text
 ```
 
 **Client mode log output**:
@@ -696,7 +699,8 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 │     Claude Code ◄──► STDIO Transport ◄──► MCP Tools         │
 │                                               │             │
 │                                               ▼             │
-│                                           LanceDB           │
+│                                               ▼             │
+│                                           Storage           │
 │                                           (queries)         │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -728,8 +732,8 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 │     API Endpoints ◄── Status Server (port 4680)             │
 │           │                                                 │
 │           ▼                                                 │
-│     Embedder ──► LanceDB ◄── Search API                    │
-│     (Ollama/vLLM/OpenAI)                                   │
+│     Embedder ──► Storage ◄── Search API                    │
+│     (Ollama/vLLM)                                          │
 │                                                             │
 │     Position Tracking (per machine)                        │
 └─────────────────────────────────────────────────────────────┘
@@ -757,7 +761,8 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 
 - **Python 3.10+** with async/await patterns
 - **FastMCP** (official MCP SDK) - STDIO transport
-- **LanceDB 0.25+** - Embedded vector database with hybrid search
+- **SQLite + sqlite-vec** - Embedded vector search (default)
+- **Qdrant** - Optional scalable vector store
 - **httpx** - Async HTTP client for embeddings API and client/server communication
 - **watchfiles** - Rust-based async file watching
 - **pydantic** - Data validation and settings
@@ -767,10 +772,29 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 
 | Metric | Target | Implementation |
 |--------|--------|----------------|
-| Query latency | <500ms | LanceDB vector + RRF reranking |
+| Query latency | <500ms | SQLite/Qdrant + RRF reranking |
 | Indexing | <30s/1000 chunks | Batch embedding, async I/O |
 | Memory idle | <200MB | Lazy model loading |
 | Update latency | <60s | 5s debounce + incremental indexing |
+
+
+## Storage Backends
+
+The server supports two storage backends:
+
+### SQLite (Default)
+Best for single-machine setups and lightweight deployments.
+- Uses `sqlite-vec` for high-performance vector search
+- Zero-dependency deployment (embedded)
+- Database stored in a single file (`history.db`)
+
+### Qdrant
+Best for power users, large datasets, and multi-machine setups.
+- Dedicated vector database server
+- Higher scalability and advanced filtering
+- Run via Docker: `docker run -p 6333:6333 qdrant/qdrant`
+
+To switch, set `CLAUDE_HISTORY_RAG_STORAGE_BACKEND=qdrant` and configure `CLAUDE_HISTORY_RAG_QDRANT_URL`.
 
 ## Troubleshooting
 
@@ -779,7 +803,7 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 Run the doctor command for comprehensive system diagnostics:
 
 ```bash
-uv run ai-agent-history-rag-doctor
+uv run ai-agent-history-rag doctor
 ```
 
 The doctor checks:

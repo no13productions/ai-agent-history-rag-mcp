@@ -145,7 +145,7 @@ class StatusCollector:
 
         # Database check
         try:
-            stats = store.get_stats()
+            stats = await store.get_stats_async()
             checks["database"] = {
                 "status": "ok",
                 "chunks": stats.get("total_chunks", 0),
@@ -161,11 +161,11 @@ class StatusCollector:
         else:
             db_error = stats.get("error")
 
-        # Data integrity check (e.g., missing Lance files)
-        if db_error and "LanceError(IO)" in str(db_error):
+        # Data integrity check
+        if db_error:
             checks["database_integrity"] = {
                 "status": "error",
-                "error": "LanceDB files missing or corrupted. Re-index required.",
+                "error": db_error,
             }
 
         # Embedder check
@@ -222,20 +222,14 @@ class StatusCollector:
     async def _get_database_stats(self) -> dict[str, Any]:
         """Get database statistics."""
         try:
-            stats = store.get_stats()
+            stats = await store.get_stats_async()
+            
+            # Add file size if SQLite
+            if settings.storage_backend == "sqlite":
+                if settings.sqlite_db_path.exists():
+                    stats["database_size_bytes"] = settings.sqlite_db_path.stat().st_size
 
-            # Get database size
-            db_size = 0
-            if settings.db_path.exists():
-                for file_path in settings.db_path.rglob("*"):
-                    if file_path.is_file():
-                        db_size += file_path.stat().st_size
-
-            return {
-                "total_chunks": stats.get("total_chunks", 0),
-                "database_size_bytes": db_size,
-                "database_path": str(settings.db_path),
-            }
+            return stats
         except Exception as e:
             logger.error(f"Failed to get database stats: {e}")
             return {"error": str(e)}
@@ -414,7 +408,9 @@ class StatusCollector:
     def _get_configuration(self) -> dict[str, Any]:
         """Get current configuration."""
         return {
-            "db_path": str(settings.db_path),
+            "storage_backend": settings.storage_backend,
+            "sqlite_db_path": str(settings.sqlite_db_path),
+            "qdrant_url": settings.qdrant_url,
             "projects_path": str(settings.projects_path),
             "codex_sessions_path": str(settings.codex_sessions_path),
             "gemini_sessions_path": str(settings.gemini_sessions_path),

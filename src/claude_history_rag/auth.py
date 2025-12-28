@@ -113,15 +113,15 @@ class AuthManager:
             self._state["dashboard_hash"] = _generate_salt()
             self._save()
 
-        if settings.server_psk:
+        if settings.server_psk.get_secret_value():
             self._state["env_override"] = True
             active = self._state.get("active") or {}
             if not active.get("key_salt"):
                 active["key_salt"] = _generate_salt()
-            active["key_hash"] = _hash_key(settings.server_psk, active["key_salt"])
+            active["key_hash"] = _hash_key(settings.server_psk.get_secret_value(), active["key_salt"])
             active["created_at"] = active.get("created_at") or _now()
             active["key_id"] = active.get("key_id") or active["key_hash"][:12]
-            active["key_plain"] = settings.server_psk
+            active["key_plain"] = settings.server_psk.get_secret_value()
             self._state["active"] = active
             self._save()
             return

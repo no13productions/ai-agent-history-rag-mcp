@@ -337,10 +337,20 @@ def write_compose_file(config: dict[str, Any], compose_path: Path) -> None:
         f"      - CLAUDE_HISTORY_RAG_EMBEDDING_API_KEY={config.get('embedding_api_key', '')}",
         "      - CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=0.0.0.0",
         f"      - CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT={DEFAULT_PORT}",
-        "      - CLAUDE_HISTORY_RAG_DB_PATH=/data/db/lancedb",
         "      - CLAUDE_HISTORY_RAG_STATE_PATH=/data/state/state.json",
         "      - CLAUDE_HISTORY_RAG_AUTH_STATE_PATH=/data/state/auth.json",
     ]
+    
+    # Add storage backend config
+    storage_backend = config.get("storage_backend", "sqlite")
+    env_lines.append(f"      - CLAUDE_HISTORY_RAG_STORAGE_BACKEND={storage_backend}")
+    
+    if storage_backend == "sqlite":
+        env_lines.append("      - CLAUDE_HISTORY_RAG_SQLITE_DB_PATH=/data/history.db")
+    elif storage_backend == "qdrant":
+        env_lines.append(f"      - CLAUDE_HISTORY_RAG_QDRANT_URL={config.get('qdrant_url', '')}")
+        env_lines.append(f"      - CLAUDE_HISTORY_RAG_QDRANT_API_KEY={config.get('qdrant_api_key', '')}")
+        env_lines.append(f"      - CLAUDE_HISTORY_RAG_QDRANT_COLLECTION={config.get('qdrant_collection', 'history_rag')}")
 
     volume_lines = []
     volume_defs = []
@@ -603,6 +613,41 @@ def run_wizard() -> int:
             storage_choices,
             default_index=default_index,
         )
+        
+        # Storage Backend Selection
+        print_header("Storage Backend")
+        backend = prompt_choice(
+            "Select storage backend",
+            ["sqlite", "qdrant"],
+            default_index=0 if use_config.get("storage_backend", "sqlite") == "sqlite" else 1
+        )
+        
+        qdrant_url = ""
+        qdrant_api_key = ""
+        qdrant_collection = "history_rag"
+        
+        if backend == "qdrant":
+            # Auto-fill localhost for Qdrant URL without prompting as requested
+            default_url = use_config.get("qdrant_url", "")
+            if not default_url:
+                print("Auto-configuring Qdrant URL to http://host.docker.internal:6333 (accessing host Qdrant)")
+                qdrant_url = "http://host.docker.internal:6333"
+            else:
+                 qdrant_url = default_url
+
+            qdrant_api_key = prompt_string(
+                "Qdrant API Key (optional)", 
+                use_config.get("qdrant_api_key", "")
+            )
+            qdrant_collection = prompt_string(
+                "Qdrant Collection", 
+                use_config.get("qdrant_collection", "history_rag")
+            )
+        
+        # Volume configuration (for sqlite/state)
+        # Even if Qdrant is used, we still need state volume? 
+        # Yes, for 'state.json' (uploads/auth).
+        print_header("Volume Configuration")
 
         db_dir = ""
         state_dir = ""
@@ -681,6 +726,10 @@ def run_wizard() -> int:
             "embedding_base_url": embedding_base_url,
             "embedding_model": embedding_model,
             "embedding_api_key": embedding_api_key,
+            "storage_backend": backend,
+            "qdrant_url": qdrant_url,
+            "qdrant_api_key": qdrant_api_key,
+            "qdrant_collection": qdrant_collection,
             "labels": labels,
             "build_now": build_now,
             "no_cache": no_cache,
@@ -763,7 +812,16 @@ def run_wizard() -> int:
             run_cmd.extend(["-e", f"CLAUDE_HISTORY_RAG_EMBEDDING_API_KEY={embedding_api_key}"])
         run_cmd.extend(["-e", "CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=0.0.0.0"])
         run_cmd.extend(["-e", f"CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT={DEFAULT_PORT}"])
-        run_cmd.extend(["-e", "CLAUDE_HISTORY_RAG_DB_PATH=/data/db/lancedb"])
+        storage_backend = config.get("storage_backend", "sqlite")
+        if storage_backend == "sqlite":
+             run_cmd.extend(["-e", f"CLAUDE_HISTORY_RAG_SQLITE_DB_PATH={config.get('sqlite_db_path', '/data/history.db')}"])
+        elif storage_backend == "qdrant":
+             run_cmd.extend(["-e", "CLAUDE_HISTORY_RAG_STORAGE_BACKEND=qdrant"])
+             if config.get("qdrant_url"):
+                 run_cmd.extend(["-e", f"CLAUDE_HISTORY_RAG_QDRANT_URL={config['qdrant_url']}"])
+             if config.get("qdrant_api_key"):
+                  run_cmd.extend(["-e", f"CLAUDE_HISTORY_RAG_QDRANT_API_KEY={config['qdrant_api_key']}"])
+             run_cmd.extend(["-e", f"CLAUDE_HISTORY_RAG_QDRANT_COLLECTION={config.get('qdrant_collection', 'history_rag')}"])
         run_cmd.extend(["-e", "CLAUDE_HISTORY_RAG_STATE_PATH=/data/state/state.json"])
         run_cmd.extend(["-e", "CLAUDE_HISTORY_RAG_AUTH_STATE_PATH=/data/state/auth.json"])
         for key, value in labels.items():

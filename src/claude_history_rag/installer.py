@@ -1442,6 +1442,63 @@ def run_wizard() -> int:
         if embedding_model:
             env_vars["CLAUDE_HISTORY_RAG_EMBEDDING_MODEL"] = embedding_model
 
+        # Storage Backend Configuration
+        default_backend = (
+            existing_env.get("CLAUDE_HISTORY_RAG_STORAGE_BACKEND") if existing_env else "sqlite"
+        )
+        backend_choice = prompt_choice(
+            "Select storage backend",
+            ["sqlite", "qdrant"],
+            default=0 if default_backend != "qdrant" else 1,
+        )
+        storage_backend = "sqlite" if backend_choice == 0 else "qdrant"
+        env_vars["CLAUDE_HISTORY_RAG_STORAGE_BACKEND"] = storage_backend
+
+        if storage_backend == "sqlite":
+            default_db_path = (
+                existing_env.get("CLAUDE_HISTORY_RAG_SQLITE_DB_PATH") if existing_env else ""
+            )
+            # Default is ~/.claude-history-rag/history.db (handled by config), but we can be explicit
+            db_path = prompt_string(
+                "SQLite DB path (optional)",
+                default_db_path or "",
+            )
+            if db_path:
+                env_vars["CLAUDE_HISTORY_RAG_SQLITE_DB_PATH"] = db_path
+        else:
+            # Qdrant
+            default_qdrant_url = (
+                existing_env.get("CLAUDE_HISTORY_RAG_QDRANT_URL") if existing_env else ""
+            )
+            if not default_qdrant_url:
+                print("Auto-configuring Qdrant URL to http://localhost:6333")
+                env_vars["CLAUDE_HISTORY_RAG_QDRANT_URL"] = "http://localhost:6333"
+            else:
+                 # If existing, keep it? Or explicitly set it if user wants auto? 
+                 # User said "automatically fills in localhost without prompting".
+                 # If we are updating, we respect existing. If new, we set default.
+                 pass
+
+            default_qdrant_key = (
+                existing_env.get("CLAUDE_HISTORY_RAG_QDRANT_API_KEY") if existing_env else ""
+            )
+            qdrant_key = prompt_string(
+                "Qdrant API Key (optional)",
+                default_qdrant_key or "",
+            )
+            if qdrant_key:
+                env_vars["CLAUDE_HISTORY_RAG_QDRANT_API_KEY"] = qdrant_key
+            
+            default_qdrant_collection = (
+                existing_env.get("CLAUDE_HISTORY_RAG_QDRANT_COLLECTION") if existing_env else "history_rag"
+            )
+            qdrant_collection = prompt_string(
+                "Qdrant Collection",
+                default_qdrant_collection,
+            )
+            if qdrant_collection:
+                env_vars["CLAUDE_HISTORY_RAG_QDRANT_COLLECTION"] = qdrant_collection
+
     # Auth configuration (PSK)
     if not is_update:
         print_header("Auth (PSK)")

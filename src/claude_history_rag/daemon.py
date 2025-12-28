@@ -6,10 +6,10 @@ This daemon runs independently of the MCP server and handles:
 - Periodic optimization
 
 Supports two modes:
-- Server mode: Local embeddings + LanceDB storage + status server
+- Server mode: Local embeddings + Storage backend (SQLite/Qdrant) + status server
 - Client mode: File watching + chunk upload to central server
 
-The MCP server queries the same LanceDB database populated by this daemon.
+The MCP server queries the same storage backend populated by this daemon.
 """
 
 import argparse

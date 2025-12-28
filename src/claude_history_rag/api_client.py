@@ -94,8 +94,8 @@ class APIClient:
         _write_secure_json(settings.client_auth_path, data)
 
     def _get_psk(self) -> str | None:
-        if settings.client_psk:
-            return settings.client_psk
+        if settings.client_psk.get_secret_value():
+            return settings.client_psk.get_secret_value()
         data = self._load_client_auth()
         return data.get("psk")
 

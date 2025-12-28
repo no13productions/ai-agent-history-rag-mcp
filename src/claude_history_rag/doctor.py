@@ -337,7 +337,13 @@ def run_doctor() -> int:
         print_info(f"Embedding URL: {settings.embedding_base_url}")
         print_info(f"Embedding Model: {settings.embedding_model}")
 
-    print_info(f"Database: {settings.db_path}")
+    print_info(f"Storage Backend: {settings.storage_backend}")
+    if settings.storage_backend == "sqlite":
+        print_info(f"SQLite DB: {settings.sqlite_db_path}")
+    elif settings.storage_backend == "qdrant":
+        print_info(f"Qdrant URL: {settings.qdrant_url}")
+        print_info(f"Qdrant Collection: {settings.qdrant_collection}")
+
     print_info(f"Projects: {settings.projects_path}")
     print_info(f"Codex Sessions: {settings.codex_sessions_path}")
     print_info(f"Gemini Sessions: {settings.gemini_sessions_path}")
@@ -485,7 +491,15 @@ def run_doctor() -> int:
             print_info("Start Ollama with: ollama serve")
             print_info("Or check your CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL setting")
             all_ok = False
-
+    if settings.storage_backend == "qdrant" and settings.qdrant_url:
+        print(f"  Checking Qdrant at {settings.qdrant_url}...")
+        reachable, status, error = check_url_reachable(settings.qdrant_url)
+        if reachable:
+            print_ok(f"Qdrant is reachable (HTTP {status})")
+        else:
+            print_fail(f"Cannot reach Qdrant: {error}")
+            print_info("Make sure Qdrant is running")
+            all_ok = False
     # ==========================================================================
     # Client Queue (client mode only)
     # ==========================================================================
@@ -573,17 +587,19 @@ def run_doctor() -> int:
         all_ok = False
 
     # Check database
-    if settings.db_path.exists():
-        print_ok(f"Database exists: {settings.db_path}")
-        # Try to get size
-        try:
-            size = sum(f.stat().st_size for f in settings.db_path.rglob("*") if f.is_file())
-            size_mb = size / (1024 * 1024)
-            print_info(f"Database size: {size_mb:.1f} MB")
-        except Exception:
-            pass
-    else:
-        print_info("Database not yet created (will be created on first run)")
+    if settings.storage_backend == "sqlite":
+        if settings.sqlite_db_path.exists():
+            print_ok(f"SQLite DB exists: {settings.sqlite_db_path}")
+            # Try to get size
+            try:
+                size_mb = settings.sqlite_db_path.stat().st_size / (1024 * 1024)
+                print_info(f"Database size: {size_mb:.1f} MB")
+            except Exception:
+                pass
+        else:
+            print_info(f"SQLite DB not yet created: {settings.sqlite_db_path}")
+    elif settings.storage_backend == "qdrant":
+        print_info(f"Storage is remote (Qdrant): {settings.qdrant_url}")
 
     # ==========================================================================
     # Logs

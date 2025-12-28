@@ -113,7 +113,7 @@ class AsyncEmbedder:
     ):
         self.base_url = (base_url or settings.embedding_base_url).rstrip("/")
         self.model_name = model_name or settings.embedding_model
-        self.api_key = api_key if api_key is not None else settings.embedding_api_key
+        self.api_key = api_key if api_key is not None else (settings.embedding_api_key.get_secret_value() if settings.embedding_api_key else None)
         self._client: httpx.Client | None = None
         self._client_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4)
