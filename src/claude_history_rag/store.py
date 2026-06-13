@@ -1060,10 +1060,10 @@ class VectorStore:
         await loop.run_in_executor(None, self.close)
 
 
-# Total/embedded counts drive the dashboard backfill progress. The COUNTIF scan is O(table)
-# and can take tens of seconds on a large table under backfill load, so it is cached this long
-# and served stale between scans rather than re-run on every status poll.
-EMBEDDING_COUNTS_CACHE_TTL = 30.0
+# get_stats (count scan + index-existence checks) drives the dashboard backfill progress and is
+# cached this long: cheap status polls, and the embed RATE is derived from the change in embedded
+# count between successive (real) recomputes this far apart — so it must not be too small.
+STATS_CACHE_TTL = 10.0
 
 
 class SpannerStore:
@@ -1084,11 +1084,13 @@ class SpannerStore:
         self._instance = None
         self._database = None
         self._lock = threading.Lock()
-        # TTL cache for the expensive total/embedded count scan (drives backfill progress).
-        self._counts_cache: tuple[float, int, int] | None = None  # (monotonic_ts, total, embedded)
-        # TTL cache for the whole get_stats result (count scan + index-existence info_schema
-        # checks are all slow under backfill contention; status polls must stay cheap).
+        # Single TTL cache for the whole get_stats result. Single-flighted so concurrent status
+        # polls don't all run the scan, and so the embed-rate sample below advances exactly once
+        # per real recompute.
         self._stats_cache: tuple[float, dict[str, Any]] | None = None  # (monotonic_ts, stats)
+        self._stats_lock = threading.Lock()
+        # Last (monotonic_ts, embedded_count) used to derive the embed rate per minute.
+        self._rate_sample: tuple[float, int] | None = None
 
     def _resolve_project(self) -> str:
         """Resolve the Spanner project from config or ADC."""
@@ -1360,21 +1362,12 @@ class SpannerStore:
         return int(rows[0][0]) if rows else 0
 
     def _embedding_counts(self) -> tuple[int, int]:
-        """Return (total_chunks, embedded_chunks), TTL-cached.
+        """Return (total_chunks, embedded_chunks) via one COUNTIF scan.
 
-        The underlying COUNTIF scan is O(table) and slow on a large table under backfill
-        contention, so it must NOT run on every status poll. The result is cached for
-        EMBEDDING_COUNTS_CACHE_TTL seconds and served stale in between.
+        Not cached here on purpose: the only caller is _compute_stats, whose frequency is already
+        bounded by the get_stats TTL cache, and the embed rate is derived from the change between
+        successive fresh counts — caching here would make consecutive samples identical (rate 0).
         """
-        cached = self._counts_cache
-        if cached is not None and (time.monotonic() - cached[0]) < EMBEDDING_COUNTS_CACHE_TTL:
-            return cached[1], cached[2]
-        total, embedded = self._embedding_counts_uncached()
-        self._counts_cache = (time.monotonic(), total, embedded)
-        return total, embedded
-
-    def _embedding_counts_uncached(self) -> tuple[int, int]:
-        """Run the (expensive) total/embedded count scan against Spanner."""
         database = self.connect()
         sql = f"SELECT COUNT(*), COUNTIF(Vector IS NOT NULL) FROM {SPANNER_TABLE_NAME}"
         with database.snapshot() as snapshot:
@@ -2100,25 +2093,51 @@ class SpannerStore:
         }
 
     def get_stats(self) -> dict[str, Any]:
-        """Get Spanner store statistics, TTL-cached so status polls stay cheap.
+        """Get Spanner store statistics, TTL-cached + single-flighted so status polls stay cheap.
 
-        Both the count scan and the index-existence checks are O(table)/info_schema and slow
-        under backfill contention, so the whole result is cached for EMBEDDING_COUNTS_CACHE_TTL
-        seconds and served stale in between (fine for a progress display).
+        The count scan and index-existence checks are O(table)/info_schema and slow under backfill
+        contention, so the whole result is cached for STATS_CACHE_TTL seconds. The lock ensures
+        only one recompute runs at a time (no thundering herd, and the embed-rate sample advances
+        exactly once per recompute).
         """
         cached = self._stats_cache
-        if cached is not None and (time.monotonic() - cached[0]) < EMBEDDING_COUNTS_CACHE_TTL:
+        if cached is not None and (time.monotonic() - cached[0]) < STATS_CACHE_TTL:
             return cached[1]
-        stats = self._compute_stats()
-        self._stats_cache = (time.monotonic(), stats)
-        return stats
+        with self._stats_lock:
+            cached = self._stats_cache
+            if cached is not None and (time.monotonic() - cached[0]) < STATS_CACHE_TTL:
+                return cached[1]
+            stats = self._compute_stats()
+            self._stats_cache = (time.monotonic(), stats)
+            return stats
 
     def _compute_stats(self) -> dict[str, Any]:
-        """Compute fresh store statistics (count scan + index-existence checks)."""
+        """Compute fresh store statistics, including the embed rate per minute and ETA.
+
+        The rate is the change in embedded count since the previous recompute (kept in
+        _rate_sample), divided by the elapsed time — robust to the get_stats cache because each
+        recompute reads a FRESH count.
+        """
         total, embedded = self._embedding_counts()
+        awaiting = max(total - embedded, 0)
+        now = time.monotonic()
+        rate_per_min: int | None = None
+        prev = self._rate_sample
+        if prev is not None:
+            elapsed = now - prev[0]
+            if elapsed >= 1.0:
+                rate_per_min = max(round((embedded - prev[1]) / elapsed * 60), 0)
+        self._rate_sample = (now, embedded)
+        eta_seconds = (
+            round(awaiting / (rate_per_min / 60))
+            if rate_per_min and rate_per_min > 0 and awaiting > 0
+            else None
+        )
         return {
             "total_chunks": total,
             "embedded_chunks": embedded,
+            "backfill_rate_per_min": rate_per_min,
+            "backfill_eta_seconds": eta_seconds,
             "awaiting_embedding": max(total - embedded, 0),
             "backend": "spanner",
             "project": self.project,

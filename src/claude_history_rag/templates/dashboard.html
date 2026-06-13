@@ -1196,27 +1196,26 @@
                     const pct = bfTotal > 0 ? (bfEmbedded / bfTotal * 100) : 0;
                     document.getElementById('bf-pct').textContent = pct.toFixed(1) + '%';
                     document.getElementById('bf-bar').style.width = pct.toFixed(1) + '%';
-                    // Live rate from successive polls (this dashboard auto-refreshes)
-                    const now = Date.now();
-                    if (window._bfPrev && now > window._bfPrev.t) {
-                        const dRows = bfEmbedded - window._bfPrev.e;
-                        const dMin = (now - window._bfPrev.t) / 60000;
-                        const rate = dMin > 0 ? Math.round(dRows / dMin) : 0;
-                        if (bfAwaiting === 0) {
-                            document.getElementById('bf-rate').textContent = 'complete';
-                            document.getElementById('bf-eta').textContent = 'done';
-                            document.getElementById('bf-bar').style.background = '#2ecc71';
-                        } else if (rate > 0) {
-                            document.getElementById('bf-rate').textContent = rate.toLocaleString() + ' /min';
-                            const etaMin = Math.ceil(bfAwaiting / rate);
-                            document.getElementById('bf-eta').textContent =
-                                etaMin < 60 ? etaMin + ' min' : (etaMin / 60).toFixed(1) + ' h';
-                        } else {
-                            document.getElementById('bf-rate').textContent = 'idle';
-                            document.getElementById('bf-eta').textContent = '—';
-                        }
+                    // Rate + ETA are computed server-side (robust to the stats cache); the client
+                    // just displays them. rate is null until the server has two samples (~10s).
+                    const rate = data.database.backfill_rate_per_min;
+                    const etaSec = data.database.backfill_eta_seconds;
+                    if (bfAwaiting === 0) {
+                        document.getElementById('bf-rate').textContent = 'complete';
+                        document.getElementById('bf-eta').textContent = 'done';
+                        document.getElementById('bf-bar').style.background = '#2ecc71';
+                    } else if (rate === null || rate === undefined) {
+                        document.getElementById('bf-rate').textContent = '…';
+                        document.getElementById('bf-eta').textContent = '…';
+                    } else if (rate > 0) {
+                        document.getElementById('bf-rate').textContent = rate.toLocaleString() + ' /min';
+                        const etaMin = etaSec != null ? Math.ceil(etaSec / 60) : null;
+                        document.getElementById('bf-eta').textContent = etaMin == null ? '—'
+                            : (etaMin < 60 ? etaMin + ' min' : (etaMin / 60).toFixed(1) + ' h');
+                    } else {
+                        document.getElementById('bf-rate').textContent = 'idle';
+                        document.getElementById('bf-eta').textContent = '—';
                     }
-                    window._bfPrev = { e: bfEmbedded, t: now };
                 }
 
                 // Performance
