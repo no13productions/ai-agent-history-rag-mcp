@@ -283,7 +283,9 @@ class StatusCollector:
     async def _get_database_stats(self) -> dict[str, Any]:
         """Get database statistics."""
         try:
-            stats = store.get_stats()
+            # Off the event loop: get_stats may run a TTL-cache-miss count scan that takes
+            # seconds on a large table — must not block the status server.
+            stats = await store.get_stats_async()
 
             result = {
                 "total_chunks": stats.get("total_chunks", 0),

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from datetime import datetime as dt
@@ -1059,6 +1060,12 @@ class VectorStore:
         await loop.run_in_executor(None, self.close)
 
 
+# Total/embedded counts drive the dashboard backfill progress. The COUNTIF scan is O(table)
+# and can take tens of seconds on a large table under backfill load, so it is cached this long
+# and served stale between scans rather than re-run on every status poll.
+EMBEDDING_COUNTS_CACHE_TTL = 30.0
+
+
 class SpannerStore:
     """Cloud Spanner storage backend with vector and native hybrid search."""
 
@@ -1077,6 +1084,8 @@ class SpannerStore:
         self._instance = None
         self._database = None
         self._lock = threading.Lock()
+        # TTL cache for the expensive total/embedded count scan (drives backfill progress).
+        self._counts_cache: tuple[float, int, int] | None = None  # (monotonic_ts, total, embedded)
 
     def _resolve_project(self) -> str:
         """Resolve the Spanner project from config or ADC."""
@@ -1348,7 +1357,21 @@ class SpannerStore:
         return int(rows[0][0]) if rows else 0
 
     def _embedding_counts(self) -> tuple[int, int]:
-        """Return (total_chunks, embedded_chunks) in one scan — drives backfill progress."""
+        """Return (total_chunks, embedded_chunks), TTL-cached.
+
+        The underlying COUNTIF scan is O(table) and slow on a large table under backfill
+        contention, so it must NOT run on every status poll. The result is cached for
+        EMBEDDING_COUNTS_CACHE_TTL seconds and served stale in between.
+        """
+        cached = self._counts_cache
+        if cached is not None and (time.monotonic() - cached[0]) < EMBEDDING_COUNTS_CACHE_TTL:
+            return cached[1], cached[2]
+        total, embedded = self._embedding_counts_uncached()
+        self._counts_cache = (time.monotonic(), total, embedded)
+        return total, embedded
+
+    def _embedding_counts_uncached(self) -> tuple[int, int]:
+        """Run the (expensive) total/embedded count scan against Spanner."""
         database = self.connect()
         sql = f"SELECT COUNT(*), COUNTIF(Vector IS NOT NULL) FROM {SPANNER_TABLE_NAME}"
         with database.snapshot() as snapshot:
