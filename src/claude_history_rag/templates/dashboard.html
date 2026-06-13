@@ -696,6 +696,7 @@
                 <div class="button-row">
                     <button class="btn" onclick="unlockDashboard()">Unlock</button>
                 </div>
+                <div class="modal-subtitle" id="unlock-error" style="color:#e74c3c;margin-top:10px;"></div>
             </div>
         </div>
     </div>
@@ -747,9 +748,14 @@
     </div>
 
     <script>
+        const DASHBOARD_PORT = Number("{{PORT}}") || 4680;
+        if (location.protocol === 'file:') {
+            location.replace(`http://127.0.0.1:${DASHBOARD_PORT}/dashboard`);
+        }
+
         // Use relative URL to avoid CORS issues
         const STATUS_URL = '/status?detail=full';
-        const DEFAULT_REFRESH_INTERVAL = {{REFRESH_INTERVAL}};
+        const DEFAULT_REFRESH_INTERVAL = Number("{{REFRESH_INTERVAL}}") || 5000;
         let refreshInterval = DEFAULT_REFRESH_INTERVAL;
         let refreshTimer = null;
         let clientsCache = [];
@@ -926,6 +932,7 @@
 
         function openUnlockModal() {
             document.getElementById('unlock-psk-input').value = '';
+            document.getElementById('unlock-error').textContent = '';
             document.getElementById('unlock-modal-backdrop').classList.remove('hidden');
             setRefreshPaused(true);
         }
@@ -937,21 +944,33 @@
 
         async function unlockDashboard() {
             const psk = document.getElementById('unlock-psk-input').value.trim();
-            if (!psk) return;
+            const errorEl = document.getElementById('unlock-error');
+            errorEl.textContent = '';
+            if (!psk) {
+                errorEl.textContent = 'Enter the current PSK.';
+                return;
+            }
             sessionPsk = psk;
             try {
                 const response = await fetchWithAuth('/api/auth/dashboard-hash');
-                if (response.ok) {
-                    const payload = await response.json();
-                    if (payload.dashboard_hash) {
-                        dashboardHash = payload.dashboard_hash;
+                if (!response.ok) {
+                    errorEl.textContent = `Unlock failed (${response.status}).`;
+                    return;
+                }
+                const payload = await response.json();
+                if (payload.dashboard_hash) {
+                    dashboardHash = payload.dashboard_hash;
+                    try {
                         localStorage.setItem('chr_dashboard_hash', dashboardHash);
+                    } catch (e) {
+                        console.warn('Failed to persist dashboard unlock hash:', e);
                     }
                 }
                 closeUnlockModal();
                 updateStatus();
             } catch (e) {
                 console.error('Failed to unlock dashboard:', e);
+                errorEl.textContent = 'Unlock failed. Open the dashboard from the local server.';
             }
         }
 
