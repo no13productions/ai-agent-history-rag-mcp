@@ -141,9 +141,11 @@ class Settings(BaseSettings):
     # Decouples ingest speed from embedding latency (max ingest throughput for large backfills).
     spanner_defer_embeddings: bool = False
     # Concurrent shard workers for the embedding backfill. NULL-vector rows are sharded by Id
-    # hex-prefix (256 slices) and drained by this many workers in parallel — the lever that
-    # saturates the Vertex quota, since partitioned DML is capped by Spanner table splits.
-    spanner_backfill_concurrency: int = 16
+    # hex-prefix (256 slices) and drained by this many workers in parallel. Default 8 keeps the
+    # burst under the Vertex gemini-embedding quota (stress testing showed ~32 trips 409
+    # quota-exceeded); raise only with a corresponding quota increase. A failed shard is
+    # non-fatal (it stops and its rows retry next pass), but staying under quota is faster.
+    spanner_backfill_concurrency: int = 8
     # Rows read + embedded per batch, per shard worker (one batched ML.PREDICT call each).
     spanner_backfill_batch_size: int = 200
     # Daemon embedding-backfill cadence (seconds) when spanner_defer_embeddings is enabled.

@@ -1347,6 +1347,16 @@ class SpannerStore:
             rows = list(snapshot.execute_sql(f"SELECT COUNT(*) FROM {SPANNER_TABLE_NAME}"))
         return int(rows[0][0]) if rows else 0
 
+    def _embedding_counts(self) -> tuple[int, int]:
+        """Return (total_chunks, embedded_chunks) in one scan — drives backfill progress."""
+        database = self.connect()
+        sql = f"SELECT COUNT(*), COUNTIF(Vector IS NOT NULL) FROM {SPANNER_TABLE_NAME}"
+        with database.snapshot() as snapshot:
+            rows = list(snapshot.execute_sql(sql))
+        if rows:
+            return int(rows[0][0]), int(rows[0][1])
+        return 0, 0
+
     def create_vector_index(self, force: bool = False) -> bool:
         """Create Spanner ANN vector index when enabled and useful."""
         if not settings.spanner_enable_vector_index:
@@ -1635,15 +1645,32 @@ class SpannerStore:
         return [self._row_to_chunk_dict(row) for row in rows]
 
     def _backfill_shard(self, prefix: str) -> int:
-        """Drain one Id-prefix shard: read NULL-vector rows in batches and re-embed them."""
+        """Drain one Id-prefix shard: read NULL-vector rows in batches and re-embed them.
+
+        Resilient by design: a failed batch (e.g. Vertex quota/throttle, or a transient
+        Spanner Aborted) stops THIS shard but never propagates — the affected rows stay NULL
+        and are retried on the next pass, and the other shards keep going. A single batch
+        failure must not abort the whole backfill pass (the bug the PDML version avoided via
+        SAFE.ML.PREDICT + auto-retry).
+        """
         batch_size = settings.spanner_backfill_batch_size
         embedded = 0
         while True:
-            rows = self._read_unembedded_batch(prefix, batch_size)
-            if not rows:
+            try:
+                rows = self._read_unembedded_batch(prefix, batch_size)
+                if not rows:
+                    break
+                self._add_chunks_with_spanner_embeddings(rows)
+                embedded += len(rows)
+            except Exception as exc:
+                logger.warning(
+                    "Backfill shard %s stopped after %s rows: %s; remaining rows stay NULL "
+                    "for the next pass",
+                    prefix,
+                    embedded,
+                    exc,
+                )
                 break
-            self._add_chunks_with_spanner_embeddings(rows)
-            embedded += len(rows)
         return embedded
 
     def backfill_embeddings(self) -> int:
@@ -2048,9 +2075,11 @@ class SpannerStore:
 
     def get_stats(self) -> dict[str, Any]:
         """Get Spanner store statistics."""
-        row_count = self._row_count()
+        total, embedded = self._embedding_counts()
         return {
-            "total_chunks": row_count,
+            "total_chunks": total,
+            "embedded_chunks": embedded,
+            "awaiting_embedding": max(total - embedded, 0),
             "backend": "spanner",
             "project": self.project,
             "instance": self.instance_id,
