@@ -133,6 +133,17 @@ class Settings(BaseSettings):
     spanner_rrf_k: int = 60
     spanner_embedding_mode: str = "app"
     spanner_embedding_model_id: str = "ConversationEmbeddingModel"
+    # Rows per Vertex RPC for ML.PREDICT (the remote_udf_max_rows_per_rpc hint). Keep small:
+    # gemini-embedding-001 caps a request at 20,000 tokens (<=2,048 counted per text), so ~9-10
+    # worst-case-size chunks is the safe ceiling. Throughput comes from parallelism, not RPC size.
+    spanner_embedding_rpc_batch_size: int = 10
+    # Insert rows without vectors and backfill embeddings asynchronously via partitioned DML.
+    # Decouples ingest speed from embedding latency (max ingest throughput for large backfills).
+    spanner_defer_embeddings: bool = False
+    # Parallel partitions for the embedding backfill (the pdml_max_parallelism hint).
+    spanner_pdml_max_parallelism: int = 20
+    # Daemon embedding-backfill cadence (seconds) when spanner_defer_embeddings is enabled.
+    spanner_backfill_interval_seconds: int = 60
 
     # Optimization Settings
     optimization_cleanup_older_than_seconds: int = 3600  # Default 1 hour
@@ -423,6 +434,38 @@ class Settings(BaseSettings):
             raise ValueError("spanner_rrf_k must be positive")
         if v > 10_000:
             raise ValueError("spanner_rrf_k must be <= 10000")
+        return v
+
+    @field_validator("spanner_embedding_rpc_batch_size")
+    @classmethod
+    def validate_spanner_embedding_rpc_batch_size(cls, v: int) -> int:
+        """Validate rows-per-RPC for Spanner ML.PREDICT embedding calls."""
+        if v < 1:
+            raise ValueError("spanner_embedding_rpc_batch_size must be positive")
+        if v > 250:
+            raise ValueError(
+                "spanner_embedding_rpc_batch_size must be <= 250 (Vertex per-request instance limit)"
+            )
+        return v
+
+    @field_validator("spanner_pdml_max_parallelism")
+    @classmethod
+    def validate_spanner_pdml_max_parallelism(cls, v: int) -> int:
+        """Validate partitioned-DML parallelism for the embedding backfill."""
+        if v < 1:
+            raise ValueError("spanner_pdml_max_parallelism must be positive")
+        if v > 1000:
+            raise ValueError("spanner_pdml_max_parallelism must be <= 1000")
+        return v
+
+    @field_validator("spanner_backfill_interval_seconds")
+    @classmethod
+    def validate_spanner_backfill_interval_seconds(cls, v: int) -> int:
+        """Validate daemon embedding-backfill cadence."""
+        if v < 10:
+            raise ValueError("spanner_backfill_interval_seconds must be at least 10")
+        if v > 3600:
+            raise ValueError("spanner_backfill_interval_seconds must be at most 3600 (1 hour)")
         return v
 
     @field_validator("log_level")

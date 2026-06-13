@@ -82,6 +82,29 @@ async def periodic_optimize(stop_event: asyncio.Event) -> None:
             logger.exception("Scheduled optimization failed")
 
 
+async def periodic_backfill(stop_event: asyncio.Event) -> None:
+    """Periodically backfill NULL embeddings via partitioned DML (deferred Spanner mode)."""
+    from claude_history_rag.store import store
+
+    backfill = getattr(store, "backfill_embeddings_async", None)
+    if backfill is None:
+        return  # backend has no deferred-embedding backfill (e.g. LanceDB)
+
+    while not stop_event.is_set():
+        try:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=settings.spanner_backfill_interval_seconds
+                )
+            if stop_event.is_set():
+                break
+            updated = await backfill()
+            if updated:
+                logger.info("Embedding backfill updated %s rows", updated)
+        except Exception:
+            logger.exception("Scheduled embedding backfill failed")
+
+
 async def run_daemon():
     """Run the daemon with file watcher, status server, and optimization.
 
@@ -90,6 +113,7 @@ async def run_daemon():
     watchers = get_all_watchers()
     stop_event = asyncio.Event()
     optimize_task: asyncio.Task | None = None
+    backfill_task: asyncio.Task | None = None
     status_server = None
     cache = None
 
@@ -155,6 +179,14 @@ async def run_daemon():
             # Start periodic optimization task
             optimize_task = asyncio.create_task(periodic_optimize(stop_event))
 
+            # Start periodic embedding backfill (deferred Spanner-embedding mode only)
+            if settings.storage_backend == "spanner" and settings.spanner_defer_embeddings:
+                logger.info(
+                    "[SERVER] Deferred embeddings enabled; backfilling every %ss via partitioned DML",
+                    settings.spanner_backfill_interval_seconds,
+                )
+                backfill_task = asyncio.create_task(periodic_backfill(stop_event))
+
         # Set up signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
 
@@ -196,6 +228,17 @@ async def run_daemon():
                 optimize_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await optimize_task
+
+        # Stop embedding backfill task (deferred Spanner mode only)
+        if backfill_task:
+            try:
+                stop_event.set()
+                await asyncio.wait_for(backfill_task, timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("Embedding backfill task did not finish in time, cancelling")
+                backfill_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await backfill_task
 
         for history_watcher in watchers:
             try:
