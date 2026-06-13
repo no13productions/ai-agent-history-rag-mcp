@@ -455,6 +455,23 @@ def test_embedding_counts_are_ttl_cached(monkeypatch):
     assert len(scans) == 1  # cached — the O(table) scan ran exactly once
 
 
+def test_get_stats_is_ttl_cached(monkeypatch):
+    """get_stats caches its whole result (count scan + index checks) within the TTL."""
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = FakeDatabase()
+    computes = []
+    monkeypatch.setattr(
+        store, "_compute_stats", lambda: (computes.append(1), {"total_chunks": 5})[1]
+    )
+
+    first = store.get_stats()
+    second = store.get_stats()
+
+    assert first == {"total_chunks": 5}
+    assert second == {"total_chunks": 5}
+    assert len(computes) == 1  # status polls served from cache, no repeat scan
+
+
 def test_read_unembedded_batch_filters_by_id_prefix(monkeypatch):
     """_read_unembedded_batch targets one Id shard with a bounded SELECT."""
     store = SpannerStore(project="p", instance="i", database="d")
