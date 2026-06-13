@@ -131,7 +131,7 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
   },
   "file_watcher": {
     "is_running": true,
-    "projects_path": "/Users/brandon/.claude/projects",
+    "projects_path": "/Users/youruser/.claude/projects",
     "debounce_ms": 5000,
     "queue_size": 0,
     "queue_max_size": 1000,
@@ -143,8 +143,8 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
     "by_type": {}
   },
   "configuration": {
-    "db_path": "/Users/brandon/.claude-history-rag/lancedb",
-    "projects_path": "/Users/brandon/.claude/projects",
+    "db_path": "/Users/youruser/.claude-history-rag/lancedb",
+    "projects_path": "/Users/youruser/.claude/projects",
     "embedding_model": "nomic-ai/nomic-embed-text-v1.5",
     "log_level": "INFO",
     "batch_size": 32

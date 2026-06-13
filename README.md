@@ -251,9 +251,9 @@ On the central machine, run server mode against the shared Spanner DB:
 
 ```bash
 export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
-export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=jeeves-486102
-export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=jeeves-rg-spanner-prod-4d0e4c43
-export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=ai-agent-history-rag
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=<your-gcp-project>
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=<your-spanner-instance>
+export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=<your-rag-database>
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE=spanner
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID=ConversationEmbeddingModel
 export CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex
@@ -435,9 +435,9 @@ export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=<your-rag-database>
 **Spanner + Vertex native embedding example:**
 ```bash
 export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
-export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=jeeves-486102
-export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=jeeves-rg-spanner-prod-4d0e4c43
-export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=ai-agent-history-rag
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=<your-gcp-project>
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=<your-spanner-instance>
+export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=<your-rag-database>
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE=spanner
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID=ConversationEmbeddingModel
 export CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex

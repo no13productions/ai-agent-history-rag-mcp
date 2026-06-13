@@ -575,8 +575,8 @@ def run_wizard() -> int:
                     "New macvlan network name",
                     use_config.get("network_name", "ai-agent-history-rag-macvlan"),
                 )
-                subnet = prompt_string("Subnet (CIDR, e.g., 192.168.4.0/24)")
-                gateway = prompt_string("Gateway (e.g., 192.168.4.1)")
+                subnet = prompt_string("Subnet (CIDR, e.g., 192.168.1.0/24)")
+                gateway = prompt_string("Gateway (e.g., 192.168.1.1)")
                 parent = prompt_string("Parent interface (e.g., eth0)")
                 created = create_docker_network(
                     network_name,
@@ -644,7 +644,7 @@ def run_wizard() -> int:
         print_header("Embedding Settings")
         embedding_base_url = prompt_required_url(
             "Embedding base URL",
-            "http://192.168.4.204:11434/v1",
+            "http://localhost:11434/v1",
             use_config.get("embedding_base_url") or None,
         )
         embedding_base_url = normalize_embedding_base_url(embedding_base_url)
