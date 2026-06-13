@@ -287,6 +287,8 @@ class StatusCollector:
 
             result = {
                 "total_chunks": stats.get("total_chunks", 0),
+                "embedded_chunks": stats.get("embedded_chunks"),
+                "awaiting_embedding": stats.get("awaiting_embedding"),
             }
             if settings.storage_backend == "lancedb":
                 db_size = 0

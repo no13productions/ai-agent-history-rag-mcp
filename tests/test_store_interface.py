@@ -70,6 +70,8 @@ class FakeSnapshot:
                     0.123,
                 ]
             ]
+        if "COUNTIF" in sql:
+            return [[0, 0]]  # (total, embedded) for _embedding_counts
         if "COUNT(*)" in sql:
             return [[0]]
         return []
@@ -403,6 +405,39 @@ def test_spanner_store_backfill_embeddings_shards_and_embeds(monkeypatch):
     assert embedded_batches == [
         [{"id": "00aaa", "content": "c1"}, {"id": "00bbb", "content": "c2"}]
     ]
+
+
+def test_backfill_shard_failure_does_not_abort_the_pass(monkeypatch):
+    """A failed batch stops only its shard; backfill_embeddings completes without raising."""
+    monkeypatch.setattr(settings, "spanner_backfill_concurrency", 4)
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = FakeDatabase()
+    monkeypatch.setattr(store, "ensure_embedding_model", lambda: None)
+
+    # Every shard reads one batch; embedding always fails (e.g. Vertex 409 quota).
+    monkeypatch.setattr(store, "_read_unembedded_batch", lambda prefix, limit: [{"id": prefix}])
+
+    def boom(rows):
+        raise RuntimeError("429 quota exceeded")
+
+    monkeypatch.setattr(store, "_add_chunks_with_spanner_embeddings", boom)
+
+    # Must not raise, and embeds 0 (all batches failed) — rows stay NULL for the next pass.
+    total = store.backfill_embeddings()
+    assert total == 0
+
+
+def test_spanner_store_get_stats_includes_backfill_progress(monkeypatch):
+    """get_stats exposes embedded/awaiting counts that drive the dashboard backfill section."""
+    monkeypatch.setattr(settings, "storage_backend", "spanner")
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = FakeDatabase()
+
+    stats = store.get_stats()
+
+    assert "embedded_chunks" in stats
+    assert "awaiting_embedding" in stats
+    assert stats["awaiting_embedding"] == max(stats["total_chunks"] - stats["embedded_chunks"], 0)
 
 
 def test_read_unembedded_batch_filters_by_id_prefix(monkeypatch):

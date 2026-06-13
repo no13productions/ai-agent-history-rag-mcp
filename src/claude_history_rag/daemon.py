@@ -83,7 +83,7 @@ async def periodic_optimize(stop_event: asyncio.Event) -> None:
 
 
 async def periodic_backfill(stop_event: asyncio.Event) -> None:
-    """Periodically backfill NULL embeddings via partitioned DML (deferred Spanner mode)."""
+    """Periodically backfill NULL embeddings via sharded workers (deferred Spanner mode)."""
     from claude_history_rag.store import store
 
     backfill = getattr(store, "backfill_embeddings_async", None)
@@ -166,8 +166,9 @@ async def run_daemon():
             and settings.spanner_defer_embeddings
         ):
             logger.info(
-                "[SERVER] Deferred embeddings enabled; backfilling every %ss via partitioned DML",
+                "[SERVER] Deferred embeddings enabled; backfilling every %ss via %s sharded workers",
                 settings.spanner_backfill_interval_seconds,
+                settings.spanner_backfill_concurrency,
             )
             backfill_task = asyncio.create_task(periodic_backfill(stop_event))
 

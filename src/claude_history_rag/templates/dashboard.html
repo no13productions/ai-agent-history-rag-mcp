@@ -500,6 +500,34 @@
                 </div>
             </div>
 
+            <!-- Embedding Backfill Card -->
+            <div class="card">
+                <h2>Embedding Backfill</h2>
+                <div class="metric">
+                    <span class="metric-label">Embedded</span>
+                    <span class="metric-value" id="bf-embedded">-</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Awaiting</span>
+                    <span class="metric-value" id="bf-awaiting">-</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Progress</span>
+                    <span class="metric-value" id="bf-pct">-</span>
+                </div>
+                <div style="background:#e9ecef;border-radius:6px;height:8px;margin:8px 0;overflow:hidden;">
+                    <div id="bf-bar" style="background:#27ae60;height:100%;width:0%;transition:width 0.6s ease;"></div>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Rate</span>
+                    <span class="metric-value" id="bf-rate">-</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">ETA</span>
+                    <span class="metric-value" id="bf-eta">-</span>
+                </div>
+            </div>
+
             <!-- Indexing Progress Card -->
             <div class="card">
                 <h2 style="display: flex; justify-content: space-between; align-items: center;">
@@ -1149,6 +1177,46 @@
                 document.getElementById('db-size').textContent = formatBytes(data.database.database_size_bytes);
                 if (data.database.error) {
                     document.getElementById('db-chunks').textContent = 'Error';
+                }
+
+                // Embedding Backfill — done / awaiting / progress / live rate / ETA
+                const bfEmbedded = data.database.embedded_chunks;
+                const bfAwaiting = data.database.awaiting_embedding;
+                const bfTotal = data.database.total_chunks;
+                if (bfEmbedded === null || bfEmbedded === undefined) {
+                    // Backend without server-side embedding backfill (e.g. LanceDB)
+                    document.getElementById('bf-embedded').textContent = 'n/a';
+                    document.getElementById('bf-awaiting').textContent = 'n/a';
+                    document.getElementById('bf-pct').textContent = '-';
+                    document.getElementById('bf-rate').textContent = '-';
+                    document.getElementById('bf-eta').textContent = '-';
+                } else {
+                    document.getElementById('bf-embedded').textContent = bfEmbedded.toLocaleString();
+                    document.getElementById('bf-awaiting').textContent = (bfAwaiting ?? 0).toLocaleString();
+                    const pct = bfTotal > 0 ? (bfEmbedded / bfTotal * 100) : 0;
+                    document.getElementById('bf-pct').textContent = pct.toFixed(1) + '%';
+                    document.getElementById('bf-bar').style.width = pct.toFixed(1) + '%';
+                    // Live rate from successive polls (this dashboard auto-refreshes)
+                    const now = Date.now();
+                    if (window._bfPrev && now > window._bfPrev.t) {
+                        const dRows = bfEmbedded - window._bfPrev.e;
+                        const dMin = (now - window._bfPrev.t) / 60000;
+                        const rate = dMin > 0 ? Math.round(dRows / dMin) : 0;
+                        if (bfAwaiting === 0) {
+                            document.getElementById('bf-rate').textContent = 'complete';
+                            document.getElementById('bf-eta').textContent = 'done';
+                            document.getElementById('bf-bar').style.background = '#2ecc71';
+                        } else if (rate > 0) {
+                            document.getElementById('bf-rate').textContent = rate.toLocaleString() + ' /min';
+                            const etaMin = Math.ceil(bfAwaiting / rate);
+                            document.getElementById('bf-eta').textContent =
+                                etaMin < 60 ? etaMin + ' min' : (etaMin / 60).toFixed(1) + ' h';
+                        } else {
+                            document.getElementById('bf-rate').textContent = 'idle';
+                            document.getElementById('bf-eta').textContent = '—';
+                        }
+                    }
+                    window._bfPrev = { e: bfEmbedded, t: now };
                 }
 
                 // Performance
