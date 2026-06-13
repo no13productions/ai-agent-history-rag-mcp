@@ -759,6 +759,7 @@
         let refreshPaused = false;
 
         function formatBytes(bytes) {
+            if (bytes === null || bytes === undefined || Number.isNaN(Number(bytes))) return '-';
             if (bytes === 0) return '0 B';
             const k = 1024;
             const sizes = ['B', 'KB', 'MB', 'GB'];
@@ -1163,7 +1164,11 @@
                 document.getElementById('embedder-loaded').textContent = data.embedder.loaded ? 'Yes' : 'No';
 
                 // File Watcher
-                document.getElementById('watcher-running').textContent = data.file_watcher.is_running ? 'Yes' : 'No';
+                const runningSources = data.file_watcher.running_sources ?? (data.file_watcher.is_running ? 1 : 0);
+                const totalSources = data.file_watcher.total_sources ?? 1;
+                document.getElementById('watcher-running').textContent = data.file_watcher.is_running
+                    ? `Yes (${runningSources} / ${totalSources})`
+                    : 'No';
                 document.getElementById('watcher-queue').textContent = `${data.file_watcher.queue_size} / ${data.file_watcher.queue_max_size}`;
                 document.getElementById('watcher-failed').textContent = data.file_watcher.failed_files_count;
 

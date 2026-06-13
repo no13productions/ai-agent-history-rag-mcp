@@ -227,10 +227,15 @@ class StatusCollector:
         # File watcher check
         try:
             watchers = get_all_watchers()
-            all_running = all(watcher.is_running for watcher in watchers)
+            running_count = sum(1 for watcher in watchers if watcher.is_running)
+            any_running = running_count > 0
+            all_running = bool(watchers) and running_count == len(watchers)
             checks["file_watcher"] = {
-                "status": "ok" if all_running else "stopped",
-                "is_running": all_running,
+                "status": "ok" if any_running else "stopped",
+                "is_running": any_running,
+                "all_sources_running": all_running,
+                "running_sources": running_count,
+                "total_sources": len(watchers),
             }
         except Exception as e:
             checks["file_watcher"] = {
@@ -331,13 +336,17 @@ class StatusCollector:
             files_indexed = sum(s["files_indexed"] for s in source_status.values())
             files_pending = sum(s["files_pending"] for s in source_status.values())
             files_failed = sum(s["files_failed"] for s in source_status.values())
+            running_sources = sum(1 for watcher in watchers if watcher.is_running)
 
             return {
-                "status": "active" if all(w.is_running for w in watchers) else "stopped",
+                "status": "active" if running_sources else "stopped",
                 "files_discovered": files_discovered,
                 "files_indexed": files_indexed,
                 "files_pending": files_pending,
                 "files_failed": files_failed,
+                "running_sources": running_sources,
+                "total_sources": len(watchers),
+                "all_sources_running": bool(watchers) and running_sources == len(watchers),
                 "sources": source_status,
             }
         except Exception as e:
@@ -443,9 +452,13 @@ class StatusCollector:
             }
             queue_size = sum(source["queue_size"] for source in source_stats.values())
             failed_count = sum(source["failed_files_count"] for source in source_stats.values())
+            running_sources = sum(1 for watcher in watchers if watcher.is_running)
 
             return {
-                "is_running": all(watcher.is_running for watcher in watchers),
+                "is_running": running_sources > 0,
+                "all_sources_running": bool(watchers) and running_sources == len(watchers),
+                "running_sources": running_sources,
+                "total_sources": len(watchers),
                 "projects_path": str(settings.projects_path),
                 "codex_sessions_path": str(settings.codex_sessions_path),
                 "gemini_sessions_path": str(settings.gemini_sessions_path),
