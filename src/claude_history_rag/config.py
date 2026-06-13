@@ -137,11 +137,15 @@ class Settings(BaseSettings):
     # gemini-embedding-001 caps a request at 20,000 tokens (<=2,048 counted per text), so ~9-10
     # worst-case-size chunks is the safe ceiling. Throughput comes from parallelism, not RPC size.
     spanner_embedding_rpc_batch_size: int = 10
-    # Insert rows without vectors and backfill embeddings asynchronously via partitioned DML.
+    # Insert rows without vectors and backfill embeddings asynchronously (deferred mode).
     # Decouples ingest speed from embedding latency (max ingest throughput for large backfills).
     spanner_defer_embeddings: bool = False
-    # Parallel partitions for the embedding backfill (the pdml_max_parallelism hint).
-    spanner_pdml_max_parallelism: int = 20
+    # Concurrent shard workers for the embedding backfill. NULL-vector rows are sharded by Id
+    # hex-prefix (256 slices) and drained by this many workers in parallel — the lever that
+    # saturates the Vertex quota, since partitioned DML is capped by Spanner table splits.
+    spanner_backfill_concurrency: int = 16
+    # Rows read + embedded per batch, per shard worker (one batched ML.PREDICT call each).
+    spanner_backfill_batch_size: int = 200
     # Daemon embedding-backfill cadence (seconds) when spanner_defer_embeddings is enabled.
     spanner_backfill_interval_seconds: int = 60
 
@@ -448,14 +452,24 @@ class Settings(BaseSettings):
             )
         return v
 
-    @field_validator("spanner_pdml_max_parallelism")
+    @field_validator("spanner_backfill_concurrency")
     @classmethod
-    def validate_spanner_pdml_max_parallelism(cls, v: int) -> int:
-        """Validate partitioned-DML parallelism for the embedding backfill."""
+    def validate_spanner_backfill_concurrency(cls, v: int) -> int:
+        """Validate concurrent shard-worker count for the embedding backfill."""
         if v < 1:
-            raise ValueError("spanner_pdml_max_parallelism must be positive")
-        if v > 1000:
-            raise ValueError("spanner_pdml_max_parallelism must be <= 1000")
+            raise ValueError("spanner_backfill_concurrency must be positive")
+        if v > 256:
+            raise ValueError("spanner_backfill_concurrency must be <= 256 (one per Id shard)")
+        return v
+
+    @field_validator("spanner_backfill_batch_size")
+    @classmethod
+    def validate_spanner_backfill_batch_size(cls, v: int) -> int:
+        """Validate rows-per-batch for each backfill shard worker."""
+        if v < 1:
+            raise ValueError("spanner_backfill_batch_size must be positive")
+        if v > 2000:
+            raise ValueError("spanner_backfill_batch_size must be <= 2000")
         return v
 
     @field_validator("spanner_backfill_interval_seconds")
