@@ -440,6 +440,21 @@ def test_spanner_store_get_stats_includes_backfill_progress(monkeypatch):
     assert stats["awaiting_embedding"] == max(stats["total_chunks"] - stats["embedded_chunks"], 0)
 
 
+def test_embedding_counts_are_ttl_cached(monkeypatch):
+    """The expensive count scan is cached — repeated polls don't re-scan within the TTL."""
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = FakeDatabase()
+    scans = []
+    monkeypatch.setattr(store, "_embedding_counts_uncached", lambda: (scans.append(1), (10, 4))[1])
+
+    first = store._embedding_counts()
+    second = store._embedding_counts()
+
+    assert first == (10, 4)
+    assert second == (10, 4)
+    assert len(scans) == 1  # cached — the O(table) scan ran exactly once
+
+
 def test_read_unembedded_batch_filters_by_id_prefix(monkeypatch):
     """_read_unembedded_batch targets one Id shard with a bounded SELECT."""
     store = SpannerStore(project="p", instance="i", database="d")
