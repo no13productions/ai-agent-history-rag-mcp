@@ -440,19 +440,24 @@ def test_spanner_store_get_stats_includes_backfill_progress(monkeypatch):
     assert stats["awaiting_embedding"] == max(stats["total_chunks"] - stats["embedded_chunks"], 0)
 
 
-def test_embedding_counts_are_ttl_cached(monkeypatch):
-    """The expensive count scan is cached — repeated polls don't re-scan within the TTL."""
+def test_compute_stats_reports_embed_rate_and_eta(monkeypatch):
+    """_compute_stats derives rate/min and ETA from the change in embedded count over time."""
+    import time as _time
+
     store = SpannerStore(project="p", instance="i", database="d")
     store._database = FakeDatabase()
-    scans = []
-    monkeypatch.setattr(store, "_embedding_counts_uncached", lambda: (scans.append(1), (10, 4))[1])
+    monkeypatch.setattr(store, "_embedding_counts", lambda: (1000, 700))
+    # Previous sample: 100 embedded, 60s ago -> +600 over ~60s -> ~600/min.
+    store._rate_sample = (_time.monotonic() - 60.0, 100)
 
-    first = store._embedding_counts()
-    second = store._embedding_counts()
+    stats = store._compute_stats()
 
-    assert first == (10, 4)
-    assert second == (10, 4)
-    assert len(scans) == 1  # cached — the O(table) scan ran exactly once
+    assert stats["embedded_chunks"] == 700
+    assert stats["awaiting_embedding"] == 300
+    assert 560 <= stats["backfill_rate_per_min"] <= 640
+    # ETA = awaiting / (rate per second) ~= 300 / 10 ~= 30s.
+    assert stats["backfill_eta_seconds"] is not None
+    assert 25 <= stats["backfill_eta_seconds"] <= 35
 
 
 def test_get_stats_is_ttl_cached(monkeypatch):
