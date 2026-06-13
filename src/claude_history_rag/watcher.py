@@ -59,6 +59,30 @@ def _count_file_lines(file_path: Path) -> int:
         return 0
 
 
+def _machine_scoped_chunk_id(machine_id: str, chunk_id: Any) -> str:
+    """Return a deterministic machine-scoped storage id for shared backends."""
+    return hashlib.sha256(f"{machine_id}\x00{chunk_id or ''}".encode()).hexdigest()
+
+
+def _scope_chunk_for_direct_store(chunk: dict[str, Any], machine_id: str) -> dict[str, Any]:
+    """Scope direct-write chunk ids so multiple machines can share one database."""
+    scoped = dict(chunk)
+    scoped["id"] = _machine_scoped_chunk_id(machine_id, scoped.get("id"))
+    scoped["machine_id"] = machine_id
+
+    parent_chunk_id = scoped.get("parent_chunk_id")
+    if parent_chunk_id is not None:
+        scoped["parent_chunk_id"] = _machine_scoped_chunk_id(machine_id, parent_chunk_id)
+
+    child_chunk_ids = scoped.get("child_chunk_ids")
+    if isinstance(child_chunk_ids, list):
+        scoped["child_chunk_ids"] = [
+            _machine_scoped_chunk_id(machine_id, child_id) for child_id in child_chunk_ids
+        ]
+
+    return scoped
+
+
 async def _queue_all_watchers_for_reindex() -> int:
     """Queue all files for indexing across all client watchers."""
     total_queued = 0
@@ -864,7 +888,10 @@ class HistoryWatcher:
         try:
             for chunk in self._chunker(file_path, start_line):
                 chunk_dict = chunk.model_dump()
-                chunk_dict["machine_id"] = settings.machine_id
+                if settings.storage_backend == "spanner":
+                    chunk_dict = _scope_chunk_for_direct_store(chunk_dict, settings.machine_id)
+                else:
+                    chunk_dict["machine_id"] = settings.machine_id
                 chunk_batch.append(chunk_dict)
                 if chunk.source_line > max_line:
                     max_line = chunk.source_line

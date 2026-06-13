@@ -24,7 +24,11 @@ from claude_history_rag.status_server import (
     _server_chunk_id,
     _validate_upload_chunks,
 )
-from claude_history_rag.watcher import HistoryWatcher, _count_file_lines
+from claude_history_rag.watcher import (
+    HistoryWatcher,
+    _count_file_lines,
+    _machine_scoped_chunk_id,
+)
 
 
 class FakeEmbedder:
@@ -114,6 +118,8 @@ def _single_chunker(file_path, start_line=0):
         timestamp="2026-06-13T00:00:00Z",
         source_file=str(file_path),
         source_line=1,
+        parent_chunk_id="parent-1",
+        child_chunk_ids=["child-1"],
     )
 
 
@@ -135,7 +141,13 @@ async def test_local_direct_indexing_stamps_machine_id(monkeypatch, tmp_path):
 
     await watcher._index_file(history_file, embedder=None, store=store)
 
-    assert store.chunks[0]["machine_id"] == "macbook-laptop"
+    stored = store.chunks[0]
+    assert stored["machine_id"] == "macbook-laptop"
+    assert stored["id"] == _machine_scoped_chunk_id("macbook-laptop", "chunk-1")
+    assert stored["parent_chunk_id"] == _machine_scoped_chunk_id("macbook-laptop", "parent-1")
+    assert stored["child_chunk_ids"] == [
+        _machine_scoped_chunk_id("macbook-laptop", "child-1")
+    ]
 
 
 @pytest.mark.asyncio
