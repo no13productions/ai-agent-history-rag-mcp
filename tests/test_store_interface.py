@@ -89,6 +89,11 @@ class FakeDatabase:
         self.ddl = []
         self.ddl_completed = False
         self.batch_obj = FakeBatch()
+        self.pdml_calls = []
+
+    def execute_partitioned_dml(self, sql):
+        self.pdml_calls.append(sql)
+        return 7
 
     def snapshot(self):
         return FakeSnapshot(self)
@@ -177,7 +182,9 @@ def test_spanner_schema_ddl_uses_configured_vector_dimension(monkeypatch):
 
     ddl = "\n".join(get_spanner_schema_ddl())
 
-    assert "Vector ARRAY<FLOAT32>(vector_length=>3072) NOT NULL" in ddl
+    # Vector is nullable so deferred-embedding mode can land rows before vectors exist.
+    assert "Vector ARRAY<FLOAT32>(vector_length=>3072)" in ddl
+    assert "Vector ARRAY<FLOAT32>(vector_length=>3072) NOT NULL" not in ddl
     assert f"CREATE TABLE {SPANNER_TABLE_NAME}" in ddl
     assert f"{SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST" in ddl
     assert "TOKENIZE_FULLTEXT(Content)" in ddl
@@ -192,6 +199,8 @@ def test_spanner_vector_index_ddl_is_separate_from_base_schema(monkeypatch):
 
     assert f"CREATE VECTOR INDEX {SPANNER_VECTOR_INDEX}" in ddl
     assert f"ON {SPANNER_TABLE_NAME}(Vector)" in ddl
+    # Partial index over embedded rows only (Vector is nullable in deferred mode).
+    assert "WHERE Vector IS NOT NULL" in ddl
     assert "distance_type = 'COSINE'" in ddl
     assert "num_leaves = 2048" in ddl
 
@@ -271,18 +280,121 @@ def test_spanner_store_add_chunks_can_generate_embeddings_in_spanner(monkeypatch
                 "source_file": "/source.jsonl",
                 "source_line": 1,
                 "machine_id": "machine",
-            }
+            },
+            {
+                "id": "chunk-2",
+                "content": "more content",
+                "chunk_type": "turn",
+                "session_id": "session-1",
+                "timestamp": datetime(2026, 1, 1, tzinfo=UTC),
+                "source_file": "/source.jsonl",
+                "source_line": 2,
+                "machine_id": "machine",
+            },
         ]
     )
 
+    # A whole batch is embedded in ONE batched INSERT ... SELECT, not one DML per chunk.
+    assert len(database.sql_calls) == 1
     call = database.sql_calls[-1]
     assert "INSERT OR UPDATE INTO ConversationChunks" in call["sql"]
     assert "ML.PREDICT" in call["sql"]
     assert "MODEL ConversationEmbeddingModel" in call["sql"]
+    assert "FROM UNNEST(@rows)" in call["sql"]
+    assert "remote_udf_max_rows_per_rpc=" in call["sql"]
     assert "RETRIEVAL_DOCUMENT" not in call["sql"]
     assert "CAST(value AS FLOAT32)" in call["sql"]
-    assert call["params"]["id"] == "chunk-1"
     assert call["params"]["task_type"] == "RETRIEVAL_DOCUMENT"
+    rows = call["params"]["rows"]
+    assert len(rows) == 2
+    # Struct field order: id is first, content second (see _CHUNK_STRUCT_FIELDS).
+    assert rows[0][0] == "chunk-1"
+    assert rows[0][1] == "content"
+    assert rows[1][0] == "chunk-2"
+
+
+def test_chunk_struct_value_matches_declared_field_order(monkeypatch):
+    """The positional STRUCT value lines up with _CHUNK_STRUCT_FIELDS and omits Vector."""
+    store = SpannerStore(project="p", instance="i", database="d")
+    chunk = {
+        "id": "c1",
+        "content": "hello",
+        "chunk_type": "turn",
+        "session_id": "s1",
+        "project_path": "/p",
+        "project_name": "p",
+        "timestamp": datetime(2026, 1, 1, tzinfo=UTC),
+        "source_file": "/f.jsonl",
+        "source_line": 4,
+        "child_chunk_ids": ["a", "b"],
+        "machine_id": "m",
+    }
+    value = store._chunk_struct_value(chunk)
+    fields = store._CHUNK_STRUCT_FIELDS
+    assert len(value) == len(fields)
+    assert "vector" not in fields
+    assert value[fields.index("id")] == "c1"
+    assert value[fields.index("content")] == "hello"
+    assert value[fields.index("source_line")] == 4
+    assert value[fields.index("child_chunk_ids")] == ["a", "b"]
+
+
+def test_spanner_store_defer_embeddings_inserts_without_vector(monkeypatch):
+    """Deferred mode lands rows via mutations with the Vector column omitted (NULL)."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
+    monkeypatch.setattr(settings, "spanner_defer_embeddings", True)
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+
+    store.add_chunks(
+        [
+            {
+                "id": "chunk-1",
+                "content": "content",
+                "chunk_type": "turn",
+                "session_id": "session-1",
+                "timestamp": datetime(2026, 1, 1, tzinfo=UTC),
+                "source_file": "/source.jsonl",
+                "source_line": 1,
+                "machine_id": "machine",
+            }
+        ]
+    )
+
+    # No ML.PREDICT DML on the write path; rows are inserted vector-less via mutations.
+    assert database.sql_calls == []
+    call = database.batch_obj.insert_or_update_calls[0]
+    assert call["table"] == SPANNER_TABLE_NAME
+    assert "Vector" not in call["columns"]
+    assert call["values"][0][0] == "chunk-1"
+
+
+def test_spanner_store_backfill_embeddings_uses_partitioned_dml(monkeypatch):
+    """backfill_embeddings issues a partitioned DML UPDATE with SAFE.ML.PREDICT."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
+    monkeypatch.setattr(settings, "spanner_embedding_model_id", "ConversationEmbeddingModel")
+    monkeypatch.setattr(settings, "vertex_document_task_type", "RETRIEVAL_DOCUMENT")
+    monkeypatch.setattr(settings, "spanner_pdml_max_parallelism", 12)
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+    monkeypatch.setattr(store, "ensure_embedding_model", lambda: None)
+
+    updated = store.backfill_embeddings()
+
+    assert updated == 7
+    sql = database.pdml_calls[-1]
+    assert "pdml_max_parallelism=12" in sql
+    assert "UPDATE ConversationChunks" in sql
+    assert "SAFE.ML.PREDICT" in sql
+    assert "WHERE Vector IS NULL" in sql
+    assert "remote_udf_max_rows_per_rpc=" in sql
+    assert "'RETRIEVAL_DOCUMENT'" in sql  # task type is a safe, validated literal
 
 
 def test_spanner_store_treats_none_vector_as_unembedded(monkeypatch):

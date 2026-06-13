@@ -241,7 +241,7 @@ def get_spanner_schema_ddl() -> list[str]:
             Content STRING(MAX) NOT NULL,
             {SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST
                 AS (TOKENIZE_FULLTEXT(Content)) HIDDEN,
-            Vector ARRAY<FLOAT32>(vector_length=>{dim}) NOT NULL,
+            Vector ARRAY<FLOAT32>(vector_length=>{dim}),
             ChunkType STRING(32) NOT NULL,
             SessionId STRING(128) NOT NULL,
             ProjectPath STRING(MAX) NOT NULL,
@@ -278,6 +278,7 @@ def get_spanner_vector_index_ddl() -> str:
         CREATE VECTOR INDEX {SPANNER_VECTOR_INDEX}
         ON {SPANNER_TABLE_NAME}(Vector)
         STORING (ChunkType, SessionId, ProjectName, MachineId)
+        WHERE Vector IS NOT NULL
         OPTIONS (
             distance_type = 'COSINE',
             tree_depth = 2,
@@ -316,7 +317,8 @@ def get_spanner_embedding_model_ddl(project: str) -> str:
             >
         )
         REMOTE OPTIONS (
-            endpoint = '{endpoint}'
+            endpoint = '{endpoint}',
+            default_batch_size = {settings.spanner_embedding_rpc_batch_size}
         )
     """
 
@@ -1381,53 +1383,76 @@ class SpannerStore:
             chunk.get("machine_id"),
         ]
 
-    def _chunk_params(self, chunk: dict[str, Any]) -> dict[str, Any]:
-        """Convert a chunk dict to DML parameters."""
-        return {
-            "id": chunk.get("id"),
-            "content": chunk.get("content"),
-            "chunk_type": chunk.get("chunk_type"),
-            "session_id": chunk.get("session_id"),
-            "project_path": chunk.get("project_path"),
-            "project_name": chunk.get("project_name"),
-            "timestamp": _normalize_timestamp(chunk.get("timestamp")),
-            "user_uuid": chunk.get("user_uuid"),
-            "assistant_uuid": chunk.get("assistant_uuid"),
-            "file_path": chunk.get("file_path"),
-            "operation": chunk.get("operation"),
-            "model": chunk.get("model"),
-            "source_file": chunk.get("source_file"),
-            "source_line": int(chunk.get("source_line", 0)),
-            "parent_chunk_id": chunk.get("parent_chunk_id"),
-            "child_chunk_ids": chunk.get("child_chunk_ids"),
-            "machine_id": chunk.get("machine_id"),
-        }
+    # Field order for the ARRAY<STRUCT> ML.PREDICT input. MUST match _chunk_struct_value()
+    # and the column list in _batched_insert_with_spanner_embedding_sql(). Vector is omitted
+    # because ML.PREDICT computes it; "content"/"task_type" are the model's INPUT columns and
+    # every other field is passed through to the prediction output relation.
+    _CHUNK_STRUCT_FIELDS = [
+        "id",
+        "content",
+        "chunk_type",
+        "session_id",
+        "project_path",
+        "project_name",
+        "timestamp",
+        "user_uuid",
+        "assistant_uuid",
+        "file_path",
+        "operation",
+        "model",
+        "source_file",
+        "source_line",
+        "parent_chunk_id",
+        "child_chunk_ids",
+        "machine_id",
+    ]
 
-    def _chunk_param_types(self) -> dict[str, Any]:
-        """Return Spanner parameter types for chunk DML."""
+    def _chunk_struct_param_type(self) -> Any:
+        """Return the ARRAY<STRUCT> Spanner parameter type for a batch of chunks."""
         try:
             from google.cloud.spanner_v1 import param_types
         except ImportError as e:
             raise RuntimeError("google-cloud-spanner is required") from e
-        return {
-            "id": param_types.STRING,
-            "content": param_types.STRING,
-            "chunk_type": param_types.STRING,
-            "session_id": param_types.STRING,
-            "project_path": param_types.STRING,
-            "project_name": param_types.STRING,
+        field_types = {
             "timestamp": param_types.TIMESTAMP,
-            "user_uuid": param_types.STRING,
-            "assistant_uuid": param_types.STRING,
-            "file_path": param_types.STRING,
-            "operation": param_types.STRING,
-            "model": param_types.STRING,
-            "source_file": param_types.STRING,
             "source_line": param_types.INT64,
-            "parent_chunk_id": param_types.STRING,
             "child_chunk_ids": param_types.Array(param_types.STRING),
-            "machine_id": param_types.STRING,
         }
+        struct = param_types.Struct(
+            [
+                param_types.StructField(name, field_types.get(name, param_types.STRING))
+                for name in self._CHUNK_STRUCT_FIELDS
+            ]
+        )
+        return param_types.Array(struct)
+
+    def _chunk_struct_value(self, chunk: dict[str, Any]) -> list[Any]:
+        """Convert a chunk dict to a positional STRUCT value (order = _CHUNK_STRUCT_FIELDS)."""
+        return [
+            chunk.get("id"),
+            chunk.get("content"),
+            chunk.get("chunk_type"),
+            chunk.get("session_id"),
+            chunk.get("project_path"),
+            chunk.get("project_name"),
+            _normalize_timestamp(chunk.get("timestamp")),
+            chunk.get("user_uuid"),
+            chunk.get("assistant_uuid"),
+            chunk.get("file_path"),
+            chunk.get("operation"),
+            chunk.get("model"),
+            chunk.get("source_file"),
+            int(chunk.get("source_line", 0)),
+            chunk.get("parent_chunk_id"),
+            chunk.get("child_chunk_ids"),
+            chunk.get("machine_id"),
+        ]
+
+    def _chunk_values_no_vector(self, chunk: dict[str, Any]) -> list[Any]:
+        """Mutation values for a chunk with the Vector column omitted (left NULL)."""
+        values = self._chunk_values(chunk)
+        # SPANNER_COLUMNS index 2 is "Vector"; drop it for deferred-embedding inserts.
+        return values[:2] + values[3:]
 
     def _embedding_vector_sql(self, content_sql: str, task_type_sql: str) -> str:
         """Return SQL expression that generates a FLOAT32 embedding via ML.PREDICT."""
@@ -1445,48 +1470,140 @@ class SpannerStore:
             )
         """
 
-    def _insert_with_spanner_embedding_sql(self) -> str:
-        """Return DML that upserts one chunk and generates its embedding in Spanner."""
-        vector_expr = self._embedding_vector_sql("@content", "@task_type")
+    def _batched_insert_with_spanner_embedding_sql(self) -> str:
+        """DML that upserts a whole batch of chunks, embedding them in ONE ML.PREDICT.
+
+        The batch is passed as the @rows ARRAY<STRUCT> parameter and UNNESTed into the
+        model input. ML.PREDICT passes every input column through to its output relation
+        (pred.*), so the outer SELECT reads the passthrough columns and the computed
+        embedding. The @{remote_udf_max_rows_per_rpc=N} hint makes Spanner fan the batch
+        into N-row Vertex RPCs instead of one-call-per-row.
+        """
+        model_id = settings.spanner_embedding_model_id
+        dim = get_current_vector_dim()
+        rpc = settings.spanner_embedding_rpc_batch_size
         return f"""
             INSERT OR UPDATE INTO {SPANNER_TABLE_NAME} (
                 Id, Content, Vector, ChunkType, SessionId, ProjectPath, ProjectName,
                 Timestamp, UserUuid, AssistantUuid, FilePath, Operation, Model,
                 SourceFile, SourceLine, ParentChunkId, ChildChunkIds, MachineId
             )
-            VALUES (
-                @id, @content, {vector_expr}, @chunk_type, @session_id, @project_path,
-                @project_name, @timestamp, @user_uuid, @assistant_uuid, @file_path,
-                @operation, @model, @source_file, @source_line, @parent_chunk_id,
-                @child_chunk_ids, @machine_id
-            )
+            SELECT
+                pred.id, pred.content,
+                ARRAY(SELECT CAST(value AS FLOAT32) FROM UNNEST(pred.embeddings.values) AS value),
+                pred.chunk_type, pred.session_id, pred.project_path, pred.project_name,
+                pred.timestamp, pred.user_uuid, pred.assistant_uuid, pred.file_path,
+                pred.operation, pred.model, pred.source_file, pred.source_line,
+                pred.parent_chunk_id, pred.child_chunk_ids, pred.machine_id
+            FROM ML.PREDICT(
+                MODEL {model_id},
+                (
+                    SELECT
+                        id, content, chunk_type, session_id, project_path, project_name,
+                        timestamp, user_uuid, assistant_uuid, file_path, operation, model,
+                        source_file, source_line, parent_chunk_id, child_chunk_ids, machine_id,
+                        @task_type AS task_type
+                    FROM UNNEST(@rows)
+                ),
+                STRUCT({dim} AS outputDimensionality)
+            ) @{{remote_udf_max_rows_per_rpc={rpc}}} AS pred
         """
 
     def _add_chunks_with_spanner_embeddings(self, chunks: list[dict[str, Any]]) -> None:
-        """Add unembedded chunks and generate vectors inside Spanner with ML.PREDICT."""
+        """Add unembedded chunks, generating all vectors in ONE batched ML.PREDICT.
+
+        Replaces the legacy one-DML-per-chunk loop (which made one serial Vertex RPC per
+        chunk) with a single INSERT ... SELECT over the whole batch, fanned into N-row RPCs
+        by the remote_udf_max_rows_per_rpc hint.
+        """
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+
         self.ensure_embedding_model()
         database = self.connect()
-        sql = self._insert_with_spanner_embedding_sql()
-        param_types = self._chunk_param_types()
-        param_types["task_type"] = param_types["content"]
+        sql = self._batched_insert_with_spanner_embedding_sql()
+        params = {
+            "rows": [self._chunk_struct_value(chunk) for chunk in chunks],
+            "task_type": settings.vertex_document_task_type,
+        }
+        spanner_param_types = {
+            "rows": self._chunk_struct_param_type(),
+            "task_type": param_types.STRING,
+        }
 
-        def insert_chunks(transaction):
-            row_count = 0
-            for chunk in chunks:
-                params = self._chunk_params(chunk)
-                params["task_type"] = settings.vertex_document_task_type
-                row_count += transaction.execute_update(
-                    sql,
-                    params=params,
-                    param_types=param_types,
-                )
-            return row_count
+        def insert_batch(transaction):
+            return transaction.execute_update(
+                sql,
+                params=params,
+                param_types=spanner_param_types,
+            )
 
-        row_count = database.run_in_transaction(insert_chunks)
+        row_count = database.run_in_transaction(insert_batch)
         logger.info(
-            "Added %s chunks to Spanner store using Spanner-native embeddings",
+            "Added %s chunks to Spanner store via batched Spanner-native embeddings (rpc_batch=%s)",
             row_count,
+            settings.spanner_embedding_rpc_batch_size,
         )
+
+    def add_chunks_without_embeddings(self, chunks: list[dict[str, Any]]) -> None:
+        """Insert chunks with the Vector column left NULL (deferred-embedding mode).
+
+        Ingest is decoupled from embedding: rows land immediately via the mutation API and
+        are filled in later by backfill_embeddings(). Search already filters Vector IS NOT
+        NULL, so un-embedded rows are simply invisible until backfilled.
+        """
+        if not chunks:
+            return
+        database = self.connect()
+        columns = [column for column in SPANNER_COLUMNS if column != "Vector"]
+        values = [self._chunk_values_no_vector(chunk) for chunk in chunks]
+        with database.batch() as batch:
+            batch.insert_or_update(table=SPANNER_TABLE_NAME, columns=columns, values=values)
+        logger.info(
+            "Inserted %s chunks to Spanner store without embeddings (deferred backfill)",
+            len(chunks),
+        )
+
+    def backfill_embeddings(self) -> int:
+        """Fill NULL vectors via partitioned DML — parallel, throttle-retrying, re-runnable.
+
+        Spanner fans the UPDATE across partitions (pdml_max_parallelism), batches Vertex
+        calls (remote_udf_max_rows_per_rpc), and auto-retries throttled requests. SAFE.ML.PREDICT
+        yields NULL on per-row failure; the WHERE clause keeps such rows NULL so a re-run picks
+        them up. Returns the number of rows updated. No-op (0) when no rows need embedding.
+        """
+        self.ensure_embedding_model()
+        database = self.connect()
+        model_id = settings.spanner_embedding_model_id
+        dim = get_current_vector_dim()
+        task_type = settings.vertex_document_task_type  # validated to a fixed token set
+        rpc = settings.spanner_embedding_rpc_batch_size
+        parallelism = settings.spanner_pdml_max_parallelism
+        sql = f"""
+            @{{pdml_max_parallelism={parallelism}}}
+            UPDATE {SPANNER_TABLE_NAME}
+            SET Vector = (
+                SELECT ARRAY(SELECT CAST(value AS FLOAT32) FROM UNNEST(embeddings.values) AS value)
+                FROM SAFE.ML.PREDICT(
+                    MODEL {model_id},
+                    (SELECT Content AS content, '{task_type}' AS task_type),
+                    STRUCT({dim} AS outputDimensionality)
+                ) @{{remote_udf_max_rows_per_rpc={rpc}}}
+                WHERE embeddings.values IS NOT NULL
+            )
+            WHERE Vector IS NULL
+        """
+        row_count = database.execute_partitioned_dml(sql)
+        if row_count:
+            logger.info("Backfilled embeddings for %s rows via partitioned DML", row_count)
+        return row_count
+
+    async def backfill_embeddings_async(self) -> int:
+        """Run backfill_embeddings() off the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.backfill_embeddings)
 
     def add_chunks(self, chunks: list[dict[str, Any]]) -> None:
         """Add embedded chunks to Spanner."""
@@ -1495,7 +1612,11 @@ class SpannerStore:
         if settings.spanner_embedding_mode == "spanner":
             unembedded_chunks = [chunk for chunk in chunks if not chunk.get("vector")]
             if len(unembedded_chunks) == len(chunks):
-                self._add_chunks_with_spanner_embeddings(chunks)
+                if settings.spanner_defer_embeddings:
+                    # Fast path: land rows now (Vector NULL), embed later via partitioned DML.
+                    self.add_chunks_without_embeddings(chunks)
+                else:
+                    self._add_chunks_with_spanner_embeddings(chunks)
                 return
             if unembedded_chunks:
                 raise ValueError("Cannot mix embedded and unembedded chunks in one Spanner batch")
