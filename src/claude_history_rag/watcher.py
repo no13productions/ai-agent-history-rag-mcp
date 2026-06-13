@@ -17,19 +17,19 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from collections.abc import Callable, Iterator
 
 import psutil
 from watchfiles import Change, awatch
 
-from claude_history_rag.chunker import chunk_session_file
 from claude_history_rag import __version__ as package_version
-from claude_history_rag.models import Chunk
+from claude_history_rag.chunker import chunk_session_file
 from claude_history_rag.config import settings
 from claude_history_rag.errors import record_error
+from claude_history_rag.models import Chunk
 
 if TYPE_CHECKING:
     from claude_history_rag.api_client import APIClient
@@ -55,19 +55,15 @@ def _count_file_lines(file_path: Path) -> int:
     try:
         with open(file_path) as f:
             return sum(1 for _ in f)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return 0
 
 
 async def _queue_all_watchers_for_reindex() -> int:
     """Queue all files for indexing across all client watchers."""
-    from claude_history_rag.codex.watcher import get_codex_watcher
-    from claude_history_rag.gemini.watcher import get_gemini_watcher
-
-    watchers = [get_watcher(), get_codex_watcher(), get_gemini_watcher()]
     total_queued = 0
-    for watcher in watchers:
-        watcher._failed_files.clear()
+    for watcher in get_all_watchers():
+        watcher.clear_failed_files()
         total_queued += await watcher.queue_all_files_for_indexing()
     return total_queued
 
@@ -96,9 +92,7 @@ async def _handle_server_reindex(
     await state_manager.reset_for_reindex()
 
     queued = await _queue_all_watchers_for_reindex()
-    logger.warning(
-        f"Server requested reindex at {reindex_requested_at}; queued {queued} files"
-    )
+    logger.warning(f"Server requested reindex at {reindex_requested_at}; queued {queued} files")
 
     try:
         await api_client.ack_reindex(
@@ -124,11 +118,7 @@ async def _maybe_ack_reindex_completed(
     if state.pending_uploads:
         return
 
-    from claude_history_rag.codex.watcher import get_codex_watcher
-    from claude_history_rag.gemini.watcher import get_gemini_watcher
-
-    watchers = [get_watcher(), get_codex_watcher(), get_gemini_watcher()]
-    if any(watcher.queue.qsize() > 0 for watcher in watchers):
+    if any(watcher.queue.qsize() > 0 for watcher in get_all_watchers()):
         return
 
     if state.last_server_sync and state.last_server_sync < state.reindex_required_at:
@@ -249,6 +239,38 @@ class HistoryWatcher:
         """Check if the watcher is currently running."""
         return self._running
 
+    @property
+    def source_name(self) -> str:
+        """Human-readable source name for logs and status output."""
+        return self._source_name
+
+    @property
+    def failed_files_count(self) -> int:
+        """Number of files that failed indexing for this watcher."""
+        return len(self._failed_files)
+
+    def failed_files(self) -> list[str]:
+        """Return failed file paths for status reporting."""
+        return list(self._failed_files)
+
+    def clear_failed_files(self) -> None:
+        """Clear failed file tracking before a forced reindex."""
+        self._failed_files.clear()
+
+    def discover_files(self) -> list[Path]:
+        """Return currently discoverable history files for this watcher."""
+        if not self.projects_path.exists():
+            return []
+        return [
+            file_path
+            for file_path in self.projects_path.glob("**/*")
+            if _is_safe_path(file_path, self.projects_path) and self._path_filter(file_path)
+        ]
+
+    def is_allowed_history_path(self, path: Path) -> bool:
+        """Return whether a path is inside this watch root and matches this source filter."""
+        return _is_safe_path(path, self.projects_path) and self._path_filter(path)
+
     async def _watch_files(self) -> None:
         """Producer: watch for file changes."""
         logger.info(f"Starting file watcher on {self.projects_path}")
@@ -295,10 +317,17 @@ class HistoryWatcher:
             state_manager = get_client_state_manager()
             embedder = None  # Not used in client mode
         else:
-            from claude_history_rag.embedder import get_embedder
             from claude_history_rag.store import store as chunk_store
 
-            embedder = get_embedder()
+            if (
+                settings.storage_backend == "spanner"
+                and settings.spanner_embedding_mode == "spanner"
+            ):
+                embedder = None
+            else:
+                from claude_history_rag.embedder import get_embedder
+
+                embedder = get_embedder()
             api_client = None
             state_manager = None
 
@@ -346,6 +375,23 @@ class HistoryWatcher:
         self, chunk_batch: list[dict], file_path: Path, embedder: "AsyncEmbedder", store
     ) -> int | None:
         """Embed and store a batch of chunks. Returns chunk count or None on failure."""
+        if settings.storage_backend == "spanner" and settings.spanner_embedding_mode == "spanner":
+            try:
+                await store.add_chunks_async(chunk_batch)
+                return len(chunk_batch)
+            except Exception as e:
+                logger.error(
+                    f"Failed to store Spanner-native embedding batch from {file_path.name}: "
+                    f"{type(e).__name__}",
+                    exc_info=True,
+                )
+                record_error(
+                    "database",
+                    f"Failed to store Spanner-native embedding batch: {type(e).__name__}",
+                    {"file": file_path.name, "error_type": type(e).__name__},
+                )
+                return None
+
         try:
             embedded_chunks = await embedder.embed_chunks(chunk_batch)
         except Exception as e:
@@ -636,8 +682,14 @@ class HistoryWatcher:
                 # Re-queue these files for indexing
                 for file_path, server_pos, _local_pos in catchup_files:
                     path = Path(file_path)
-                    if path.exists():
+                    if path.exists() and self.is_allowed_history_path(path):
                         await self.queue.put(path)
+                    elif path.exists():
+                        logger.warning(
+                            "Ignoring catch-up path outside %s watcher root: %s",
+                            self.source_name,
+                            path.name,
+                        )
                     else:
                         # File was deleted locally - handle gracefully
                         await state_manager.handle_missing_history(file_path, server_pos)
@@ -691,6 +743,13 @@ class HistoryWatcher:
     ) -> None:
         """Index a file in client mode - chunk and prepare for upload."""
         path_str = str(file_path)
+        if not self.is_allowed_history_path(file_path):
+            logger.warning(
+                "[CLIENT] Ignoring path outside %s watcher root: %s",
+                self.source_name,
+                file_path.name,
+            )
+            return
 
         # Skip files that have failed recently
         if path_str in self._failed_files:
@@ -770,6 +829,13 @@ class HistoryWatcher:
         """Index a single file from its last known position."""
         # LOW #2: Use Path consistently instead of str for dict keys
         path_str = str(file_path)
+        if not self.is_allowed_history_path(file_path):
+            logger.warning(
+                "Ignoring path outside %s watcher root: %s",
+                self.source_name,
+                file_path.name,
+            )
+            return
 
         # MEDIUM #3: Skip files that have failed recently
         if path_str in self._failed_files:
@@ -797,7 +863,9 @@ class HistoryWatcher:
 
         try:
             for chunk in self._chunker(file_path, start_line):
-                chunk_batch.append(chunk.model_dump())
+                chunk_dict = chunk.model_dump()
+                chunk_dict["machine_id"] = settings.machine_id
+                chunk_batch.append(chunk_dict)
                 if chunk.source_line > max_line:
                     max_line = chunk.source_line
 
@@ -922,10 +990,17 @@ class HistoryWatcher:
             # Clear stale pending uploads
             await state_manager.clear_stale_pending_uploads()
         else:
-            from claude_history_rag.embedder import get_embedder
             from claude_history_rag.store import store as chunk_store
 
-            embedder = get_embedder()
+            if (
+                settings.storage_backend == "spanner"
+                and settings.spanner_embedding_mode == "spanner"
+            ):
+                embedder = None
+            else:
+                from claude_history_rag.embedder import get_embedder
+
+                embedder = get_embedder()
             api_client = None
             state_manager = None
 
@@ -1134,3 +1209,21 @@ def get_watcher() -> HistoryWatcher:
             if watcher is None:
                 watcher = HistoryWatcher()
     return watcher
+
+
+def get_all_watchers() -> list[HistoryWatcher]:
+    """Return all configured local history watchers."""
+    from claude_history_rag.antigravity.watcher import get_antigravity_watcher
+    from claude_history_rag.chatgpt.watcher import get_chatgpt_watcher
+    from claude_history_rag.claude_app.watcher import get_claude_app_watcher
+    from claude_history_rag.codex.watcher import get_codex_watcher
+    from claude_history_rag.gemini.watcher import get_gemini_watcher
+
+    return [
+        get_watcher(),
+        get_codex_watcher(),
+        get_gemini_watcher(),
+        get_antigravity_watcher(),
+        get_chatgpt_watcher(),
+        get_claude_app_watcher(),
+    ]

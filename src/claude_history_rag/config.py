@@ -1,6 +1,7 @@
 """Configuration management."""
 
 import logging
+import re
 import socket
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -9,6 +10,7 @@ from pydantic import ConfigDict, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
+GCP_LOCATION_PATTERN = re.compile(r"^[a-z]+-[a-z]+[0-9](-[a-z])?$")
 
 # Optimization interval in seconds (15 minutes)
 OPTIMIZE_INTERVAL = 900
@@ -64,8 +66,12 @@ class Settings(BaseSettings):
     codex_state_path: Path = Path.home() / ".claude-history-rag" / "codex_state.json"
     gemini_sessions_path: Path = Path.home() / ".gemini" / "tmp"
     gemini_state_path: Path = Path.home() / ".claude-history-rag" / "gemini_state.json"
-    antigravity_sessions_path: Path = Path.home() / ".gemini" / "antigravity" / "conversations"
+    antigravity_sessions_path: Path = Path.home() / ".gemini" / "antigravity"
     antigravity_state_path: Path = Path.home() / ".claude-history-rag" / "antigravity_state.json"
+    chatgpt_exports_path: Path = Path.home() / ".claude-history-rag" / "imports" / "chatgpt"
+    chatgpt_state_path: Path = Path.home() / ".claude-history-rag" / "chatgpt_state.json"
+    claude_app_exports_path: Path = Path.home() / ".claude-history-rag" / "imports" / "claude-app"
+    claude_app_state_path: Path = Path.home() / ".claude-history-rag" / "claude_app_state.json"
 
     # ============================================================
     # Client/Server Mode Settings
@@ -83,16 +89,21 @@ class Settings(BaseSettings):
     client_heartbeat_interval_seconds: int = 60  # Client heartbeat interval
 
     # ============================================================
-    # Embedding Settings (OpenAI-compatible API)
+    # Embedding Settings
     # ============================================================
-    # Works with: Ollama, vLLM, text-embeddings-inference, OpenAI, etc.
-    # Example URLs:
-    #   - Ollama: http://localhost:11434/v1
-    #   - vLLM: http://localhost:8000/v1
-    #   - OpenAI: https://api.openai.com/v1
+    # Provider "openai" works with Ollama, vLLM, text-embeddings-inference, OpenAI, etc.
+    # Provider "vertex" uses Vertex AI Model Garden prediction endpoints.
+    embedding_provider: str = "openai"
     embedding_base_url: str = "http://localhost:11434/v1"  # Default to Ollama
     embedding_model: str = "nomic-embed-text"
     embedding_api_key: str = ""  # Optional, for OpenAI or auth-required endpoints
+    embedding_dimension: int | None = None  # Override output/store dimension when needed
+    openai_embedding_send_dimensions: bool = False
+    vertex_project: str = ""  # Defaults to ADC project if empty
+    vertex_location: str = "us-central1"
+    vertex_auto_truncate: bool = True
+    vertex_query_task_type: str = "RETRIEVAL_QUERY"
+    vertex_document_task_type: str = "RETRIEVAL_DOCUMENT"
 
     # ============================================================
     # General Settings
@@ -105,6 +116,23 @@ class Settings(BaseSettings):
     gc_after_files: bool = True  # Enable garbage collection after file batches
     defer_startup_indexing: bool = False  # If True, skip initial indexing on startup
     startup_indexing_delay_ms: int = 0  # Delay between files during startup (ms, 0=no delay)
+
+    # ============================================================
+    # Storage Settings
+    # ============================================================
+    storage_backend: str = "lancedb"
+    spanner_project: str = ""
+    spanner_instance: str = ""
+    spanner_database: str = ""
+    spanner_enable_full_text: bool = True
+    spanner_enable_vector_index: bool = True
+    spanner_use_approx_vector_search: bool = True
+    spanner_vector_index_leaves: int = 1000
+    spanner_num_leaves_to_search: int = 50
+    spanner_hybrid_candidate_limit: int = 100
+    spanner_rrf_k: int = 60
+    spanner_embedding_mode: str = "app"
+    spanner_embedding_model_id: str = "ConversationEmbeddingModel"
 
     # Optimization Settings
     optimization_cleanup_older_than_seconds: int = 3600  # Default 1 hour
@@ -156,6 +184,75 @@ class Settings(BaseSettings):
         if not v or not v.strip():
             raise ValueError("embedding_model cannot be empty")
         return v.strip()
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def validate_embedding_provider(cls, v: str) -> str:
+        """Validate embedding provider name."""
+        provider = v.strip().lower()
+        if provider not in {"openai", "vertex"}:
+            raise ValueError("embedding_provider must be one of: openai, vertex")
+        return provider
+
+    @field_validator("storage_backend")
+    @classmethod
+    def validate_storage_backend(cls, v: str) -> str:
+        """Validate storage backend name."""
+        backend = v.strip().lower()
+        if backend not in {"lancedb", "spanner"}:
+            raise ValueError("storage_backend must be one of: lancedb, spanner")
+        return backend
+
+    @field_validator("spanner_embedding_mode")
+    @classmethod
+    def validate_spanner_embedding_mode(cls, v: str) -> str:
+        """Validate where embeddings are generated for Spanner storage."""
+        mode = v.strip().lower()
+        if mode not in {"app", "spanner"}:
+            raise ValueError("spanner_embedding_mode must be one of: app, spanner")
+        return mode
+
+    @field_validator("spanner_embedding_model_id")
+    @classmethod
+    def validate_spanner_embedding_model_id(cls, v: str) -> str:
+        """Validate Spanner model identifier before interpolating into SQL."""
+        model_id = v.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", model_id):
+            raise ValueError("spanner_embedding_model_id must be a simple SQL identifier")
+        return model_id
+
+    @field_validator("embedding_dimension")
+    @classmethod
+    def validate_embedding_dimension(cls, v: int | None) -> int | None:
+        """Validate optional embedding output dimension."""
+        if v is None:
+            return None
+        if v <= 0:
+            raise ValueError("embedding_dimension must be positive")
+        return v
+
+    @field_validator("vertex_location")
+    @classmethod
+    def validate_vertex_location(cls, v: str) -> str:
+        """Validate Vertex location before it is interpolated into a URL host."""
+        location = v.strip()
+        if not GCP_LOCATION_PATTERN.fullmatch(location):
+            raise ValueError(
+                "vertex_location must be a valid Google Cloud region, e.g. us-central1"
+            )
+        return location
+
+    @field_validator("vertex_query_task_type", "vertex_document_task_type")
+    @classmethod
+    def validate_vertex_text_settings(cls, v: str) -> str:
+        """Validate required Vertex text settings."""
+        task_type = v.strip().upper()
+        if task_type not in {"RETRIEVAL_QUERY", "RETRIEVAL_DOCUMENT", "SEMANTIC_SIMILARITY"}:
+            raise ValueError(
+                "Vertex task type must be one of: RETRIEVAL_QUERY, "
+                "RETRIEVAL_DOCUMENT, SEMANTIC_SIMILARITY"
+            )
+        return task_type
 
     @field_validator("embedding_base_url")
     @classmethod
@@ -222,6 +319,10 @@ class Settings(BaseSettings):
         "codex_state_path",
         "gemini_state_path",
         "antigravity_state_path",
+        "chatgpt_exports_path",
+        "chatgpt_state_path",
+        "claude_app_exports_path",
+        "claude_app_state_path",
         mode="after",
     )
     @classmethod
@@ -284,6 +385,46 @@ class Settings(BaseSettings):
             raise ValueError("batch_size must be <= 1000")
         return v
 
+    @field_validator("spanner_vector_index_leaves")
+    @classmethod
+    def validate_spanner_vector_index_leaves(cls, v: int) -> int:
+        """Validate Spanner vector index leaf count."""
+        if v < 1:
+            raise ValueError("spanner_vector_index_leaves must be positive")
+        if v > 1_000_000:
+            raise ValueError("spanner_vector_index_leaves must be <= 1000000")
+        return v
+
+    @field_validator("spanner_num_leaves_to_search")
+    @classmethod
+    def validate_spanner_num_leaves_to_search(cls, v: int) -> int:
+        """Validate Spanner ANN search breadth."""
+        if v < 1:
+            raise ValueError("spanner_num_leaves_to_search must be positive")
+        if v > 1_000_000:
+            raise ValueError("spanner_num_leaves_to_search must be <= 1000000")
+        return v
+
+    @field_validator("spanner_hybrid_candidate_limit")
+    @classmethod
+    def validate_spanner_hybrid_candidate_limit(cls, v: int) -> int:
+        """Validate candidate pool size for Spanner hybrid ranking."""
+        if v < 1:
+            raise ValueError("spanner_hybrid_candidate_limit must be positive")
+        if v > 10_000:
+            raise ValueError("spanner_hybrid_candidate_limit must be <= 10000")
+        return v
+
+    @field_validator("spanner_rrf_k")
+    @classmethod
+    def validate_spanner_rrf_k(cls, v: int) -> int:
+        """Validate reciprocal-rank-fusion smoothing constant."""
+        if v < 1:
+            raise ValueError("spanner_rrf_k must be positive")
+        if v > 10_000:
+            raise ValueError("spanner_rrf_k must be <= 10000")
+        return v
+
     @field_validator("log_level")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
@@ -295,7 +436,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_paths_unique(self) -> "Settings":
-        """Validate that db_path and state_path are different."""
+        """Validate cross-field settings."""
+        if self.embedding_provider == "vertex":
+            if self.embedding_model == "nomic-embed-text":
+                self.embedding_model = "gemini-embedding-001"
+            if self.embedding_dimension is None:
+                self.embedding_dimension = 3072
+        if self.spanner_embedding_mode == "spanner":
+            if self.embedding_model == "nomic-embed-text":
+                self.embedding_model = "gemini-embedding-001"
+            if self.embedding_model != "gemini-embedding-001":
+                raise ValueError("spanner_embedding_mode='spanner' requires gemini-embedding-001")
+            if self.embedding_dimension is None:
+                self.embedding_dimension = 3072
+            if self.embedding_dimension != 3072:
+                raise ValueError(
+                    "spanner_embedding_mode='spanner' requires embedding_dimension=3072"
+                )
         if self.db_path == self.state_path:
             raise ValueError(
                 f"db_path and state_path must be different: both are set to {self.db_path}"
@@ -313,6 +470,16 @@ class Settings(BaseSettings):
         if self.antigravity_state_path == self.state_path:
             raise ValueError(
                 "antigravity_state_path must be different from state_path: "
+                f"both are set to {self.state_path}"
+            )
+        if self.chatgpt_state_path == self.state_path:
+            raise ValueError(
+                "chatgpt_state_path must be different from state_path: "
+                f"both are set to {self.state_path}"
+            )
+        if self.claude_app_state_path == self.state_path:
+            raise ValueError(
+                "claude_app_state_path must be different from state_path: "
                 f"both are set to {self.state_path}"
             )
         return self

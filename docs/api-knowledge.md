@@ -41,10 +41,14 @@ result = tbl.search("hello", query_type="hybrid").rerank(reranker=RRFReranker())
 - RRFReranker is default for hybrid search
 - `normalize` param: "rank" or "score"
 
-## fastembed
+## fastembed (historical reference only)
 
 **Version**: fastembed 0.7.4 (Dec 5, 2025)
 **Source**: https://pypi.org/project/fastembed/, https://qdrant.github.io/fastembed/
+
+The current server/standalone embedding path does not use `fastembed` in-process.
+It uses an external OpenAI-compatible `/v1/embeddings` endpoint, Vertex AI REST,
+or Spanner-native `ML.PREDICT` against a registered Vertex embedding model.
 
 ```python
 from fastembed import TextEmbedding

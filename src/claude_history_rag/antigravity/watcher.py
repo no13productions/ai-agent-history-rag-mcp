@@ -3,8 +3,8 @@
 import threading
 from pathlib import Path
 
-from claude_history_rag.config import settings
 from claude_history_rag.antigravity.chunker import chunk_antigravity_file
+from claude_history_rag.config import settings
 from claude_history_rag.watcher import HistoryWatcher
 
 antigravity_watcher: HistoryWatcher | None = None
@@ -12,7 +12,11 @@ _antigravity_watcher_lock = threading.Lock()
 
 
 def _is_antigravity_file(path: Path) -> bool:
-    return path.suffix == ".pb" and path.is_file()
+    if not path.is_file():
+        return False
+    if path.suffix == ".pb" and path.parent.name == "conversations":
+        return True
+    return path.name == "transcript_full.jsonl" and path.parent.name == "logs"
 
 
 def get_antigravity_watcher() -> HistoryWatcher:

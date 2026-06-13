@@ -7,18 +7,22 @@ In server mode, this provides:
 In client mode, MCP instances connect to this server's API endpoints.
 """
 
-import json
+import hashlib
 import hmac
+import json
 import logging
-import traceback
+import re
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+from pydantic import ValidationError
 
+from claude_history_rag.auth import AuthCheckResult, get_auth_manager
+from claude_history_rag.client_registry import get_client_registry
 from claude_history_rag.config import settings
-from claude_history_rag.auth import get_auth_manager, AuthCheckResult
 from claude_history_rag.models import (
     AuthRotateAckRequest,
     ChunkUploadRequest,
@@ -28,10 +32,10 @@ from claude_history_rag.models import (
     FileSearchRequest,
     FileSearchResponse,
     GetPositionsResponse,
-    PurgeClientRequest,
-    PurgeClientResponse,
     PositionSyncRequest,
     PositionSyncResponse,
+    PurgeClientRequest,
+    PurgeClientResponse,
     ReindexAckRequest,
     ReindexAckResponse,
     SearchRequest,
@@ -40,13 +44,107 @@ from claude_history_rag.models import (
     SessionSummaryResponse,
 )
 from claude_history_rag.status import get_status_collector
-from claude_history_rag.client_registry import get_client_registry
 
 logger = logging.getLogger(__name__)
 
 # Server-side state for tracking per-machine file positions
 # Structure: {machine_id: {file_path: line_number}}
 _machine_positions: dict[str, dict[str, int]] = {}
+_MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def _clear_machine_positions(machine_id: str | None = None) -> None:
+    """Clear tracked upload positions globally or for one machine."""
+    if machine_id is None:
+        _machine_positions.clear()
+    else:
+        _machine_positions.pop(machine_id, None)
+
+
+def _server_chunk_id(machine_id: str, client_chunk_id: Any) -> str:
+    """Derive a server-owned chunk id scoped to one machine."""
+    return hashlib.sha256(f"{machine_id}\x00{client_chunk_id or ''}".encode()).hexdigest()
+
+
+def _client_chunk_identity(chunk: dict[str, Any]) -> str:
+    """Return a stable client chunk identity, even for older clients missing id."""
+    chunk_id = chunk.get("id")
+    if chunk_id:
+        return str(chunk_id)
+    fallback = {
+        "source_file": chunk.get("source_file") or "",
+        "source_line": chunk.get("source_line") or 0,
+        "chunk_type": chunk.get("chunk_type") or "",
+        "session_id": chunk.get("session_id") or "",
+        "content": chunk.get("content") or "",
+    }
+    return hashlib.sha256(json.dumps(fallback, sort_keys=True).encode()).hexdigest()
+
+
+def _consume_search_type_marker(
+    results: list[dict[str, Any]], requested_search_type: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """Remove internal fallback markers and return the actual search type."""
+    actual_search_type = requested_search_type
+    cleaned_results: list[dict[str, Any]] = []
+    for result in results:
+        marker = result.pop("_search_type", None)
+        if marker:
+            actual_search_type = str(marker)
+        cleaned_results.append(result)
+    return actual_search_type, cleaned_results
+
+
+def _validate_upload_chunks(chunks: list[dict[str, Any]]) -> str | None:
+    """Return an error string if uploaded chunks miss required storage fields."""
+    required_fields = (
+        "content",
+        "chunk_type",
+        "session_id",
+        "project_path",
+        "project_name",
+        "source_file",
+    )
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            return f"chunks[{index}] must be an object"
+        for field in required_fields:
+            value = chunk.get(field)
+            if not isinstance(value, str) or not value:
+                return f"chunks[{index}].{field} is required"
+        source_line = chunk.get("source_line", 0)
+        if not isinstance(source_line, int) or source_line < 0:
+            return f"chunks[{index}].source_line must be a non-negative integer"
+        child_chunk_ids = chunk.get("child_chunk_ids", [])
+        if child_chunk_ids is not None and not isinstance(child_chunk_ids, list):
+            return f"chunks[{index}].child_chunk_ids must be a list"
+    return None
+
+
+def _scope_uploaded_chunk_ids(machine_id: str, chunks: list[dict[str, Any]]) -> None:
+    """Rewrite chunk ids and intra-batch references into the server id namespace."""
+    id_map: dict[str, str] = {}
+    for chunk in chunks:
+        client_identity = _client_chunk_identity(chunk)
+        id_map[client_identity] = _server_chunk_id(machine_id, client_identity)
+
+    for chunk in chunks:
+        client_identity = _client_chunk_identity(chunk)
+        chunk["id"] = id_map[client_identity]
+        chunk["machine_id"] = machine_id
+
+        parent_chunk_id = chunk.get("parent_chunk_id")
+        if parent_chunk_id is not None:
+            chunk["parent_chunk_id"] = id_map.get(
+                str(parent_chunk_id), _server_chunk_id(machine_id, str(parent_chunk_id))
+            )
+
+        child_chunk_ids = chunk.get("child_chunk_ids")
+        if isinstance(child_chunk_ids, list):
+            chunk["child_chunk_ids"] = [
+                id_map.get(str(child_id), _server_chunk_id(machine_id, str(child_id)))
+                for child_id in child_chunk_ids
+            ]
 
 
 class StatusServer:
@@ -97,12 +195,23 @@ class StatusServer:
             return None
         return auth_header.split(" ", 1)[1].strip()
 
+    def _get_client_identity(self, request: web.Request) -> str | None:
+        identity = request.headers.get("X-Client-Identity", "").strip()
+        if not identity:
+            return None
+        if len(identity) > 128 or not all(c in "0123456789abcdefABCDEF" for c in identity):
+            return None
+        return identity.lower()
+
     async def _require_auth(
         self,
         request: web.Request,
         machine_id: str | None = None,
         client_name: str | None = None,
+        require_client_identity: bool = False,
     ) -> AuthCheckResult | web.Response:
+        if machine_id and not _MACHINE_ID_RE.fullmatch(machine_id):
+            return web.json_response({"error": "invalid_machine_id"}, status=400)
         auth_manager = get_auth_manager()
         registry = get_client_registry()
 
@@ -122,6 +231,15 @@ class StatusServer:
             return web.json_response({"error": result.error or "unauthorized"}, status=403)
 
         if machine_id:
+            client_identity = self._get_client_identity(request)
+            if require_client_identity and not client_identity:
+                return web.json_response({"error": "missing_client_identity"}, status=403)
+            stored_identity = registry.get_client_identity_hash(machine_id)
+            if stored_identity:
+                if not client_identity or not hmac.compare_digest(client_identity, stored_identity):
+                    return web.json_response({"error": "invalid_client_identity"}, status=403)
+            elif client_identity:
+                registry.set_client_identity_hash(machine_id, client_identity)
             registry.register_client(machine_id, client_name=client_name)
             if result.key_type == "pending":
                 registry.mark_key_rotated(machine_id, result.rotate_id)
@@ -140,10 +258,6 @@ class StatusServer:
     async def handle_dashboard(self, request: web.Request) -> web.Response:
         """Serve HTML dashboard."""
         try:
-            auth_result = await self._require_auth(request)
-            if isinstance(auth_result, web.Response):
-                return auth_result
-
             # Read dashboard HTML template
             template_path = Path(__file__).parent / "templates" / "dashboard.html"
             if not template_path.exists():
@@ -165,7 +279,7 @@ class StatusServer:
         except Exception as e:
             logger.error(f"Failed to serve dashboard: {e}", exc_info=True)
             return web.Response(
-                text=f"Error loading dashboard: {e}",
+                text=f"Error loading dashboard: {type(e).__name__}",
                 status=500,
                 content_type="text/html",
             )
@@ -205,7 +319,9 @@ class StatusServer:
             return web.json_response(status)
         except Exception as e:
             logger.error(f"Failed to collect status: {e}", exc_info=True)
-            return web.json_response({"error": str(e)}, status=500)
+            return web.json_response(
+                {"error": f"Status collection failed: {type(e).__name__}"}, status=500
+            )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """Simple health check endpoint."""
@@ -227,7 +343,10 @@ class StatusServer:
                 return web.json_response({"status": "unhealthy"}, status=503)
         except Exception as e:
             logger.error(f"Health check failed: {e}", exc_info=True)
-            return web.json_response({"status": "error", "error": str(e)}, status=503)
+            return web.json_response(
+                {"status": "error", "error": f"Health check failed: {type(e).__name__}"},
+                status=503,
+            )
 
     async def handle_metrics(self, request: web.Request) -> web.Response:
         """Prometheus metrics endpoint."""
@@ -243,7 +362,7 @@ class StatusServer:
             return web.Response(text=metrics, content_type="text/plain; version=0.0.4")
         except Exception as e:
             logger.error(f"Failed to generate metrics: {e}", exc_info=True)
-            return web.Response(text=f"# Error: {e}\n", status=500)
+            return web.Response(text=f"# Error: metrics_failed:{type(e).__name__}\n", status=500)
 
     async def handle_trigger_index(self, request: web.Request) -> web.Response:
         """Trigger full indexing of all unindexed files."""
@@ -252,12 +371,11 @@ class StatusServer:
             if isinstance(auth_result, web.Response):
                 return auth_result
 
-            from claude_history_rag.watcher import get_watcher
+            from claude_history_rag.watcher import get_all_watchers
 
-            watcher = get_watcher()
-
-            # Queue all files for indexing (force=True to re-check all files)
-            queued_count = await watcher.queue_all_files_for_indexing()
+            queued_count = 0
+            for watcher in get_all_watchers():
+                queued_count += await watcher.queue_all_files_for_indexing()
 
             logger.info(f"Triggered full indexing: {queued_count} files queued")
 
@@ -273,7 +391,7 @@ class StatusServer:
             return web.json_response(
                 {
                     "status": "error",
-                    "error": str(e),
+                    "error": f"Index trigger failed: {type(e).__name__}",
                 },
                 status=500,
             )
@@ -286,17 +404,23 @@ class StatusServer:
                 return auth_result
 
             from claude_history_rag.store import store
-            from claude_history_rag.watcher import get_watcher
+            from claude_history_rag.watcher import get_all_watchers
 
-            watcher = get_watcher()
+            watchers = get_all_watchers()
             registry = get_client_registry()
 
             # Clear the database first (removes all embeddings)
             chunks_deleted = await store.clear_all_async()
             logger.info(f"Cleared {chunks_deleted} chunks from database")
+            _clear_machine_positions()
 
             # Force full re-index (resets positions and queues files)
-            files_reset, files_queued = await watcher.force_full_reindex()
+            files_reset = 0
+            files_queued = 0
+            for watcher in watchers:
+                reset_count, queued_count = await watcher.force_full_reindex()
+                files_reset += reset_count
+                files_queued += queued_count
             reindex_requested_at = registry.mark_reindex_requested()
 
             logger.info(
@@ -319,7 +443,7 @@ class StatusServer:
             return web.json_response(
                 {
                     "status": "error",
-                    "error": str(e),
+                    "error": f"Reindex failed: {type(e).__name__}",
                 },
                 status=500,
             )
@@ -342,6 +466,7 @@ class StatusServer:
                 request,
                 machine_id=upload_request.machine_id,
                 client_name=upload_request.client_name or upload_request.machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -350,6 +475,17 @@ class StatusServer:
                 upload_request.machine_id,
                 client_name=upload_request.client_name or upload_request.machine_id,
             )
+            validation_error = _validate_upload_chunks(upload_request.chunks)
+            if validation_error:
+                response = ChunkUploadResponse(
+                    status="error",
+                    chunks_received=len(upload_request.chunks),
+                    chunks_embedded=0,
+                    chunks_stored=0,
+                    auth=self._auth_payload(auth_result),
+                    error=validation_error,
+                )
+                return web.json_response(response.model_dump(), status=400)
 
             logger.info(
                 f"Received {len(upload_request.chunks)} chunks from machine "
@@ -365,16 +501,20 @@ class StatusServer:
             )
 
             # Import here to avoid circular imports and allow client-only installs
-            from claude_history_rag.embedder import get_embedder
             from claude_history_rag.store import store
 
-            # Add machine_id to each chunk
-            for chunk in upload_request.chunks:
-                chunk["machine_id"] = upload_request.machine_id
+            _scope_uploaded_chunk_ids(upload_request.machine_id, upload_request.chunks)
 
-            # Embed the chunks
-            embedder = get_embedder()
-            embedded_chunks = await embedder.embed_chunks(upload_request.chunks)
+            if (
+                settings.storage_backend == "spanner"
+                and settings.spanner_embedding_mode == "spanner"
+            ):
+                embedded_chunks = upload_request.chunks
+            else:
+                from claude_history_rag.embedder import get_embedder
+
+                embedder = get_embedder()
+                embedded_chunks = await embedder.embed_chunks(upload_request.chunks)
 
             if not embedded_chunks:
                 reindex_required, reindex_requested_at = registry.get_reindex_status(
@@ -440,6 +580,16 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = ChunkUploadResponse(
+                status="error",
+                chunks_received=0,
+                chunks_embedded=0,
+                chunks_stored=0,
+                auth=None,
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except web.HTTPRequestEntityTooLarge as e:
             logger.error(
                 "Chunk upload too large: content_length=%s error=%s",
@@ -463,7 +613,7 @@ class StatusServer:
                 chunks_embedded=0,
                 chunks_stored=0,
                 auth=None,
-                error=f"{type(e).__name__}: {e}",
+                error=f"Chunk upload failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -477,11 +627,19 @@ class StatusServer:
             search_request = SearchRequest(**data)
 
             # Import here to avoid circular imports
-            from claude_history_rag.embedder import get_embedder
             from claude_history_rag.store import store
 
-            embedder = get_embedder()
-            query_vector = await embedder.embed_query(search_request.query)
+            if (
+                settings.storage_backend == "spanner"
+                and settings.spanner_embedding_mode == "spanner"
+                and hasattr(store, "embed_query_text_async")
+            ):
+                query_vector = await store.embed_query_text_async(search_request.query)
+            else:
+                from claude_history_rag.embedder import get_embedder
+
+                embedder = get_embedder()
+                query_vector = await embedder.embed_query(search_request.query)
 
             if search_request.use_hybrid:
                 results = await store.hybrid_search_async(
@@ -499,6 +657,7 @@ class StatusServer:
                 )
                 search_type = "vector"
 
+            search_type, results = _consume_search_type_marker(results, search_type)
             response = SearchResponse(
                 results=results,
                 count=len(results),
@@ -517,6 +676,15 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = SearchResponse(
+                results=[],
+                count=0,
+                query=data.get("query", "") if "data" in dir() else "",
+                search_type="error",
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Search failed: {type(e).__name__}: {e}", exc_info=True)
             response = SearchResponse(
@@ -524,7 +692,7 @@ class StatusServer:
                 count=0,
                 query=data.get("query", "") if "data" in dir() else "",
                 search_type="error",
-                error=f"{type(e).__name__}: {e}",
+                error=f"Search failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -538,18 +706,13 @@ class StatusServer:
             search_request = FileSearchRequest(**data)
 
             # Import here to avoid circular imports
-            from claude_history_rag.embedder import get_embedder
             from claude_history_rag.store import store
-
-            embedder = get_embedder()
 
             # Use query if provided, otherwise search by file path pattern
             if search_request.query:
-                query_vector = await embedder.embed_query(search_request.query)
+                query_text = search_request.query
             elif search_request.file_path:
-                query_vector = await embedder.embed_query(
-                    f"file changes to {search_request.file_path}"
-                )
+                query_text = f"file changes to {search_request.file_path}"
             else:
                 response = FileSearchResponse(
                     results=[],
@@ -557,6 +720,18 @@ class StatusServer:
                     error="Either query or file_path must be provided",
                 )
                 return web.json_response(response.model_dump(), status=400)
+
+            if (
+                settings.storage_backend == "spanner"
+                and settings.spanner_embedding_mode == "spanner"
+                and hasattr(store, "embed_query_text_async")
+            ):
+                query_vector = await store.embed_query_text_async(query_text)
+            else:
+                from claude_history_rag.embedder import get_embedder
+
+                embedder = get_embedder()
+                query_vector = await embedder.embed_query(query_text)
 
             results = await store.search_async(
                 query_vector=query_vector,
@@ -583,12 +758,19 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = FileSearchResponse(
+                results=[],
+                count=0,
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"File search failed: {type(e).__name__}: {e}", exc_info=True)
             response = FileSearchResponse(
                 results=[],
                 count=0,
-                error=f"{type(e).__name__}: {e}",
+                error=f"File search failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -602,14 +784,21 @@ class StatusServer:
             summary_request = SessionSummaryRequest(**data)
 
             # Import here to avoid circular imports
-            from claude_history_rag.embedder import get_embedder
             from claude_history_rag.store import store
-
-            embedder = get_embedder()
 
             # Search for summary chunks
             query = "session summary conversation overview"
-            query_vector = await embedder.embed_query(query)
+            if (
+                settings.storage_backend == "spanner"
+                and settings.spanner_embedding_mode == "spanner"
+                and hasattr(store, "embed_query_text_async")
+            ):
+                query_vector = await store.embed_query_text_async(query)
+            else:
+                from claude_history_rag.embedder import get_embedder
+
+                embedder = get_embedder()
+                query_vector = await embedder.embed_query(query)
 
             results = await store.search_async(
                 query_vector=query_vector,
@@ -647,12 +836,19 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = SessionSummaryResponse(
+                summaries=[],
+                count=0,
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Session summary failed: {type(e).__name__}: {e}", exc_info=True)
             response = SessionSummaryResponse(
                 summaries=[],
                 count=0,
-                error=f"{type(e).__name__}: {e}",
+                error=f"Session summary failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -662,7 +858,12 @@ class StatusServer:
             machine_id = request.match_info["machine_id"]
             registry = get_client_registry()
             client_name = request.query.get("client_name") or machine_id
-            auth_result = await self._require_auth(request, machine_id=machine_id, client_name=client_name)
+            auth_result = await self._require_auth(
+                request,
+                machine_id=machine_id,
+                client_name=client_name,
+                require_client_identity=True,
+            )
             if isinstance(auth_result, web.Response):
                 return auth_result
             registry.register_client(machine_id, client_name=client_name)
@@ -685,7 +886,7 @@ class StatusServer:
             response = GetPositionsResponse(
                 machine_id=request.match_info.get("machine_id", "unknown"),
                 positions={},
-                error=f"{type(e).__name__}: {e}",
+                error=f"Get positions failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -699,6 +900,7 @@ class StatusServer:
                 request,
                 machine_id=sync_request.machine_id,
                 client_name=sync_request.client_name or sync_request.machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -733,6 +935,15 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = PositionSyncResponse(
+                status="error",
+                machine_id=data.get("machine_id", "") if "data" in dir() else "",
+                file_path=data.get("file_path", "") if "data" in dir() else "",
+                position=0,
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Position sync failed: {type(e).__name__}: {e}", exc_info=True)
             response = PositionSyncResponse(
@@ -740,7 +951,7 @@ class StatusServer:
                 machine_id=data.get("machine_id", "") if "data" in dir() else "",
                 file_path=data.get("file_path", "") if "data" in dir() else "",
                 position=0,
-                error=f"{type(e).__name__}: {e}",
+                error=f"Position sync failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -754,6 +965,7 @@ class StatusServer:
                 request,
                 machine_id=ack_request.machine_id,
                 client_name=ack_request.client_name or ack_request.machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -791,12 +1003,19 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = ReindexAckResponse(
+                status="error",
+                machine_id=data.get("machine_id", "") if "data" in dir() else "",
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Reindex ack failed: {type(e).__name__}: {e}", exc_info=True)
             response = ReindexAckResponse(
                 status="error",
                 machine_id=data.get("machine_id", "") if "data" in dir() else "",
-                error=f"{type(e).__name__}: {e}",
+                error=f"Reindex acknowledgement failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -806,11 +1025,13 @@ class StatusServer:
             data = await request.json()
             purge_request = PurgeClientRequest(**data)
             from claude_history_rag.store import store
+
             registry = get_client_registry()
             auth_result = await self._require_auth(
                 request,
                 machine_id=purge_request.machine_id,
                 client_name=purge_request.machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -821,6 +1042,7 @@ class StatusServer:
                 purge_request.reason,
             )
             chunks_deleted = await store.delete_by_machine_id_async(purge_request.machine_id)
+            _clear_machine_positions(purge_request.machine_id)
             registry.mark_purged(purge_request.machine_id, client_name=purge_request.machine_id)
 
             response = PurgeClientResponse(
@@ -838,12 +1060,19 @@ class StatusServer:
                 error=f"Invalid JSON: {e}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = PurgeClientResponse(
+                status="error",
+                machine_id=data.get("machine_id", "") if "data" in dir() else "",
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Purge client failed: {type(e).__name__}: {e}", exc_info=True)
             response = PurgeClientResponse(
                 status="error",
                 machine_id=data.get("machine_id", "") if "data" in dir() else "",
-                error=f"{type(e).__name__}: {e}",
+                error=f"Purge failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
@@ -857,6 +1086,7 @@ class StatusServer:
                 request,
                 machine_id=heartbeat_request.machine_id,
                 client_name=heartbeat_request.client_name or heartbeat_request.machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -880,75 +1110,106 @@ class StatusServer:
         except json.JSONDecodeError as e:
             response = ClientHeartbeatResponse(status="error", error=f"Invalid JSON: {e}")
             return web.json_response(response.model_dump(), status=400)
+        except ValidationError as e:
+            response = ClientHeartbeatResponse(
+                status="error",
+                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Heartbeat failed: {type(e).__name__}: {e}", exc_info=True)
             response = ClientHeartbeatResponse(
                 status="error",
-                error=f"{type(e).__name__}: {e}",
+                error=f"Heartbeat failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
     async def handle_api_auth_state(self, request: web.Request) -> web.Response:
         """Return auth state for dashboard."""
-        auth_result = await self._require_auth(request)
-        if isinstance(auth_result, web.Response):
-            return auth_result
-        auth_manager = get_auth_manager()
-        registry = get_client_registry()
-        state = auth_manager.get_rotation_state()
+        try:
+            auth_result = await self._require_auth(request)
+            if isinstance(auth_result, web.Response):
+                return auth_result
+            auth_manager = get_auth_manager()
+            registry = get_client_registry()
+            state = auth_manager.get_rotation_state()
 
-        def scrub(entry: dict[str, Any] | None) -> dict[str, Any] | None:
-            if not entry:
-                return None
-            return {
-                "key_id": entry.get("key_id"),
-                "created_at": entry.get("created_at"),
-                "allowlist": entry.get("allowlist"),
-                "allowlist_days": entry.get("allowlist_days"),
-                "allowlist_expires_at": entry.get("allowlist_expires_at"),
+            def scrub(entry: dict[str, Any] | None) -> dict[str, Any] | None:
+                if not entry:
+                    return None
+                return {
+                    "key_id": entry.get("key_id"),
+                    "created_at": entry.get("created_at"),
+                    "allowlist": entry.get("allowlist"),
+                    "allowlist_days": entry.get("allowlist_days"),
+                    "allowlist_expires_at": entry.get("allowlist_expires_at"),
+                }
+
+            response = {
+                "auth_enabled": state.get("auth_enabled", True),
+                "env_override": state.get("env_override", False),
+                "active": scrub(state.get("active")),
+                "pending": scrub(state.get("pending")),
+                "rotation": state.get("rotation"),
+                "clients": registry.get_client_status().get("clients", []),
             }
-
-        response = {
-            "auth_enabled": state.get("auth_enabled", True),
-            "env_override": state.get("env_override", False),
-            "active": scrub(state.get("active")),
-            "pending": scrub(state.get("pending")),
-            "rotation": state.get("rotation"),
-            "clients": registry.get_client_status().get("clients", []),
-        }
-        return web.json_response(response)
+            return web.json_response(response)
+        except Exception as e:
+            logger.error("Auth state failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response({"error": f"auth_state_failed:{type(e).__name__}"}, status=500)
 
     async def handle_api_auth_rotate(self, request: web.Request) -> web.Response:
         """Rotate PSK with optional allowlist and expiry."""
-        auth_result = await self._require_auth(request)
-        if isinstance(auth_result, web.Response):
-            return auth_result
-        auth_manager = get_auth_manager()
-        if auth_manager.is_env_override():
-            return web.json_response({"error": "env_override"}, status=400)
-        data = await request.json()
-        allowlist = data.get("allowlist") or []
-        allow_days = int(data.get("allow_days", 0))
-        revoke_old = bool(data.get("revoke_old", False))
-        result = auth_manager.rotate_key(allowlist, allow_days, revoke_old)
-        registry = get_client_registry()
-        for machine_id in allowlist:
-            registry.set_rotation_awaiting(machine_id)
-        return web.json_response({"status": "ok", **result})
+        try:
+            auth_result = await self._require_auth(request)
+            if isinstance(auth_result, web.Response):
+                return auth_result
+            auth_manager = get_auth_manager()
+            if auth_manager.is_env_override():
+                return web.json_response({"error": "env_override"}, status=400)
+            data = await request.json()
+            allowlist = data.get("allowlist") or []
+            allow_days = int(data.get("allow_days", 0))
+            revoke_old = bool(data.get("revoke_old", False))
+            result = auth_manager.rotate_key(allowlist, allow_days, revoke_old)
+            registry = get_client_registry()
+            for machine_id in allowlist:
+                registry.set_rotation_awaiting(machine_id)
+            return web.json_response({"status": "ok", **result})
+        except json.JSONDecodeError as e:
+            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except ValidationError as e:
+            return web.json_response(
+                {"error": f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}"},
+                status=400,
+            )
+        except Exception as e:
+            logger.error("Auth rotate failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response(
+                {"error": f"auth_rotate_failed:{type(e).__name__}"}, status=500
+            )
 
     async def handle_api_auth_allowlist_keep(self, request: web.Request) -> web.Response:
         """Keep a client on the allowlist (temporary)."""
-        auth_result = await self._require_auth(request)
-        if isinstance(auth_result, web.Response):
-            return auth_result
-        auth_manager = get_auth_manager()
-        data = await request.json()
-        machine_id = data.get("machine_id")
-        if not machine_id:
-            return web.json_response({"error": "missing_machine_id"}, status=400)
-        if not auth_manager.keep_on_allowlist(machine_id):
-            return web.json_response({"error": "allowlist_expired"}, status=400)
-        return web.json_response({"status": "ok"})
+        try:
+            auth_result = await self._require_auth(request)
+            if isinstance(auth_result, web.Response):
+                return auth_result
+            auth_manager = get_auth_manager()
+            data = await request.json()
+            machine_id = data.get("machine_id")
+            if not machine_id:
+                return web.json_response({"error": "missing_machine_id"}, status=400)
+            if not auth_manager.keep_on_allowlist(machine_id):
+                return web.json_response({"error": "allowlist_expired"}, status=400)
+            return web.json_response({"status": "ok"})
+        except json.JSONDecodeError as e:
+            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except Exception as e:
+            logger.error("Auth allowlist keep failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response(
+                {"error": f"auth_allowlist_keep_failed:{type(e).__name__}"}, status=500
+            )
 
     async def handle_api_auth_rotation_error(self, request: web.Request) -> web.Response:
         """Record a client rotation failure."""
@@ -962,6 +1223,7 @@ class StatusServer:
                 request,
                 machine_id=machine_id,
                 client_name=client_name or machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -970,6 +1232,11 @@ class StatusServer:
             return web.json_response({"status": "ok"})
         except json.JSONDecodeError as e:
             return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except Exception as e:
+            logger.error("Auth rotation error record failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response(
+                {"error": f"auth_rotation_error_failed:{type(e).__name__}"}, status=500
+            )
 
     async def handle_api_auth_rotation_ack(self, request: web.Request) -> web.Response:
         """Record a client rotation acknowledgement without replaying payload."""
@@ -980,6 +1247,7 @@ class StatusServer:
                 request,
                 machine_id=ack_request.machine_id,
                 client_name=ack_request.client_name or ack_request.machine_id,
+                require_client_identity=True,
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
@@ -988,29 +1256,49 @@ class StatusServer:
             return web.json_response({"status": "ok"})
         except json.JSONDecodeError as e:
             return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except ValidationError as e:
+            return web.json_response(
+                {"error": f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}"},
+                status=400,
+            )
+        except Exception as e:
+            logger.error("Auth rotation ack failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response(
+                {"error": f"auth_rotation_ack_failed:{type(e).__name__}"}, status=500
+            )
 
     async def handle_api_auth_dashboard_hash(self, request: web.Request) -> web.Response:
         """Return dashboard hash for local storage (requires auth)."""
-        auth_result = await self._require_auth(request)
-        if isinstance(auth_result, web.Response):
-            return auth_result
-        auth_manager = get_auth_manager()
-        return web.json_response({"dashboard_hash": auth_manager.get_dashboard_hash()})
+        try:
+            auth_result = await self._require_auth(request)
+            if isinstance(auth_result, web.Response):
+                return auth_result
+            auth_manager = get_auth_manager()
+            return web.json_response({"dashboard_hash": auth_manager.get_dashboard_hash()})
+        except Exception as e:
+            logger.error("Dashboard hash failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response(
+                {"error": f"dashboard_hash_failed:{type(e).__name__}"}, status=500
+            )
 
     async def handle_api_auth_key(self, request: web.Request) -> web.Response:
         """Reveal current PSK for dashboard after hash check."""
-        auth_result = await self._require_auth(request)
-        if isinstance(auth_result, web.Response):
-            return auth_result
-        auth_manager = get_auth_manager()
-        expected = auth_manager.get_dashboard_hash()
-        provided = request.headers.get("X-Auth-Hash")
-        if not expected or not provided or not hmac.compare_digest(expected, provided):
-            return web.json_response({"error": "invalid_hash"}, status=403)
-        key = auth_manager.get_active_key_plain()
-        if not key:
-            return web.json_response({"error": "key_unavailable"}, status=404)
-        return web.json_response({"key": key})
+        try:
+            auth_result = await self._require_auth(request)
+            if isinstance(auth_result, web.Response):
+                return auth_result
+            auth_manager = get_auth_manager()
+            expected = auth_manager.get_dashboard_hash()
+            provided = request.headers.get("X-Auth-Hash")
+            if not expected or not provided or not hmac.compare_digest(expected, provided):
+                return web.json_response({"error": "invalid_hash"}, status=403)
+            key = auth_manager.get_active_key_plain()
+            if not key:
+                return web.json_response({"error": "key_unavailable"}, status=404)
+            return web.json_response({"key": key})
+        except Exception as e:
+            logger.error("Auth key reveal failed: %s", type(e).__name__, exc_info=True)
+            return web.json_response({"error": f"auth_key_failed:{type(e).__name__}"}, status=500)
 
     def _convert_to_prometheus(self, status: dict[str, Any]) -> str:
         """Convert status JSON to Prometheus text format."""

@@ -152,9 +152,9 @@ class ClientStateManager:
         if not requested_at:
             return False
         state = await self.get_state()
-        if state.reindex_required_at and state.reindex_required_at.isoformat() == requested_at:
-            return False
-        return True
+        return not (
+            state.reindex_required_at and state.reindex_required_at.isoformat() == requested_at
+        )
 
     async def set_reindex_ack(self, status: str | None = None) -> None:
         """Record that we acknowledged a reindex request."""

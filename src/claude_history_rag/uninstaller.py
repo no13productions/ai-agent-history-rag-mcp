@@ -14,8 +14,8 @@ from claude_history_rag.installer import (
     print_success,
     print_warning,
     prompt_yes_no,
-    remove_mcp_from_toml_config,
     read_json_config,
+    remove_mcp_from_toml_config,
     write_json_config,
 )
 

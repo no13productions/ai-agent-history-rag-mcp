@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -35,10 +36,8 @@ def _ensure_parent(path: Path) -> None:
 def _write_secure_json(path: Path, payload: dict[str, Any]) -> None:
     _ensure_parent(path)
     path.write_text(json.dumps(payload, indent=2))
-    try:
+    with contextlib.suppress(Exception):
         os.chmod(path, 0o600)
-    except Exception:
-        pass
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -179,9 +178,7 @@ class AuthManager:
     def _is_allowlisted(self, machine_id: str) -> bool:
         pending = self._state.get("pending") or {}
         allowlist = pending.get("allowlist") or []
-        if machine_id in allowlist and not self._allowlist_expired():
-            return True
-        return False
+        return machine_id in allowlist and not self._allowlist_expired()
 
     def _derive_client_hash(self, raw_key: str, client_id: str, base_salt: str) -> str:
         salt = f"{client_id}:{base_salt}"
@@ -215,16 +212,22 @@ class AuthManager:
                 derived = self._derive_client_hash(raw_key, machine_id, pending_salt)
                 stored = registry.get_client_key_hash(machine_id)
                 stored_key_id = registry.get_client_key_id(machine_id)
-                if stored and stored_key_id == pending.get("key_id"):
-                    if not _secure_compare(derived, stored):
-                        return AuthCheckResult(ok=False, error="invalid_client_key")
+                if (
+                    stored
+                    and stored_key_id == pending.get("key_id")
+                    and not _secure_compare(derived, stored)
+                ):
+                    return AuthCheckResult(ok=False, error="invalid_client_key")
                 registry.set_client_key_hash(machine_id, derived, pending.get("key_id"))
-            if machine_id and pending.get("allowlist"):
-                if machine_id in pending.get("allowlist", []):
-                    self.remove_from_allowlist(machine_id)
-                    pending = self._state.get("pending") or {}
-                    if not pending.get("allowlist"):
-                        self.promote_pending()
+            if (
+                machine_id
+                and pending.get("allowlist")
+                and machine_id in pending.get("allowlist", [])
+            ):
+                self.remove_from_allowlist(machine_id)
+                pending = self._state.get("pending") or {}
+                if not pending.get("allowlist"):
+                    self.promote_pending()
             return AuthCheckResult(
                 ok=True,
                 key_type="pending",
@@ -238,9 +241,12 @@ class AuthManager:
                     derived = self._derive_client_hash(raw_key, machine_id, active_salt)
                     stored = registry.get_client_key_hash(machine_id)
                     stored_key_id = registry.get_client_key_id(machine_id)
-                    if stored and stored_key_id == active.get("key_id"):
-                        if not _secure_compare(derived, stored):
-                            return AuthCheckResult(ok=False, error="invalid_client_key")
+                    if (
+                        stored
+                        and stored_key_id == active.get("key_id")
+                        and not _secure_compare(derived, stored)
+                    ):
+                        return AuthCheckResult(ok=False, error="invalid_client_key")
                     registry.set_client_key_hash(machine_id, derived, active.get("key_id"))
                     return AuthCheckResult(
                         ok=True,
@@ -258,9 +264,12 @@ class AuthManager:
                 derived = self._derive_client_hash(raw_key, machine_id, active_salt)
                 stored = registry.get_client_key_hash(machine_id)
                 stored_key_id = registry.get_client_key_id(machine_id)
-                if stored and stored_key_id == active.get("key_id"):
-                    if not _secure_compare(derived, stored):
-                        return AuthCheckResult(ok=False, error="invalid_client_key")
+                if (
+                    stored
+                    and stored_key_id == active.get("key_id")
+                    and not _secure_compare(derived, stored)
+                ):
+                    return AuthCheckResult(ok=False, error="invalid_client_key")
                 registry.set_client_key_hash(machine_id, derived, active.get("key_id"))
             return AuthCheckResult(ok=True, key_type="active")
 
@@ -309,8 +318,7 @@ class AuthManager:
         if not pending:
             return
         self._state["active"] = {
-            k: pending[k]
-            for k in ("key_hash", "key_salt", "key_plain", "created_at", "key_id")
+            k: pending[k] for k in ("key_hash", "key_salt", "key_plain", "created_at", "key_id")
         }
         self._state["pending"] = None
         rotation = self._state.get("rotation") or {}

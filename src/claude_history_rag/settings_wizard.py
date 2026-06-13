@@ -594,9 +594,7 @@ def run_wizard() -> int:
         "Client PSK (optional override)",
         str(current_values.get("client_psk") or ""),
     )
-    auth_state_path = Path(
-        prompt_string("Auth state path", str(current_values["auth_state_path"]))
-    )
+    auth_state_path = Path(prompt_string("Auth state path", str(current_values["auth_state_path"])))
     client_auth_path = Path(
         prompt_string("Client auth path", str(current_values["client_auth_path"]))
     )

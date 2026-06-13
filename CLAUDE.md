@@ -14,12 +14,12 @@ This is an MCP server that provides RAG (Retrieval-Augmented Generation) over AI
 
 ## Tech Stack
 
-- **Python 3.10+** with async/await patterns
-- **FastMCP** (from `mcp.server.fastmcp`) - official MCP SDK, STDIO transport
-- **LanceDB 0.26+** - embedded vector database with hybrid search
-- **fastembed** - ONNX-based embeddings (nomic-embed-text-v1.5 or bge-small-en-v1.5)
+- **Python 3.10+** with async/await patterns (use `uv` with a pinned 3.12 — lancedb/tantivy/pylance wheels may lag on the newest CPython, e.g. 3.14)
+- **FastMCP** (from `mcp.server.fastmcp`) - official MCP SDK (`mcp[cli]>=1.24.0`), STDIO transport
+- **Storage backends** - LanceDB 0.25+ locally by default; optional Cloud Spanner backend using `ARRAY<FLOAT32>(vector_length=>N)` and exact `COSINE_DISTANCE` search.
+- **Embedding providers** - OpenAI-compatible `/v1/embeddings` API by default (Ollama/vLLM/OpenAI/LiteLLM), or Vertex AI REST (`gemini-embedding-001`, 3072d). NOTE: embeddings are NOT computed in-process. (`fastembed` is no longer used.)
 - **watchfiles** - Rust-based async file watching
-- **pydantic** - data validation and settings
+- **pydantic / pydantic-settings** - data validation and settings (env prefix `CLAUDE_HISTORY_RAG_`)
 
 ## Build and Run Commands
 
@@ -49,15 +49,15 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 ### Data Flow
 
 ```
-~/.claude/projects/*.jsonl, ~/.codex/sessions/**/*.jsonl, ~/.gemini/tmp/**/chats/*.json → File Watcher → Chunking Engine → Embedding → LanceDB → MCP Tools
+~/.claude/projects/*.jsonl, ~/.codex/sessions/**/*.jsonl, ~/.gemini/tmp/**/chats/*.json → File Watcher → Chunking Engine → Embedding Provider → Storage Backend → MCP Tools
 ```
 
 ### Key Components
 
 1. **Parser** ([src/claude_history_rag/parser.py](src/claude_history_rag/parser.py)) - Parses JSONL entries (user, assistant, summary, system types)
 2. **Chunker** ([src/claude_history_rag/chunker.py](src/claude_history_rag/chunker.py)) - Creates turn, file_change, and summary chunks
-3. **Embedder** ([src/claude_history_rag/embedder.py](src/claude_history_rag/embedder.py)) - Async wrapper around fastembed with ThreadPoolExecutor
-4. **Store** ([src/claude_history_rag/store.py](src/claude_history_rag/store.py)) - LanceDB operations, hybrid search with RRF reranking
+3. **Embedder** ([src/claude_history_rag/embedder.py](src/claude_history_rag/embedder.py)) - Async facade over pluggable OpenAI-compatible or Vertex AI embedding providers
+4. **Store** ([src/claude_history_rag/store.py](src/claude_history_rag/store.py)) - Pluggable LanceDB or Cloud Spanner storage backends
 5. **Watcher** ([src/claude_history_rag/watcher.py](src/claude_history_rag/watcher.py)) - watchfiles async file monitoring with debouncing
 6. **Server** ([src/claude_history_rag/server.py](src/claude_history_rag/server.py)) - FastMCP server with async tools
 
@@ -65,8 +65,9 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 
 - `search_conversations` - Semantic search across all conversation history
 - `search_file_changes` - Find specific file modifications
-- `get_session_summary` - Get overview of session(s)
+- `get_session_summary` - Get overview of session(s) (relies on `summary` chunks)
 - `get_index_status` - Check indexing status
+- `get_server_status` - Comprehensive server health/metrics (basic|full)
 
 ## Critical Implementation Notes
 
@@ -78,7 +79,16 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 ### Claude Code History Format
 - History files are at `~/.claude/projects/` in JSONL format
 - Project paths are encoded: `/Users/brandon/project` → `-Users-brandon-project`
-- Entry types: `user`, `assistant`, `summary`, `system`
+- Content entry types: `user`, `assistant`, `system`. Current Claude Code (>=2.1)
+  also emits many no-op metadata types the chunker safely ignores
+  (`queue-operation`, `attachment`, `last-prompt`, `custom-title`, `ai-title`,
+  `pr-link`, `mode`).
+- **Compaction summaries**: the legacy dedicated `type: "summary"` entry is GONE
+  in Claude Code >=2.1. Summaries are now ordinary `user` entries flagged
+  `isCompactSummary: true` (text in `message.content`). The chunker handles both
+  formats and produces `chunk_type="summary"` chunks for each. Unknown top-level
+  fields are tolerated (pydantic `extra="ignore"`), so new metadata keys don't
+  break parsing.
 
 ### Chunk Types
 1. **Turn chunks** - User message paired with assistant response
@@ -90,10 +100,18 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 - Documents: `"search_document: " + content`
 
 ### LanceDB Configuration
-- Database location: `~/.ai-agent-history-rag/lancedb/`
+- Database location: `~/.claude-history-rag/lancedb/`
 - Index type: IVF_HNSW_SQ for collections > 10,000 chunks
 - Use RRFReranker for hybrid search fusion
 - Vector weight 0.6 / BM25 weight 0.4
+
+### Vertex + Spanner Configuration
+- Set `CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex`
+- Set `CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001`
+- Set `CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072`
+- Set `CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner`
+- Example database config: project `<your-gcp-project>`, instance `<your-spanner-instance>`, database `<your-rag-database>`
+- The app prefers ADC, but falls back to active `gcloud auth login` credentials for local runs.
 
 ## Performance Targets
 

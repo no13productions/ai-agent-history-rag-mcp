@@ -694,7 +694,9 @@ def add_mcp_to_target(
                 continue
             args = entry.get("args")
             if isinstance(args, list) and "claude-history-rag" in args:
-                entry["args"] = ["ai-agent-history-rag" if a == "claude-history-rag" else a for a in args]
+                entry["args"] = [
+                    "ai-agent-history-rag" if a == "claude-history-rag" else a for a in args
+                ]
                 servers[key] = entry
 
     # Handle Claude Code specially - it has a different structure
@@ -734,8 +736,7 @@ def discover_project_mcp_targets(root_paths: list[Path]) -> list[MCPTarget]:
     if root_paths:
         roots_display = ", ".join(str(p) for p in root_paths)
         print(
-            f"\nScanning for mcp.json under: {roots_display}. "
-            "macOS may prompt for folder access."
+            f"\nScanning for mcp.json under: {roots_display}. macOS may prompt for folder access."
         )
 
     def detect_mcp_json_format(path: Path) -> tuple[str | None, str]:
@@ -1502,9 +1503,7 @@ def run_wizard() -> int:
         targets = get_mcp_targets(project_dir)
         extra_scan_roots: list[Path] = []
         if not is_update:
-            print(
-                "\nOptional: Add a parent folder to scan for project-scoped mcp.json files."
-            )
+            print("\nOptional: Add a parent folder to scan for project-scoped mcp.json files.")
             print("Example: ~/develop (we'll add to any mcp.json under that folder).")
             raw_paths = input("Additional scan folder(s), comma-separated [skip]: ").strip()
             if raw_paths:
@@ -1545,7 +1544,9 @@ def run_wizard() -> int:
             if selection == "" or selection == "all":
                 selected_targets = available_targets
             elif selection in {"found", "all-found"}:
-                selected_targets = [t for t in available_targets if t.name.startswith("Found MCP JSON")]
+                selected_targets = [
+                    t for t in available_targets if t.name.startswith("Found MCP JSON")
+                ]
             else:
                 try:
                     indices = [int(x.strip()) - 1 for x in selection.split(",")]

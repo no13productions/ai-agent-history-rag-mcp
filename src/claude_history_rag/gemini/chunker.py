@@ -217,8 +217,7 @@ def _create_file_change_chunks(
         operation = op.get("operation", "edit")
         summary = op.get("summary", "File change")
         content = (
-            f"In project {project_name}, file {file_path} was {operation}.\n"
-            f"Summary: {summary}"
+            f"In project {project_name}, file {file_path} was {operation}.\nSummary: {summary}"
         )
         chunk_id = generate_chunk_id(content, session_id, str(timestamp) + file_path)
         chunks.append(
@@ -313,11 +312,10 @@ def _extract_tool_ops_from_call(tool_call: dict) -> list[dict]:
         if isinstance(result_display, str):
             ops.extend(_extract_apply_patch_ops_from_text(result_display))
 
-    if name in ("shell", "shell_command", "bash"):
-        if isinstance(args, dict):
-            cmd = args.get("command")
-            if isinstance(cmd, str):
-                ops.extend(_extract_shell_ops_from_command(cmd))
+    if name in ("shell", "shell_command", "bash") and isinstance(args, dict):
+        cmd = args.get("command")
+        if isinstance(cmd, str):
+            ops.extend(_extract_shell_ops_from_command(cmd))
 
     return ops
 
@@ -338,11 +336,10 @@ def chunk_gemini_session_file(file_path: Path, start_line: int = 0) -> Iterator[
     # logs.json (list of events)
     if isinstance(data, list):
         for idx, event in enumerate(data, start=1):
-            if not isinstance(event, dict):
-                content = str(event)
-            else:
-                content = json.dumps(event)
-            timestamp = _parse_timestamp(event.get("timestamp")) if isinstance(event, dict) else None
+            content = str(event) if not isinstance(event, dict) else json.dumps(event)
+            timestamp = (
+                _parse_timestamp(event.get("timestamp")) if isinstance(event, dict) else None
+            )
             if not timestamp:
                 timestamp = datetime.now(timezone.utc)
             session_id = (
@@ -558,6 +555,5 @@ def chunk_gemini_session_file(file_path: Path, start_line: int = 0) -> Iterator[
 
     total = sum(chunk_counts.values())
     logger.info(
-        f"Completed Gemini chunking {file_path.name}: {total} chunks "
-        f"(turns={chunk_counts['turn']})"
+        f"Completed Gemini chunking {file_path.name}: {total} chunks (turns={chunk_counts['turn']})"
     )

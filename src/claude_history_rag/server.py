@@ -13,7 +13,7 @@ from mcp.server.fastmcp import FastMCP
 
 from claude_history_rag.config import settings
 from claude_history_rag.errors import record_error
-from claude_history_rag.watcher import get_watcher
+from claude_history_rag.watcher import get_all_watchers
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +103,24 @@ async def _execute_search(
     )
 
 
+def _consume_search_type_marker(results: list[dict[str, Any]], default: str) -> str:
+    """Remove internal backend search metadata and return the effective search type."""
+    effective = default
+    for result in results:
+        marker = result.pop("_search_type", None)
+        if marker in {"hybrid", "vector"}:
+            effective = marker
+    return effective
+
+
 async def _embed_query(query: str) -> list[float]:
     """Embed query - wrapper for decision engine."""
+    if settings.storage_backend == "spanner" and settings.spanner_embedding_mode == "spanner":
+        from claude_history_rag.store import store
+
+        if hasattr(store, "embed_query_text_async"):
+            return await store.embed_query_text_async(query)
+
     from claude_history_rag.embedder import get_embedder
 
     embedder = get_embedder()
@@ -210,32 +226,56 @@ async def search_conversations(
         # ============================================================
         # Server Mode: Local processing
         # ============================================================
-        from claude_history_rag.embedder import get_embedder
         from claude_history_rag.store import store
+
+        effective_use_hybrid = use_hybrid and store.has_fts_index()
+        search_type = "hybrid" if effective_use_hybrid else "vector"
 
         # Use decision engine for enhanced search
         if enable_analysis or enable_synthesis:
             engine = _get_decision_engine()
 
+            async def execute_effective_search(
+                search_query: str,
+                search_vector: list[float],
+                search_limit: int,
+                search_project_filter: str | None,
+            ) -> list[dict[str, Any]]:
+                if effective_use_hybrid:
+                    return await store.hybrid_search_async(
+                        query=search_query,
+                        query_vector=search_vector,
+                        limit=search_limit,
+                        project_filter=search_project_filter,
+                    )
+                return await store.search_async(
+                    query_vector=search_vector,
+                    limit=search_limit,
+                    project_filter=search_project_filter,
+                )
+
             # Pass enable_synthesis as parameter instead of mutating global state (T2 fix)
             result = await engine.search(
                 query=query,
-                search_func=_execute_search,
+                search_func=execute_effective_search,
                 embed_func=_embed_query,
                 limit=limit,
                 project_filter=project_filter,
-                search_type="hybrid" if use_hybrid else "vector",
+                search_type=search_type,
                 enable_synthesis=enable_synthesis,
                 include_debug=include_debug,
             )
+            if isinstance(result.get("results"), list):
+                result["search_type"] = _consume_search_type_marker(
+                    result["results"], result.get("search_type", search_type)
+                )
 
             return result
 
         # Fall back to basic search if analysis disabled
-        embedder = get_embedder()
-        query_vector = await embedder.embed_query(query)
+        query_vector = await _embed_query(query)
 
-        if use_hybrid:
+        if effective_use_hybrid:
             # Use hybrid search with RRF reranking for better results
             results = await store.hybrid_search_async(
                 query=query,
@@ -255,7 +295,7 @@ async def search_conversations(
             "results": results,
             "count": len(results),
             "query": query,
-            "search_type": "hybrid" if use_hybrid else "vector",
+            "search_type": _consume_search_type_marker(results, search_type),
             "cache_hit": False,
         }
 
@@ -267,7 +307,9 @@ async def search_conversations(
     except Exception as e:
         logger.exception(f"Search failed: {type(e).__name__} - {str(e)}")
         record_error(
-            "search", f"Search failed: {type(e).__name__}", {"query": query[:100], "error": str(e)}
+            "search",
+            f"Search failed: {type(e).__name__}",
+            {"query_length": len(query), "error_type": type(e).__name__},
         )
         return {
             "error": f"Search error: {type(e).__name__}",
@@ -370,10 +412,7 @@ async def search_file_changes(
         # ============================================================
         # Server Mode: Local processing
         # ============================================================
-        from claude_history_rag.embedder import get_embedder
         from claude_history_rag.store import store
-
-        embedder = get_embedder()
 
         # Build search query with expansion if file_path provided
         if query:
@@ -391,7 +430,7 @@ async def search_file_changes(
         else:
             search_text = "file changes modifications edits"
 
-        query_vector = await embedder.embed_query(search_text)
+        query_vector = await _embed_query(search_text)
 
         results = await store.search_async(
             query_vector=query_vector,
@@ -419,7 +458,10 @@ async def search_file_changes(
         record_error(
             "search",
             f"File search failed: {type(e).__name__}",
-            {"file_path": file_path, "error": str(e)},
+            {
+                "has_file_path_filter": bool(file_path),
+                "error_type": type(e).__name__,
+            },
         )
         return {
             "error": f"File search error: {type(e).__name__}",
@@ -481,11 +523,9 @@ async def get_session_summary(
         # ============================================================
         # Server Mode: Local processing
         # ============================================================
-        from claude_history_rag.embedder import get_embedder
         from claude_history_rag.store import store
 
-        embedder = get_embedder()
-        query_vector = await embedder.embed_query("session summary overview")
+        query_vector = await _embed_query("session summary overview")
 
         # If filtering by session_id, fetch more results to ensure we get
         # enough after filtering. Use higher multiplier for sparse
@@ -547,11 +587,20 @@ async def get_index_status() -> dict:
     try:
         logger.debug("get_index_status called")
 
-        watcher = get_watcher()
-
-        # Get watcher state
-        watched_files = len(watcher.state.get_all_files())
-        pending_files = watcher.queue.qsize()
+        watchers = get_all_watchers()
+        source_status = {
+            watcher.source_name: {
+                "watched_files": len(watcher.state.get_all_files()),
+                "pending_files": watcher.queue.qsize(),
+                "running": watcher.is_running,
+                "failed_files": watcher.failed_files_count,
+                "watch_path": str(watcher.projects_path),
+            }
+            for watcher in watchers
+        }
+        watched_files = sum(source["watched_files"] for source in source_status.values())
+        pending_files = sum(source["pending_files"] for source in source_status.values())
+        watcher_running = all(watcher.is_running for watcher in watchers)
 
         # ============================================================
         # Client Mode: Get status from central server
@@ -573,8 +622,9 @@ async def get_index_status() -> dict:
                 "machine_id": settings.machine_id,
                 "watched_files": watched_files,
                 "pending_files": pending_files,
+                "sources": source_status,
                 "pending_uploads": pending_uploads,
-                "watcher_running": watcher.is_running,
+                "watcher_running": watcher_running,
                 "connected": client_state.connected,
             }
 
@@ -593,11 +643,16 @@ async def get_index_status() -> dict:
         # ============================================================
         # Server Mode: Local status
         # ============================================================
-        from claude_history_rag.embedder import get_embedder
         from claude_history_rag.store import store
 
         stats = await store.get_stats_async()
-        embedder = get_embedder()
+        embedding_model_loaded = True
+        if not (
+            settings.storage_backend == "spanner" and settings.spanner_embedding_mode == "spanner"
+        ):
+            from claude_history_rag.embedder import get_embedder
+
+            embedding_model_loaded = get_embedder().is_initialized
 
         # Get cache stats if decision engine is initialized (I1 fix: check via module)
         cache_stats = None
@@ -612,13 +667,32 @@ async def get_index_status() -> dict:
         return {
             "mode": "server",
             "total_chunks": stats["total_chunks"],
-            "db_path": stats["db_path"],
-            "embedding_model_loaded": embedder.is_initialized,
+            "embedding_model_loaded": embedding_model_loaded,
             "watched_files": watched_files,
             "pending_files": pending_files,
-            "watcher_running": watcher.is_running,
+            "sources": source_status,
+            "watcher_running": watcher_running,
             "status": "healthy",
             "cache_stats": cache_stats,
+            "storage_backend": stats.get("backend", settings.storage_backend),
+            "database": {
+                key: value
+                for key, value in stats.items()
+                if key
+                in {
+                    "db_path",
+                    "backend",
+                    "project",
+                    "instance",
+                    "database",
+                    "dimension",
+                    "fts_index_available",
+                    "vector_index_available",
+                    "vector_search_mode",
+                    "embedding_mode",
+                    "embedding_model_id",
+                }
+            },
         }
 
     except Exception as e:
@@ -671,5 +745,5 @@ async def get_server_status(detail_level: str = "basic") -> dict:
         return {
             "error": "Failed to collect status",
             "error_type": type(e).__name__,
-            "message": str(e),
+            "message": f"Status collection failed: {type(e).__name__}",
         }

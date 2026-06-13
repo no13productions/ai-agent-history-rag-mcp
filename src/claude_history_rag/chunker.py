@@ -209,15 +209,27 @@ def create_summary_chunk(
 ) -> Chunk | None:
     """Create a summary chunk from a compaction event.
 
+    Handles both formats:
+    - Legacy (Claude Code < 2.1): a dedicated ``type: "summary"`` entry whose
+      text lives in the top-level ``summary`` field.
+    - Current (Claude Code >= 2.1): an ordinary ``user``/``assistant`` entry
+      flagged with ``isCompactSummary`` whose text lives in ``message.content``.
+
     Returns:
         Chunk if summary content exists, None otherwise.
     """
+    # Resolve summary text from whichever format produced this entry.
+    summary_text = entry.summary
+    if (not summary_text or not summary_text.strip()) and entry.message is not None:
+        summary_text = extract_text_content(entry.message)
+
     # Validate summary content
-    if not entry.summary or not entry.summary.strip():
+    if not summary_text or not summary_text.strip():
         logger.warning(
             f"Skipping empty summary chunk at line {source_line} in {source_file} - summary content is empty"
         )
         return None
+    summary_text = summary_text.strip()
 
     project_name = get_project_name(project_path)
     timestamp = entry.timestamp
@@ -228,7 +240,7 @@ def create_summary_chunk(
         timestamp = datetime.now(timezone.utc)
     session_id = entry.sessionId or "unknown"
 
-    content = f"Session summary for {project_name}:\n{entry.summary}"
+    content = f"Session summary for {project_name}:\n{summary_text}"
     chunk_id = generate_chunk_id(content, session_id, str(timestamp))
 
     return Chunk(
@@ -334,6 +346,22 @@ def chunk_session_file(
     pending_user: tuple[HistoryEntry, int] | None = None
 
     for entry, line_number in parse_jsonl_file(file_path, start_line):
+        # Current Claude Code (>=2.1) marks compaction summaries as ordinary
+        # user/assistant entries with isCompactSummary=True rather than a
+        # dedicated "summary" type. Route these to a summary chunk and skip
+        # the turn-pairing logic so the summary text isn't mislabeled as a turn.
+        if entry.isCompactSummary:
+            summary_chunk = create_summary_chunk(
+                entry=entry,
+                project_path=project_path,
+                source_file=source_file,
+                source_line=line_number,
+            )
+            if summary_chunk is not None:
+                yield summary_chunk
+                chunk_counts["summary"] += 1
+            continue
+
         if entry.type == "user":
             pending_user = (entry, line_number)
 

@@ -1,12 +1,15 @@
-"""Async embedding wrapper using OpenAI-compatible API.
+"""Async embedding wrapper with pluggable embedding providers.
 
-Works with any embedding server that implements the OpenAI /v1/embeddings endpoint:
+Provider "openai" works with any server implementing the OpenAI /v1/embeddings endpoint:
 - Ollama (http://localhost:11434/v1)
 - vLLM (http://localhost:8000/v1)
 - text-embeddings-inference
 - OpenAI API
 - LiteLLM
 - etc.
+
+Provider "vertex" uses Vertex AI prediction endpoints. The default Vertex model is
+gemini-embedding-001 with 3072-dimensional output.
 """
 
 import asyncio
@@ -15,6 +18,8 @@ import re
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -26,6 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 2
 RETRY_BACKOFF_BASE = 0.5  # seconds
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0)
+VERTEX_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 # Regex patterns for text sanitization
 # Match long runs of repeated characters (4+ of the same char)
@@ -34,6 +40,19 @@ REPEATED_CHARS_PATTERN = re.compile(r"(.)\1{3,}")
 BINARY_PATTERN = re.compile(r"(?:[0-9a-fA-F]{2}[\s:,]?){8,}")
 # Match base64-like long strings (40+ chars of base64 alphabet without spaces)
 BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/=]{40,}")
+
+
+def redact_url(url: str) -> str:
+    """Remove credentials from URLs before logging or status output."""
+    if not url:
+        return url
+    parsed = urlsplit(url)
+    if not parsed.username and not parsed.password:
+        return url
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
 
 
 def sanitize_text_for_embedding(text: str) -> str:
@@ -102,77 +121,83 @@ def sanitize_text_for_embedding(text: str) -> str:
     return text
 
 
-class AsyncEmbedder:
-    """Async wrapper for OpenAI-compatible embedding APIs."""
+class EmbeddingProvider(Protocol):
+    """Backend interface for text embedding providers."""
+
+    provider_name: str
+    model_name: str
+    dimension: int | None
+
+    def initialize(self) -> None:
+        """Initialize provider resources."""
+        ...
+
+    def embed_sync(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
+        """Synchronously embed text in provider-specific format."""
+        ...
+
+    def shutdown(self) -> None:
+        """Release provider resources."""
+        ...
+
+
+class OpenAICompatibleEmbeddingProvider:
+    """Embedding provider for OpenAI-compatible /v1/embeddings APIs."""
+
+    provider_name = "openai"
 
     def __init__(
         self,
         base_url: str | None = None,
         model_name: str | None = None,
         api_key: str | None = None,
+        dimension: int | None = None,
     ):
         self.base_url = (base_url or settings.embedding_base_url).rstrip("/")
         self.model_name = model_name or settings.embedding_model
         self.api_key = api_key if api_key is not None else settings.embedding_api_key
+        self.dimension = dimension or settings.embedding_dimension
         self._client: httpx.Client | None = None
-        self._client_lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=4)
-        self._shutdown = False
-        self._initialized = False
+
+    def initialize(self) -> None:
+        """Initialize HTTP client."""
+        if self._client is not None:
+            return
+        self._client = httpx.Client(
+            timeout=HTTP_TIMEOUT,
+            limits=httpx.Limits(
+                max_connections=4,
+                max_keepalive_connections=2,
+                keepalive_expiry=30.0,
+            ),
+        )
+        logger.info(
+            "Embedding provider initialized: provider=%s url=%s model=%s",
+            self.provider_name,
+            redact_url(self.base_url),
+            self.model_name,
+        )
 
     def _get_headers(self) -> dict[str, str]:
         """Get HTTP headers for API requests."""
-        headers = {
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    async def _ensure_initialized(self) -> None:
-        """Ensure HTTP client is initialized."""
-        if self._initialized:
-            return
-
-        with self._client_lock:
-            if self._client is None:
-                self._client = httpx.Client(
-                    timeout=HTTP_TIMEOUT,
-                    limits=httpx.Limits(
-                        max_connections=4,
-                        max_keepalive_connections=2,
-                        keepalive_expiry=30.0,
-                    ),
-                )
-                logger.info(
-                    f"Embedding client initialized: {self.base_url}, model: {self.model_name}"
-                )
-
-        self._initialized = True
-
-    def _embed_sync(self, texts: list[str]) -> list[list[float]]:
-        """Synchronous embedding using OpenAI-compatible API.
-
-        Args:
-            texts: List of texts to embed
-
-        Returns:
-            List of embedding vectors
-
-        Raises:
-            RuntimeError: If embedding fails
-        """
-        if self._shutdown:
-            raise RuntimeError("Cannot embed after shutdown")
+    def embed_sync(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
+        """Embed using the OpenAI embeddings API format."""
+        del task_type
         if self._client is None:
             raise RuntimeError("HTTP client not initialized")
 
-        # OpenAI embeddings API format
         url = f"{self.base_url}/embeddings"
-        payload = {
+        payload: dict[str, object] = {
             "model": self.model_name,
             "input": texts,
         }
+        if self.dimension is not None and settings.openai_embedding_send_dimensions:
+            payload["dimensions"] = self.dimension
 
         try:
             response = self._client.post(
@@ -183,14 +208,30 @@ class AsyncEmbedder:
             response.raise_for_status()
             data = response.json()
 
-            # Extract embeddings from response
-            # OpenAI format: {"data": [{"embedding": [...], "index": 0}, ...]}
             embeddings_data = data.get("data", [])
-
-            # Sort by index to ensure correct order
-            embeddings_data.sort(key=lambda x: x.get("index", 0))
-
-            embeddings = [item["embedding"] for item in embeddings_data]
+            if not isinstance(embeddings_data, list) or not all(
+                isinstance(item, dict) for item in embeddings_data
+            ):
+                raise RuntimeError("Invalid embedding response format")
+            has_any_index = any("index" in item for item in embeddings_data)
+            has_all_indexes = all("index" in item for item in embeddings_data)
+            if len(texts) > 1 and not has_all_indexes:
+                raise RuntimeError("Invalid embedding response format")
+            if has_any_index:
+                if not has_all_indexes:
+                    raise RuntimeError("Invalid embedding response format")
+                indexes = [item.get("index") for item in embeddings_data]
+                if not all(isinstance(index, int) for index in indexes) or sorted(indexes) != list(
+                    range(len(texts))
+                ):
+                    raise RuntimeError("Invalid embedding response format")
+                embeddings_data.sort(key=lambda x: x["index"])
+            embeddings = []
+            for item in embeddings_data:
+                embedding = item.get("embedding")
+                if not isinstance(embedding, list):
+                    raise RuntimeError("Invalid embedding response format")
+                embeddings.append(embedding)
 
             if len(embeddings) != len(texts):
                 raise RuntimeError(
@@ -200,16 +241,279 @@ class AsyncEmbedder:
             return embeddings
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"Embedding API error: {e.response.status_code} - {e.response.text[:200]}")
+            logger.error(
+                "Embedding API error: provider=%s model=%s status=%s url=%s",
+                self.provider_name,
+                self.model_name,
+                e.response.status_code,
+                redact_url(str(e.request.url)),
+            )
             raise RuntimeError(f"Embedding API error: {e.response.status_code}") from e
         except httpx.RequestError as e:
-            logger.error(f"Embedding request failed: {type(e).__name__}: {e}")
+            request_url = redact_url(str(e.request.url)) if e.request else "<unknown>"
+            logger.error(
+                "Embedding request failed: provider=%s model=%s error_type=%s url=%s",
+                self.provider_name,
+                self.model_name,
+                type(e).__name__,
+                request_url,
+            )
             raise RuntimeError(f"Embedding request failed: {type(e).__name__}") from e
         except (KeyError, IndexError) as e:
-            logger.error(f"Invalid embedding response format: {e}")
+            logger.error("Invalid embedding response format: %s", e)
             raise RuntimeError("Invalid embedding response format") from e
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    def shutdown(self) -> None:
+        """Close HTTP client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+
+class VertexAIEmbeddingProvider:
+    """Embedding provider for Vertex AI gemini-embedding-001."""
+
+    provider_name = "vertex"
+
+    def __init__(
+        self,
+        project: str | None = None,
+        location: str | None = None,
+        model_name: str | None = None,
+        dimension: int | None = None,
+        auto_truncate: bool | None = None,
+    ):
+        self.project = project if project is not None else settings.vertex_project
+        self.location = location or settings.vertex_location
+        self.model_name = model_name or settings.embedding_model
+        self.dimension = dimension or settings.embedding_dimension
+        self.auto_truncate = (
+            settings.vertex_auto_truncate if auto_truncate is None else auto_truncate
+        )
+        self._client: httpx.Client | None = None
+        self._credentials = None
+        self._endpoint = ""
+
+    def initialize(self) -> None:
+        """Initialize Vertex AI REST client."""
+        if self._client is not None:
+            return
+
+        project = self.project
+        from claude_history_rag.gcp_auth import default_project_and_credentials
+
+        resolved_project, credentials = default_project_and_credentials([VERTEX_SCOPE])
+        if not project:
+            project = resolved_project
+        if not project:
+            raise RuntimeError(
+                "Vertex project is not configured. Set CLAUDE_HISTORY_RAG_VERTEX_PROJECT "
+                "or configure Application Default Credentials with a project."
+            )
+
+        self.project = project
+        self._credentials = credentials
+        self._endpoint = (
+            f"https://{self.location}-aiplatform.googleapis.com/v1/"
+            f"projects/{self.project}/locations/{self.location}/publishers/google/"
+            f"models/{self.model_name}:predict"
+        )
+        self._client = httpx.Client(timeout=HTTP_TIMEOUT)
+        logger.info(
+            "Embedding provider initialized: provider=%s project=%s location=%s model=%s dim=%s",
+            self.provider_name,
+            self.project,
+            self.location,
+            self.model_name,
+            self.dimension,
+        )
+
+    def _auth_headers(self) -> dict[str, str]:
+        """Create authenticated headers for Vertex REST calls."""
+        if self._credentials is None:
+            raise RuntimeError("Vertex credentials not initialized")
+        from google.auth.transport.requests import Request
+
+        if not self._credentials.valid:
+            self._credentials.refresh(Request())
+        headers = {"Content-Type": "application/json"}
+        self._credentials.apply(headers)
+        return headers
+
+    def embed_sync(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
+        """Embed using Vertex AI.
+
+        gemini-embedding-001 supports one input per request, so batch requests are
+        fanned out here while preserving the public provider interface.
+        """
+        if self._client is None:
+            raise RuntimeError("Vertex embedding client not initialized")
+
+        vectors: list[list[float]] = []
+        for text in texts:
+            instance: dict[str, object] = {"content": text}
+            if task_type:
+                instance["task_type"] = task_type
+            parameters: dict[str, object] = {"autoTruncate": self.auto_truncate}
+            if self.dimension is not None:
+                parameters["outputDimensionality"] = self.dimension
+            try:
+                response = self._client.post(
+                    self._endpoint,
+                    json={"instances": [instance], "parameters": parameters},
+                    headers=self._auth_headers(),
+                )
+            except httpx.HTTPError as e:
+                logger.error(
+                    "Vertex embedding transport error: provider=%s project=%s "
+                    "location=%s model=%s error=%s",
+                    self.provider_name,
+                    self.project,
+                    self.location,
+                    self.model_name,
+                    type(e).__name__,
+                )
+                raise RuntimeError(f"Vertex embedding transport error: {type(e).__name__}") from e
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "Vertex embedding API error: provider=%s project=%s location=%s "
+                    "model=%s status=%s",
+                    self.provider_name,
+                    self.project,
+                    self.location,
+                    self.model_name,
+                    e.response.status_code,
+                )
+                raise RuntimeError(f"Vertex embedding API error: {e.response.status_code}") from e
+            try:
+                data = response.json()
+            except ValueError as e:
+                logger.error(
+                    "Vertex embedding response JSON error: provider=%s project=%s "
+                    "location=%s model=%s error=%s",
+                    self.provider_name,
+                    self.project,
+                    self.location,
+                    self.model_name,
+                    type(e).__name__,
+                )
+                raise RuntimeError("Invalid Vertex embedding JSON response") from e
+            predictions = data.get("predictions", [])
+            if len(predictions) != 1:
+                logger.error(
+                    "Vertex embedding prediction count mismatch: provider=%s project=%s "
+                    "location=%s model=%s count=%s",
+                    self.provider_name,
+                    self.project,
+                    self.location,
+                    self.model_name,
+                    len(predictions),
+                )
+                raise RuntimeError(
+                    f"Vertex embedding count mismatch: expected 1, got {len(predictions)}"
+                )
+            embedding = predictions[0].get("embeddings", {})
+            values = embedding.get("values")
+            if not isinstance(values, list):
+                logger.error(
+                    "Vertex embedding response shape error: provider=%s project=%s "
+                    "location=%s model=%s",
+                    self.provider_name,
+                    self.project,
+                    self.location,
+                    self.model_name,
+                )
+                raise RuntimeError("Invalid Vertex embedding response format")
+            vectors.append(values)
+        return vectors
+
+    def shutdown(self) -> None:
+        """Close REST client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        self._credentials = None
+
+
+def create_embedding_provider(
+    provider_name: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    api_key: str | None = None,
+) -> EmbeddingProvider:
+    """Create an embedding provider from settings."""
+    provider = (provider_name or settings.embedding_provider).lower()
+    if provider == "openai":
+        return OpenAICompatibleEmbeddingProvider(
+            base_url=base_url,
+            model_name=model_name,
+            api_key=api_key,
+        )
+    if provider == "vertex":
+        return VertexAIEmbeddingProvider(model_name=model_name)
+    raise ValueError(f"Unsupported embedding provider: {provider}")
+
+
+class AsyncEmbedder:
+    """Async embedding facade with pluggable providers."""
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        model_name: str | None = None,
+        api_key: str | None = None,
+        provider: EmbeddingProvider | None = None,
+        provider_name: str | None = None,
+    ):
+        self.provider = provider or create_embedding_provider(
+            provider_name=provider_name,
+            base_url=base_url,
+            model_name=model_name,
+            api_key=api_key,
+        )
+        self.base_url = getattr(self.provider, "base_url", "")
+        self.model_name = self.provider.model_name
+        self.provider_name = self.provider.provider_name
+        self.dimension = self.provider.dimension
+        self._client_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._shutdown = False
+        self._initialized = False
+
+    async def _ensure_initialized(self) -> None:
+        """Ensure provider resources are initialized."""
+        if self._initialized:
+            return
+
+        with self._client_lock:
+            if not self._initialized:
+                self.provider.initialize()
+                self.base_url = getattr(self.provider, "base_url", "")
+                self.model_name = self.provider.model_name
+                self.provider_name = self.provider.provider_name
+                self.dimension = self.provider.dimension
+                self._initialized = True
+
+    def _embed_sync(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
+        """Synchronous embedding through the configured provider.
+
+        Args:
+            texts: List of texts to embed
+            task_type: Optional provider-specific embedding task type
+
+        Returns:
+            List of embedding vectors
+
+        Raises:
+            RuntimeError: If embedding fails
+        """
+        if self._shutdown:
+            raise RuntimeError("Cannot embed after shutdown")
+        return self.provider.embed_sync(texts, task_type=task_type)
+
+    async def embed(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
         """Embed texts asynchronously."""
         if self._shutdown:
             raise RuntimeError("Cannot embed after shutdown")
@@ -221,6 +525,7 @@ class AsyncEmbedder:
             self._executor,
             self._embed_sync,
             texts,
+            task_type,
         )
 
     async def embed_query(self, query: str) -> list[float]:
@@ -231,7 +536,8 @@ class AsyncEmbedder:
         # Nomic requires search_query prefix for queries
         if "nomic" in self.model_name.lower():
             query = f"search_query: {query}"
-        embeddings = await self.embed([query])
+        task_type = settings.vertex_query_task_type if self.provider_name == "vertex" else None
+        embeddings = await self.embed([query], task_type=task_type)
         return embeddings[0]
 
     async def embed_documents(self, docs: list[str]) -> list[list[float]]:
@@ -242,7 +548,8 @@ class AsyncEmbedder:
         # Nomic requires search_document prefix for documents
         if "nomic" in self.model_name.lower():
             docs = [f"search_document: {doc}" for doc in docs]
-        return await self.embed(docs)
+        task_type = settings.vertex_document_task_type if self.provider_name == "vertex" else None
+        return await self.embed(docs, task_type=task_type)
 
     async def embed_chunks(
         self,
@@ -334,7 +641,9 @@ class AsyncEmbedder:
                     if attempt < MAX_RETRIES:
                         logger.warning(
                             f"Embedding batch {i}-{i + batch_size} failed "
-                            f"(attempt {attempt + 1}/{MAX_RETRIES}), retrying: {type(e).__name__}"
+                            f"(attempt {attempt + 1}/{MAX_RETRIES}), retrying: "
+                            f"{type(e).__name__}; provider={settings.embedding_provider} "
+                            f"model={settings.embedding_model} chunks={len(valid_chunks)}"
                         )
                         await asyncio.sleep(RETRY_BACKOFF_BASE * (attempt + 1))
                     else:
@@ -434,9 +743,7 @@ class AsyncEmbedder:
 
         # Close HTTP client
         with self._client_lock:
-            if self._client is not None:
-                self._client.close()
-                self._client = None
+            self.provider.shutdown()
 
         # Shutdown thread pool
         self._executor.shutdown(wait=wait, cancel_futures=True)

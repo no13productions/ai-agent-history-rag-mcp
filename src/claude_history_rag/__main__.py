@@ -17,11 +17,11 @@ import sys
 
 from claude_history_rag.config import OPTIMIZE_INTERVAL, settings
 from claude_history_rag.decision_engine.cache import get_search_cache
-from claude_history_rag.embedder import get_embedder
+from claude_history_rag.embedder import get_embedder, redact_url
 from claude_history_rag.server import mcp
 from claude_history_rag.status_server import create_status_server
 from claude_history_rag.store import store
-from claude_history_rag.watcher import get_watcher
+from claude_history_rag.watcher import get_all_watchers
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ async def run_server_standalone():
 
     This is the original behavior where the MCP server handles everything.
     """
-    watcher = get_watcher()
+    watchers = get_all_watchers()
     cache = get_search_cache()
     stop_event = asyncio.Event()
     optimize_task: asyncio.Task | None = None
@@ -59,8 +59,9 @@ async def run_server_standalone():
         except Exception as e:
             logger.error(f"Failed to start status server: {e}", exc_info=True)
 
-    # Start watcher
-    await watcher.start()
+    # Start watchers
+    for history_watcher in watchers:
+        await history_watcher.start()
 
     # Start cache maintenance
     await cache.start_maintenance()
@@ -112,10 +113,11 @@ async def run_server_standalone():
                 with contextlib.suppress(asyncio.CancelledError):
                     await optimize_task
 
-        try:
-            await asyncio.wait_for(watcher.stop(), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("Watcher stop timed out")
+        for history_watcher in watchers:
+            try:
+                await asyncio.wait_for(history_watcher.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("%s watcher stop timed out", history_watcher.source_name)
 
         if status_server:
             try:
@@ -207,10 +209,15 @@ def main():
     mode = "standalone" if args.standalone else "lightweight"
     logger.info(
         f"Starting AI Agent History RAG MCP server ({mode} mode) | "
+        f"storage_backend={settings.storage_backend} | "
         f"db={settings.db_path} | "
+        f"spanner={settings.spanner_project}/{settings.spanner_instance}/"
+        f"{settings.spanner_database} | "
         f"projects={settings.projects_path} | "
+        f"embedding_provider={settings.embedding_provider} | "
         f"embedding_model={settings.embedding_model} | "
-        f"embedding_url={settings.embedding_base_url} | "
+        f"embedding_dimension={settings.embedding_dimension} | "
+        f"embedding_url={redact_url(settings.embedding_base_url)} | "
         f"log={log_file}"
     )
 

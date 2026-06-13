@@ -3,8 +3,8 @@
 Checks system health, configuration, connectivity, and provides troubleshooting info.
 """
 
-import os
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -26,6 +26,7 @@ CONFIG_ERROR: str | None = None
 try:
     from claude_history_rag.config import Settings
     from claude_history_rag.config import settings as _settings
+    from claude_history_rag.embedder import redact_url
 
     settings: Settings | None = _settings
     CONFIG_LOADED = True
@@ -334,7 +335,7 @@ def run_doctor() -> int:
         print_info(f"Machine ID: {settings.machine_id}")
     else:
         print_info("Mode: SERVER/STANDALONE (local processing)")
-        print_info(f"Embedding URL: {settings.embedding_base_url}")
+        print_info(f"Embedding URL: {redact_url(settings.embedding_base_url)}")
         print_info(f"Embedding Model: {settings.embedding_model}")
 
     print_info(f"Database: {settings.db_path}")
@@ -342,6 +343,8 @@ def run_doctor() -> int:
     print_info(f"Codex Sessions: {settings.codex_sessions_path}")
     print_info(f"Gemini Sessions: {settings.gemini_sessions_path}")
     print_info(f"Antigravity Sessions: {settings.antigravity_sessions_path}")
+    print_info(f"ChatGPT Exports: {settings.chatgpt_exports_path}")
+    print_info(f"Claude App Exports: {settings.claude_app_exports_path}")
     print_info(f"Status Server: {settings.status_server_host}:{settings.status_server_port}")
 
     # ==========================================================================
@@ -387,16 +390,16 @@ def run_doctor() -> int:
         print_warn(
             "Status server host differs between current shell and daemon service configuration"
         )
-        print_info(f"Current shell: {settings.status_server_host} | Daemon service: {daemon_host_env}")
+        print_info(
+            f"Current shell: {settings.status_server_host} | Daemon service: {daemon_host_env}"
+        )
 
     # Warn if shell has host override but daemon service does not
     if not daemon_host_env and shell_host_env:
         print_warn(
             "Daemon service does not set CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST (current shell does)"
         )
-        print_info(
-            "The daemon will default to 127.0.0.1 unless the service config is updated"
-        )
+        print_info("The daemon will default to 127.0.0.1 unless the service config is updated")
 
     print(f"\n{BOLD}Port Status{RESET}")
 
@@ -410,9 +413,7 @@ def run_doctor() -> int:
             print_info(
                 "If this is a CENTRAL SERVER, set CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=0.0.0.0"
             )
-            print_info(
-                "If this is a standalone install, 127.0.0.1 is expected for security"
-            )
+            print_info("If this is a standalone install, 127.0.0.1 is expected for security")
         in_use, process = check_port_in_use(port)
         if in_use:
             if running and process and "claude" in process.lower():
@@ -476,7 +477,7 @@ def run_doctor() -> int:
 
         # Check embedding server
         embedding_url = f"{settings.embedding_base_url}/models"
-        print(f"  Checking embedding server at {settings.embedding_base_url}...")
+        print(f"  Checking embedding server at {redact_url(settings.embedding_base_url)}...")
         reachable, status, error = check_url_reachable(embedding_url)
         if reachable:
             print_ok(f"Embedding server is responding (HTTP {status})")
@@ -563,14 +564,43 @@ def run_doctor() -> int:
 
     if settings.antigravity_sessions_path.exists():
         print_ok(f"Antigravity sessions directory exists: {settings.antigravity_sessions_path}")
-        antigravity_files = list(settings.antigravity_sessions_path.rglob("*.pb"))
-        print_info(f"Found {len(antigravity_files)} Antigravity history files")
+        antigravity_transcripts = list(
+            settings.antigravity_sessions_path.glob(
+                "brain/**/.system_generated/logs/transcript_full.jsonl"
+            )
+        )
+        antigravity_legacy_files = list(
+            settings.antigravity_sessions_path.glob("conversations/*.pb")
+        )
+        print_info(
+            "Found "
+            f"{len(antigravity_transcripts)} Antigravity JSONL transcript files and "
+            f"{len(antigravity_legacy_files)} legacy protobuf files"
+        )
     else:
         print_fail(
             f"Antigravity sessions directory not found: {settings.antigravity_sessions_path}"
         )
-        print_info("Antigravity stores sessions in ~/.gemini/antigravity/conversations/")
+        print_info("Antigravity stores history under ~/.gemini/antigravity/")
         all_ok = False
+
+    if settings.chatgpt_exports_path.exists():
+        print_ok(f"ChatGPT export directory exists: {settings.chatgpt_exports_path}")
+        chatgpt_exports = list(settings.chatgpt_exports_path.rglob("conversations.json"))
+        print_info(f"Found {len(chatgpt_exports)} ChatGPT export files")
+    else:
+        print_info(f"ChatGPT export directory will be created: {settings.chatgpt_exports_path}")
+        print_info("Drop extracted ChatGPT data exports here to ingest conversations.json")
+
+    if settings.claude_app_exports_path.exists():
+        print_ok(f"Claude app export directory exists: {settings.claude_app_exports_path}")
+        claude_app_exports = list(settings.claude_app_exports_path.rglob("conversations.json"))
+        print_info(f"Found {len(claude_app_exports)} Claude app export files")
+    else:
+        print_info(
+            f"Claude app export directory will be created: {settings.claude_app_exports_path}"
+        )
+        print_info("Drop extracted Claude web/Desktop exports here to ingest conversations.json")
 
     # Check database
     if settings.db_path.exists():

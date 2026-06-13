@@ -5,14 +5,18 @@ with retry logic and offline resilience.
 """
 
 import asyncio
+import contextlib
+import hashlib
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from claude_history_rag.config import settings
 from claude_history_rag.auth import _read_json, _write_secure_json
+from claude_history_rag.config import settings
 from claude_history_rag.models import (
     ChunkUploadRequest,
     ChunkUploadResponse,
@@ -33,6 +37,19 @@ logger = logging.getLogger(__name__)
 
 # HTTP client configuration
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0)
+
+
+def _redact_url(url: str) -> str:
+    """Remove userinfo from URLs before logging."""
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname or ""
+        netloc = hostname
+        if parts.port is not None:
+            netloc = f"{netloc}:{parts.port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        return "<invalid-url>"
 
 
 class ServerConnectionError(Exception):
@@ -66,6 +83,7 @@ class APIClient:
         self._last_connection_attempt: datetime | None = None
         self._connection_failures = 0
         self._auth_cache: dict[str, Any] | None = None
+        self._redacted_server_url = _redact_url(self.server_url)
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         """Ensure async HTTP client is initialized."""
@@ -105,11 +123,29 @@ class APIClient:
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
         self._save_client_auth(data)
 
+    def _get_or_create_client_secret(self) -> str:
+        data = self._load_client_auth()
+        secrets_by_machine = data.setdefault("client_secrets", {})
+        secret = secrets_by_machine.get(self.machine_id)
+        if not secret:
+            secret = secrets.token_urlsafe(32)
+            secrets_by_machine[self.machine_id] = secret
+            data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_client_auth(data)
+        return secret
+
+    def _client_identity_hash(self) -> str:
+        secret = self._get_or_create_client_secret()
+        return hashlib.sha256(f"{self.machine_id}\x00{secret}".encode()).hexdigest()
+
     def _auth_headers(self) -> dict[str, str]:
         psk = self._get_psk()
         if not psk:
             return {}
-        return {"Authorization": f"Bearer {psk}"}
+        return {
+            "Authorization": f"Bearer {psk}",
+            "X-Client-Identity": self._client_identity_hash(),
+        }
 
     async def _maybe_rotate_psk(
         self,
@@ -140,7 +176,7 @@ class APIClient:
         except Exception as e:
             # Rotation failed, fall back and report error
             self._set_psk(old_psk)
-            try:
+            with contextlib.suppress(Exception):
                 await self._request_with_retry(
                     "POST",
                     "/api/auth/rotation-error",
@@ -151,8 +187,6 @@ class APIClient:
                     },
                     allow_rotate=False,
                 )
-            except Exception:
-                pass
 
     async def _request_with_retry(
         self,
@@ -214,13 +248,13 @@ class APIClient:
 
                 if attempt < self.retry_count - 1:
                     logger.warning(
-                        f"Connection to {self.server_url} failed (attempt {attempt + 1}/{self.retry_count}), "
+                        f"Connection to {self._redacted_server_url} failed (attempt {attempt + 1}/{self.retry_count}), "
                         f"retrying in {self.retry_delay_seconds}s: {type(e).__name__}"
                     )
                     await asyncio.sleep(self.retry_delay_seconds)
                 else:
                     logger.error(
-                        f"Connection to {self.server_url} failed after {self.retry_count} attempts"
+                        f"Connection to {self._redacted_server_url} failed after {self.retry_count} attempts"
                     )
 
             except httpx.HTTPStatusError as e:

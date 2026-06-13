@@ -1,10 +1,10 @@
 # AI Agent History RAG MCP Server
 
-An MCP (Model Context Protocol) server that provides RAG (Retrieval-Augmented Generation) over **AI coding agent history** (Claude Code, Codex, Gemini CLI). It solves the compaction problem where long sessions lose context by providing persistent, searchable memory across all sessions and tools.
+An MCP (Model Context Protocol) server that provides RAG (Retrieval-Augmented Generation) over **AI coding agent and chat history** (Claude Code, Codex, Gemini CLI, Antigravity, ChatGPT exports, and Claude app exports). It solves the compaction problem where long sessions lose context by providing persistent, searchable memory across all sessions and tools.
 
 ## Features
 
-- **Multi-Agent History**: Ingests Claude Code, Codex, Gemini CLI, and **Google Antigravity** histories
+- **Multi-Agent History**: Ingests Claude Code, Codex, Gemini CLI, **Google Antigravity**, ChatGPT exports, and Claude app exports
 - **Semantic Search**: Find relevant context from past conversations using natural language queries
 - **Hybrid Search**: Combines vector similarity and BM25 full-text search with RRF reranking
 - **File Change Tracking**: Search for specific file modifications across all sessions
@@ -23,9 +23,13 @@ An MCP (Model Context Protocol) server that provides RAG (Retrieval-Augmented Ge
 - **Claude Code**: `~/.claude/projects/**/*.jsonl`
 - **Codex**: `~/.codex/sessions/**/*.jsonl`
 - **Gemini CLI**: `~/.gemini/tmp/**/chats/*.json` and `~/.gemini/tmp/**/logs.json`
-- **Google Antigravity**: `~/.gemini/antigravity/conversations/*.pb`
+- **Google Antigravity**: `~/.gemini/antigravity/brain/**/.system_generated/logs/transcript_full.jsonl` with legacy `~/.gemini/antigravity/conversations/*.pb` fallback
+- **ChatGPT web/Desktop**: official export `conversations.json` dropped under `~/.claude-history-rag/imports/chatgpt/**/conversations.json`
+- **Claude web/Desktop app**: official export `conversations.json` dropped under `~/.claude-history-rag/imports/claude-app/**/conversations.json`
 
 All sources are ingested **fully** (user, assistant, tool calls, and tool outputs). The only difference between sources is how we parse their on-disk formats and where we watch for files.
+
+ChatGPT and Claude app do not currently provide a stable supported local transcript folder comparable to Claude Code/Codex/Gemini CLI. Their watchers are live drop-folder watchers for official exports: export from the app/web UI, extract the ZIP, and place the extracted folder under the configured import directory. The watcher indexes new or replaced `conversations.json` files automatically.
 
 ### About diffs and file changes
 
@@ -181,7 +185,7 @@ CLAUDE_HISTORY_RAG_AUTH_ENABLED=true
 CLAUDE_HISTORY_RAG_SERVER_PSK=change-me
 ```
 
-See [.env.docker.example](.env.docker.example) for all options.
+Use the environment variable reference below for the full option list.
 
 **Client machines** can connect to this Docker server:
 ```bash
@@ -240,6 +244,35 @@ uv run ai-agent-history-rag-daemon start
    ```
 
 3. **Configure Claude Code** to use the MCP server (see Configuration section)
+
+#### Current Spanner Server Example
+
+On the central machine, run server mode against the shared Spanner DB:
+
+```bash
+export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=jeeves-486102
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=jeeves-rg-spanner-prod-4d0e4c43
+export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=ai-agent-history-rag
+export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE=spanner
+export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID=ConversationEmbeddingModel
+export CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex
+export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
+export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
+export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=0.0.0.0
+uv run ai-agent-history-rag-daemon start
+```
+
+On another workstation, point at that server and use a stable machine id:
+
+```bash
+export CLAUDE_HISTORY_RAG_SERVER_URL=http://<server-ip>:4680
+export CLAUDE_HISTORY_RAG_MACHINE_ID=<workstation-name>
+export CLAUDE_HISTORY_RAG_CLIENT_NAME="<human readable name>"
+uv run ai-agent-history-rag-daemon start
+```
+
+Each workstation watches its local Claude Code, Codex, Gemini, Antigravity, ChatGPT export, and Claude app export roots, then uploads chunks to the central server. Rows keep their `machine_id`, so search spans all machines while purge/reindex can remain machine-scoped.
 
 ## Configuration
 
@@ -322,8 +355,12 @@ Add to `~/.config/Claude/claude_desktop_config.json`:
 | `CLAUDE_HISTORY_RAG_CODEX_STATE_PATH` | `~/.claude-history-rag/codex_state.json` | Codex file position state |
 | `CLAUDE_HISTORY_RAG_GEMINI_SESSIONS_PATH` | `~/.gemini/tmp` | Gemini CLI session history directory |
 | `CLAUDE_HISTORY_RAG_GEMINI_STATE_PATH` | `~/.claude-history-rag/gemini_state.json` | Gemini file position state |
-| `CLAUDE_HISTORY_RAG_ANTIGRAVITY_SESSIONS_PATH` | `~/.gemini/antigravity/conversations` | Google Antigravity sessions directory |
+| `CLAUDE_HISTORY_RAG_ANTIGRAVITY_SESSIONS_PATH` | `~/.gemini/antigravity` | Google Antigravity history root |
 | `CLAUDE_HISTORY_RAG_ANTIGRAVITY_STATE_PATH` | `~/.claude-history-rag/antigravity_state.json` | Google Antigravity file position state |
+| `CLAUDE_HISTORY_RAG_CHATGPT_EXPORTS_PATH` | `~/.claude-history-rag/imports/chatgpt` | ChatGPT official export drop folder |
+| `CLAUDE_HISTORY_RAG_CHATGPT_STATE_PATH` | `~/.claude-history-rag/chatgpt_state.json` | ChatGPT export file position state |
+| `CLAUDE_HISTORY_RAG_CLAUDE_APP_EXPORTS_PATH` | `~/.claude-history-rag/imports/claude-app` | Claude web/Desktop app export drop folder |
+| `CLAUDE_HISTORY_RAG_CLAUDE_APP_STATE_PATH` | `~/.claude-history-rag/claude_app_state.json` | Claude app export file position state |
 | `CLAUDE_HISTORY_RAG_LOG_LEVEL` | `INFO` | Logging level |
 
 #### Client/Server Mode
@@ -336,20 +373,77 @@ Add to `~/.config/Claude/claude_desktop_config.json`:
 | `CLAUDE_HISTORY_RAG_UPLOAD_INTERVAL_SECONDS` | `300` | Batch upload interval (5 min) |
 | `CLAUDE_HISTORY_RAG_UPLOAD_RETRY_COUNT` | `3` | Retries before queuing for later |
 | `CLAUDE_HISTORY_RAG_UPLOAD_RETRY_DELAY_SECONDS` | `30` | Delay between retries |
+| `CLAUDE_HISTORY_RAG_CLIENT_HEARTBEAT_INTERVAL_SECONDS` | `60` | Client heartbeat interval |
 
-#### Embedding Settings (OpenAI-compatible API)
+#### Embedding Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER` | `openai` | `openai` for OpenAI-compatible APIs, `vertex` for Vertex AI |
 | `CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL` | `http://localhost:11434/v1` | Embeddings API base URL |
 | `CLAUDE_HISTORY_RAG_EMBEDDING_MODEL` | `nomic-embed-text` | Model name |
 | `CLAUDE_HISTORY_RAG_EMBEDDING_API_KEY` | `""` | API key (for OpenAI, etc.) |
+| `CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION` | model default | Optional output/storage dimension override |
+| `CLAUDE_HISTORY_RAG_OPENAI_EMBEDDING_SEND_DIMENSIONS` | `false` | Send `dimensions` to OpenAI-compatible APIs |
+| `CLAUDE_HISTORY_RAG_VERTEX_PROJECT` | ADC/gcloud project | Vertex AI project |
+| `CLAUDE_HISTORY_RAG_VERTEX_LOCATION` | `us-central1` | Vertex AI location |
+| `CLAUDE_HISTORY_RAG_VERTEX_AUTO_TRUNCATE` | `true` | Let Vertex truncate oversized embedding inputs |
+| `CLAUDE_HISTORY_RAG_VERTEX_QUERY_TASK_TYPE` | `RETRIEVAL_QUERY` | Vertex task type for query embeddings |
+| `CLAUDE_HISTORY_RAG_VERTEX_DOCUMENT_TASK_TYPE` | `RETRIEVAL_DOCUMENT` | Vertex task type for document embeddings |
 
 **Example URLs:**
 - Ollama: `http://localhost:11434/v1`
 - vLLM: `http://localhost:8000/v1`
 - OpenAI: `https://api.openai.com/v1`
 - text-embeddings-inference: `http://localhost:8080/v1`
+
+**Vertex AI example:**
+```bash
+export CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex
+export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
+export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
+export CLAUDE_HISTORY_RAG_VERTEX_PROJECT=<your-gcp-project>
+export CLAUDE_HISTORY_RAG_VERTEX_LOCATION=us-central1
+```
+
+#### Storage Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_HISTORY_RAG_STORAGE_BACKEND` | `lancedb` | `lancedb` or `spanner` |
+| `CLAUDE_HISTORY_RAG_SPANNER_PROJECT` | ADC/gcloud project | Cloud Spanner project |
+| `CLAUDE_HISTORY_RAG_SPANNER_INSTANCE` | `""` | Cloud Spanner instance ID |
+| `CLAUDE_HISTORY_RAG_SPANNER_DATABASE` | `""` | Cloud Spanner database ID |
+| `CLAUDE_HISTORY_RAG_SPANNER_ENABLE_FULL_TEXT` | `true` | Create/use Spanner full-text search index |
+| `CLAUDE_HISTORY_RAG_SPANNER_ENABLE_VECTOR_INDEX` | `true` | Create/use Spanner vector index |
+| `CLAUDE_HISTORY_RAG_SPANNER_USE_APPROX_VECTOR_SEARCH` | `true` | Use indexed ANN when query shape supports it |
+| `CLAUDE_HISTORY_RAG_SPANNER_VECTOR_INDEX_LEAVES` | `1000` | Spanner vector index leaf count |
+| `CLAUDE_HISTORY_RAG_SPANNER_NUM_LEAVES_TO_SEARCH` | `50` | ANN recall/latency search knob |
+| `CLAUDE_HISTORY_RAG_SPANNER_HYBRID_CANDIDATE_LIMIT` | `100` | Candidate pool for vector/text RRF fusion |
+| `CLAUDE_HISTORY_RAG_SPANNER_RRF_K` | `60` | Reciprocal-rank fusion constant |
+| `CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE` | `app` | `app` embeds before write, `spanner` uses `ML.PREDICT` |
+| `CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID` | `ConversationEmbeddingModel` | Registered Spanner model name |
+
+**Spanner example:**
+```bash
+export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=<your-gcp-project>
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=<your-spanner-instance>
+export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=<your-rag-database>
+```
+
+**Spanner + Vertex native embedding example:**
+```bash
+export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=jeeves-486102
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=jeeves-rg-spanner-prod-4d0e4c43
+export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=ai-agent-history-rag
+export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE=spanner
+export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID=ConversationEmbeddingModel
+export CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex
+export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
+export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
+```
 
 #### Status Server Settings
 
@@ -728,8 +822,8 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 │     API Endpoints ◄── Status Server (port 4680)             │
 │           │                                                 │
 │           ▼                                                 │
-│     Embedder ──► LanceDB ◄── Search API                    │
-│     (Ollama/vLLM/OpenAI)                                   │
+│     Embedder ──► Storage Backend ◄── Search API            │
+│     (OpenAI-compatible / Vertex)   (LanceDB / Spanner)     │
 │                                                             │
 │     Position Tracking (per machine)                        │
 └─────────────────────────────────────────────────────────────┘
@@ -757,7 +851,8 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 
 - **Python 3.10+** with async/await patterns
 - **FastMCP** (official MCP SDK) - STDIO transport
-- **LanceDB 0.25+** - Embedded vector database with hybrid search
+- **Storage backends** - LanceDB 0.25+ embedded search, or Cloud Spanner vector/full-text/hybrid search
+- **Embedding providers** - OpenAI-compatible `/v1/embeddings` API or Vertex AI REST
 - **httpx** - Async HTTP client for embeddings API and client/server communication
 - **watchfiles** - Rust-based async file watching
 - **pydantic** - Data validation and settings
@@ -767,7 +862,7 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 
 | Metric | Target | Implementation |
 |--------|--------|----------------|
-| Query latency | <500ms | LanceDB vector + RRF reranking |
+| Query latency | <500ms | LanceDB vector + RRF reranking, or Spanner exact/ANN vector + full-text hybrid search |
 | Indexing | <30s/1000 chunks | Batch embedding, async I/O |
 | Memory idle | <200MB | Lazy model loading |
 | Update latency | <60s | 5s debounce + incremental indexing |
@@ -838,17 +933,12 @@ All checks passed!
 2. View pending uploads: `cat ~/.claude-history-rag/client_state.json`
 3. Stale uploads (>72h) are automatically cleared
 
-## Wish List
+## Roadmap
 
-The project roadmap includes a major refactor to introduce a **Storage Abstraction Layer** to decouple the system from LanceDB and provide flexible deployment options:
-
-- **Storage Abstraction Layer**: Interface to support multiple vector store backends.
-- **Backend Options**:
-  - **SQLite + sqlite-vec**: Zero-dependency embedded option (ideal for single-user/all-in-one).
-  - **Qdrant**: High-performance option (via sidecar container) for power users.
-  - **LanceDB**: Maintain current support as a high-throughput embedded option.
-- **Cloud Integration**: Direct connection to managed cloud vector databases.
-- **Management Dashboard**: Unified UI to manage storage backends, configure remote endpoints, and visualize usage.
+- Split LanceDB and Spanner implementations into separate backend modules behind the existing `ConversationStore` interface.
+- Add typed importers for ChatGPT and Claude app official export ZIP/JSON files.
+- Add a source registration layer so new watchers do not require edits across config, status, docs, and the watcher registry.
+- Extend the dashboard to manage backend settings, source roots, and remote client onboarding.
 
 ## License
 

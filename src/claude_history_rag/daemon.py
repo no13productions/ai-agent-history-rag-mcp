@@ -22,7 +22,8 @@ import sys
 from pathlib import Path
 
 from claude_history_rag.config import OPTIMIZE_INTERVAL, settings
-from claude_history_rag.watcher import get_watcher
+from claude_history_rag.embedder import redact_url
+from claude_history_rag.watcher import get_all_watchers
 
 logger = logging.getLogger(__name__)
 
@@ -86,14 +87,7 @@ async def run_daemon():
 
     Handles both server mode and client mode.
     """
-    watcher = get_watcher()
-    from claude_history_rag.codex.watcher import get_codex_watcher
-    from claude_history_rag.gemini.watcher import get_gemini_watcher
-    from claude_history_rag.antigravity.watcher import get_antigravity_watcher
-
-    codex_watcher = get_codex_watcher()
-    gemini_watcher = get_gemini_watcher()
-    antigravity_watcher = get_antigravity_watcher()
+    watchers = get_all_watchers()
     stop_event = asyncio.Event()
     optimize_task: asyncio.Task | None = None
     status_server = None
@@ -142,10 +136,8 @@ async def run_daemon():
 
         # Start watcher (runs startup sync, then starts background tasks)
         # Works in both modes - client mode uploads, server mode embeds locally
-        await watcher.start()
-        await codex_watcher.start()
-        await gemini_watcher.start()
-        await antigravity_watcher.start()
+        for history_watcher in watchers:
+            await history_watcher.start()
 
         # Server mode: cache and optimization
         if is_server_mode:
@@ -205,26 +197,11 @@ async def run_daemon():
                 with contextlib.suppress(asyncio.CancelledError):
                     await optimize_task
 
-        # Stop watcher
-        try:
-            await asyncio.wait_for(watcher.stop(), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("Watcher stop timed out")
-
-        try:
-            await asyncio.wait_for(codex_watcher.stop(), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("Codex watcher stop timed out")
-
-        try:
-            await asyncio.wait_for(gemini_watcher.stop(), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("Gemini watcher stop timed out")
-
-        try:
-            await asyncio.wait_for(antigravity_watcher.stop(), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("Antigravity watcher stop timed out")
+        for history_watcher in watchers:
+            try:
+                await asyncio.wait_for(history_watcher.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("%s watcher stop timed out", history_watcher.source_name)
 
         # Stop status server (server mode only)
         if status_server:
@@ -325,10 +302,15 @@ def cmd_start(args):
     if settings.is_server_mode:
         logger.info(
             f"Starting daemon [{mode}] | "
+            f"storage_backend={settings.storage_backend} | "
             f"db={settings.db_path} | "
+            f"spanner={settings.spanner_project}/{settings.spanner_instance}/"
+            f"{settings.spanner_database} | "
             f"projects={settings.projects_path} | "
-            f"embedding_url={settings.embedding_base_url} | "
+            f"embedding_provider={settings.embedding_provider} | "
+            f"embedding_url={redact_url(settings.embedding_base_url)} | "
             f"embedding_model={settings.embedding_model} | "
+            f"embedding_dimension={settings.embedding_dimension} | "
             f"log={log_file}"
         )
     else:

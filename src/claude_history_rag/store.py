@@ -4,17 +4,124 @@ import asyncio
 import logging
 import math
 import threading
+from datetime import UTC
 from datetime import datetime as dt
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import lancedb
-from lancedb.pydantic import LanceModel, Vector
+import pyarrow as pa
 from lancedb.rerankers import RRFReranker
 
 from claude_history_rag.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class ConversationStore(Protocol):
+    """Storage backend interface for searchable conversation chunks."""
+
+    def add_chunks(self, chunks: list[dict[str, Any]]) -> None:
+        """Persist embedded conversation chunks."""
+        ...
+
+    async def add_chunks_async(self, chunks: list[dict[str, Any]]) -> None:
+        """Persist embedded conversation chunks asynchronously."""
+        ...
+
+    def search(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+        file_path_filter: str | None = None,
+        operation_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search by vector similarity with optional filters."""
+        ...
+
+    def vector_search(
+        self,
+        query_vector: list[float],
+        limit: int = 5,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search by vector similarity."""
+        ...
+
+    async def search_async(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+        file_path_filter: str | None = None,
+        operation_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search asynchronously by vector similarity with optional filters."""
+        ...
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_vector: list[float],
+        limit: int = 5,
+        project_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search by combined lexical and vector relevance."""
+        ...
+
+    async def hybrid_search_async(
+        self,
+        query: str,
+        query_vector: list[float],
+        limit: int = 5,
+        project_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search asynchronously by combined lexical and vector relevance."""
+        ...
+
+    async def optimize_async(self) -> None:
+        """Optimize backend storage."""
+        ...
+
+    def has_fts_index(self) -> bool:
+        """Return whether full-text search is available."""
+        ...
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return backend statistics."""
+        ...
+
+    async def get_stats_async(self) -> dict[str, Any]:
+        """Return backend statistics asynchronously."""
+        ...
+
+    def clear_all(self) -> int:
+        """Clear all chunks."""
+        ...
+
+    async def clear_all_async(self) -> int:
+        """Clear all chunks asynchronously."""
+        ...
+
+    def delete_by_machine_id(self, machine_id: str) -> int:
+        """Delete chunks for one machine."""
+        ...
+
+    async def delete_by_machine_id_async(self, machine_id: str) -> int:
+        """Delete chunks for one machine asynchronously."""
+        ...
+
+    def close(self) -> None:
+        """Release backend resources."""
+        ...
+
+    async def close_async(self) -> None:
+        """Release backend resources asynchronously."""
+        ...
 
 
 def _escape_sql_string(value: str) -> str:
@@ -42,6 +149,7 @@ def _escape_like_pattern(value: str) -> str:
 # Model name to vector dimension mapping
 # https://ollama.com/search?c=embedding
 MODEL_DIMENSIONS: dict[str, int] = {
+    "gemini-embedding-001": 3072,
     "nomic-embed-text": 768,
     "mxbai-embed-large": 1024,
     "bge-m3": 1024,
@@ -52,6 +160,13 @@ MODEL_DIMENSIONS: dict[str, int] = {
 
 def get_vector_dim() -> int:
     """Get vector dimension based on configured embedding model."""
+    if settings.embedding_dimension is not None:
+        logger.info(
+            "Vector dimension from explicit setting for model '%s': %s",
+            settings.embedding_model,
+            settings.embedding_dimension,
+        )
+        return settings.embedding_dimension
     model = settings.embedding_model
     # Strip tag if present (e.g., "nomic-embed-text:latest" -> "nomic-embed-text")
     base_model = model.split(":")[0]
@@ -76,7 +191,7 @@ def get_current_vector_dim() -> int:
 
 
 # For backward compatibility - but use get_current_vector_dim() for runtime checks
-VECTOR_DIM = 1024  # Default to largest common dimension for schema
+VECTOR_DIM = 1024  # Legacy default only; new tables use a dynamic schema.
 
 # Threshold for creating vector indexes (only needed for large collections)
 VECTOR_INDEX_THRESHOLD = 10000
@@ -89,6 +204,121 @@ VECTOR_INDEX_THRESHOLD = 10000
 VECTOR_INDEX_BASE_PARTITIONS = 256
 VECTOR_INDEX_MIN_PARTITIONS = 64
 VECTOR_INDEX_MAX_PARTITIONS = 2048
+
+SPANNER_TABLE_NAME = "ConversationChunks"
+SPANNER_CONTENT_TOKENS_COLUMN = "ContentTokens"
+SPANNER_CONTENT_SEARCH_INDEX = "ConversationChunksContentSearch"
+SPANNER_VECTOR_INDEX = "ConversationChunksVectorIndex"
+SPANNER_COLUMNS = [
+    "Id",
+    "Content",
+    "Vector",
+    "ChunkType",
+    "SessionId",
+    "ProjectPath",
+    "ProjectName",
+    "Timestamp",
+    "UserUuid",
+    "AssistantUuid",
+    "FilePath",
+    "Operation",
+    "Model",
+    "SourceFile",
+    "SourceLine",
+    "ParentChunkId",
+    "ChildChunkIds",
+    "MachineId",
+]
+
+
+def get_spanner_schema_ddl() -> list[str]:
+    """Return DDL for the Spanner storage backend."""
+    dim = get_current_vector_dim()
+    ddl = [
+        f"""
+        CREATE TABLE {SPANNER_TABLE_NAME} (
+            Id STRING(64) NOT NULL,
+            Content STRING(MAX) NOT NULL,
+            {SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST
+                AS (TOKENIZE_FULLTEXT(Content)) HIDDEN,
+            Vector ARRAY<FLOAT32>(vector_length=>{dim}) NOT NULL,
+            ChunkType STRING(32) NOT NULL,
+            SessionId STRING(128) NOT NULL,
+            ProjectPath STRING(MAX) NOT NULL,
+            ProjectName STRING(256) NOT NULL,
+            Timestamp TIMESTAMP NOT NULL,
+            UserUuid STRING(128),
+            AssistantUuid STRING(128),
+            FilePath STRING(MAX),
+            Operation STRING(32),
+            Model STRING(256),
+            SourceFile STRING(MAX) NOT NULL,
+            SourceLine INT64 NOT NULL,
+            ParentChunkId STRING(64),
+            ChildChunkIds ARRAY<STRING(64)>,
+            MachineId STRING(256)
+        ) PRIMARY KEY (Id)
+        """,
+        f"CREATE INDEX {SPANNER_TABLE_NAME}ByProject ON {SPANNER_TABLE_NAME}(ProjectPath)",
+        f"CREATE INDEX {SPANNER_TABLE_NAME}ByMachine ON {SPANNER_TABLE_NAME}(MachineId)",
+    ]
+    if settings.spanner_enable_full_text:
+        ddl.append(
+            f"""
+            CREATE SEARCH INDEX {SPANNER_CONTENT_SEARCH_INDEX}
+            ON {SPANNER_TABLE_NAME}({SPANNER_CONTENT_TOKENS_COLUMN})
+            """
+        )
+    return ddl
+
+
+def get_spanner_vector_index_ddl() -> str:
+    """Return DDL for the Spanner ANN vector index."""
+    return f"""
+        CREATE VECTOR INDEX {SPANNER_VECTOR_INDEX}
+        ON {SPANNER_TABLE_NAME}(Vector)
+        STORING (ChunkType, SessionId, ProjectName, MachineId)
+        OPTIONS (
+            distance_type = 'COSINE',
+            tree_depth = 2,
+            num_leaves = {settings.spanner_vector_index_leaves}
+        )
+    """
+
+
+def _spanner_embedding_endpoint(project: str, location: str, model: str) -> str:
+    """Return Agent Platform model endpoint path for Spanner CREATE MODEL."""
+    return (
+        f"//aiplatform.googleapis.com/projects/{_escape_sql_string(project)}"
+        f"/locations/{_escape_sql_string(location)}"
+        f"/publishers/google/models/{_escape_sql_string(model)}"
+    )
+
+
+def get_spanner_embedding_model_ddl(project: str) -> str:
+    """Return DDL for registering the configured embedding model in Spanner."""
+    model_project = settings.vertex_project or project
+    endpoint = _spanner_embedding_endpoint(
+        project=model_project,
+        location=settings.vertex_location,
+        model=settings.embedding_model,
+    )
+    return f"""
+        CREATE MODEL IF NOT EXISTS {settings.spanner_embedding_model_id}
+        INPUT(
+            content STRING(MAX),
+            task_type STRING(MAX)
+        )
+        OUTPUT(
+            embeddings STRUCT<
+                statistics STRUCT<truncated BOOL, token_count FLOAT64>,
+                values ARRAY<FLOAT64>
+            >
+        )
+        REMOTE OPTIONS (
+            endpoint = '{endpoint}'
+        )
+    """
 
 
 def _validate_vector(vector: list[float], chunk_id: str = "unknown") -> None:
@@ -116,27 +346,60 @@ def _validate_vector(vector: list[float], chunk_id: str = "unknown") -> None:
         raise ValueError(f"Chunk {chunk_id}: Vector is a zero vector")
 
 
-class ConversationChunkModel(LanceModel):
-    """LanceDB schema for conversation chunks."""
+def _normalize_timestamp(value: Any) -> dt:
+    """Normalize timestamp values for storage backends."""
+    if isinstance(value, dt):
+        timestamp = value
+    elif isinstance(value, str):
+        timestamp = dt.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        timestamp = dt.now(UTC)
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC)
 
-    id: str
-    content: str
-    vector: Vector(VECTOR_DIM)  # type: ignore
-    chunk_type: str
-    session_id: str
-    project_path: str
-    project_name: str
-    timestamp: dt
-    user_uuid: str | None = None
-    assistant_uuid: str | None = None
-    file_path: str | None = None
-    operation: str | None = None
-    model: str | None = None
-    source_file: str
-    source_line: int
-    parent_chunk_id: str | None = None
-    child_chunk_ids: list[str] | None = None
-    machine_id: str | None = None  # For multi-machine support
+
+def _format_timestamp(value: Any) -> str | None:
+    """Format backend timestamp values for API responses."""
+    if isinstance(value, dt):
+        return value.isoformat()
+    if value is None:
+        return None
+    return str(value)
+
+
+def _relevance_to_distance(value: Any) -> float:
+    """Convert higher-is-better relevance into lower-is-better distance."""
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 1.0
+    return 1.0 - max(0.0, min(1.0, float(value)))
+
+
+def get_conversation_chunk_schema() -> pa.Schema:
+    """Create the LanceDB schema for the configured embedding dimension."""
+    dim = get_current_vector_dim()
+    return pa.schema(
+        [
+            pa.field("id", pa.string(), nullable=False),
+            pa.field("content", pa.string(), nullable=False),
+            pa.field("vector", pa.list_(pa.float32(), dim), nullable=False),
+            pa.field("chunk_type", pa.string(), nullable=False),
+            pa.field("session_id", pa.string(), nullable=False),
+            pa.field("project_path", pa.string(), nullable=False),
+            pa.field("project_name", pa.string(), nullable=False),
+            pa.field("timestamp", pa.timestamp("us"), nullable=False),
+            pa.field("user_uuid", pa.string()),
+            pa.field("assistant_uuid", pa.string()),
+            pa.field("file_path", pa.string()),
+            pa.field("operation", pa.string()),
+            pa.field("model", pa.string()),
+            pa.field("source_file", pa.string(), nullable=False),
+            pa.field("source_line", pa.int64(), nullable=False),
+            pa.field("parent_chunk_id", pa.string()),
+            pa.field("child_chunk_ids", pa.list_(pa.string())),
+            pa.field("machine_id", pa.string()),
+        ]
+    )
 
 
 class VectorStore:
@@ -180,7 +443,7 @@ class VectorStore:
                 # Create empty table with schema
                 self._table = db.create_table(
                     "conversations",
-                    schema=ConversationChunkModel,
+                    schema=get_conversation_chunk_schema(),
                     mode="overwrite",
                 )
                 logger.info("Created new conversations table")
@@ -223,9 +486,7 @@ class VectorStore:
 
         table = self.get_table()
         try:
-            # Convert dicts to Pydantic models to ensure proper schema handling
-            models = [ConversationChunkModel(**chunk) for chunk in chunks]
-            table.add(models)
+            table.add(chunks)
             logger.info(f"Added {len(chunks)} chunks to store")
         except Exception as e:
             chunk_ids = [c.get("id", "unknown")[:8] for c in chunks[:5]]
@@ -312,7 +573,9 @@ class VectorStore:
             else:
                 raise
 
-        # Validate results before accessing dict keys
+        # Validate results before accessing dict keys. LanceDB hybrid returns a
+        # higher-is-better relevance score; normalize to the store contract where
+        # score is distance-like and lower is better.
         return [
             {
                 "id": r["id"],
@@ -332,6 +595,21 @@ class VectorStore:
             for r in results
             if isinstance(r, dict) and "id" in r and "content" in r
         ]
+
+    def vector_search(
+        self,
+        query_vector: list[float],
+        limit: int = 5,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Protocol alias for vector search."""
+        return self.search(
+            query_vector=query_vector,
+            limit=limit,
+            project_filter=project_filter,
+            chunk_type_filter=chunk_type_filter,
+        )
 
     async def search_async(
         self,
@@ -391,16 +669,14 @@ class VectorStore:
                     )
                     self.reset_connections()
                     table = self.get_table()
-                    search_query = table.search(query_type="hybrid").vector(query_vector).text(query)
+                    search_query = (
+                        table.search(query_type="hybrid").vector(query_vector).text(query)
+                    )
                     if project_filter:
                         safe_project = _sanitize_filter_value(project_filter)
                         if safe_project:
-                            search_query = search_query.where(
-                                f"project_path = '{safe_project}'"
-                            )
-                    results = (
-                        search_query.rerank(reranker=RRFReranker()).limit(limit).to_list()
-                    )
+                            search_query = search_query.where(f"project_path = '{safe_project}'")
+                    results = search_query.rerank(reranker=RRFReranker()).limit(limit).to_list()
                 else:
                     raise
         except RuntimeError as e:
@@ -430,7 +706,7 @@ class VectorStore:
                 "file_path": r.get("file_path"),
                 "operation": r.get("operation"),
                 "machine_id": r.get("machine_id"),
-                "score": r.get("_relevance_score", 0),
+                "score": _relevance_to_distance(r.get("_relevance_score")),
             }
             for r in results
             if isinstance(r, dict) and "id" in r and "content" in r
@@ -547,7 +823,7 @@ class VectorStore:
             table = self.get_table()
             row_count = table.count_rows()
         except Exception as e:
-            error_message = str(e)
+            error_message = f"Stats unavailable: {type(e).__name__}"
             logger.error(
                 f"Failed to get row count for stats: {type(e).__name__}",
                 exc_info=True,
@@ -559,7 +835,7 @@ class VectorStore:
                 row_count = table.count_rows()
                 error_message = None
             except Exception as retry_error:
-                error_message = str(retry_error)
+                error_message = f"Stats unavailable after retry: {type(retry_error).__name__}"
                 logger.error(
                     f"Retry failed to get row count: {type(retry_error).__name__}",
                     exc_info=True,
@@ -780,5 +1056,923 @@ class VectorStore:
         await loop.run_in_executor(None, self.close)
 
 
+class SpannerStore:
+    """Cloud Spanner storage backend with vector and native hybrid search."""
+
+    def __init__(
+        self,
+        project: str | None = None,
+        instance: str | None = None,
+        database: str | None = None,
+        create_schema: bool = True,
+    ):
+        self.project = project if project is not None else settings.spanner_project
+        self.instance_id = instance if instance is not None else settings.spanner_instance
+        self.database_id = database if database is not None else settings.spanner_database
+        self.create_schema = create_schema
+        self._client = None
+        self._instance = None
+        self._database = None
+        self._lock = threading.Lock()
+
+    def _resolve_project(self) -> str:
+        """Resolve the Spanner project from config or ADC."""
+        if self.project:
+            return self.project
+        try:
+            from claude_history_rag.gcp_auth import default_project_and_credentials
+        except ImportError as e:
+            raise RuntimeError(
+                "Spanner storage backend requires google-cloud-spanner. "
+                "Install with: uv sync --extra server"
+            ) from e
+        project, _ = default_project_and_credentials(
+            ["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        if not project:
+            raise RuntimeError(
+                "Spanner project is not configured. Set CLAUDE_HISTORY_RAG_SPANNER_PROJECT "
+                "or configure Application Default Credentials with a project."
+            )
+        self.project = project
+        return project
+
+    def connect(self):
+        """Get or create a Spanner database handle."""
+        if self._database is not None:
+            return self._database
+        with self._lock:
+            if self._database is not None:
+                return self._database
+            if not self.instance_id or not self.database_id:
+                raise RuntimeError(
+                    "Spanner storage requires CLAUDE_HISTORY_RAG_SPANNER_INSTANCE and "
+                    "CLAUDE_HISTORY_RAG_SPANNER_DATABASE."
+                )
+            try:
+                from google.cloud import spanner
+            except ImportError as e:
+                raise RuntimeError(
+                    "Spanner storage backend requires google-cloud-spanner. "
+                    "Install with: uv sync --extra server"
+                ) from e
+
+            project, credentials = self._project_and_credentials()
+            self._client = spanner.Client(
+                project=project, credentials=credentials, disable_builtin_metrics=True
+            )
+            self._instance = self._client.instance(self.instance_id)
+            self._database = self._instance.database(self.database_id)
+            if self.create_schema:
+                self.ensure_schema()
+            return self._database
+
+    def ensure_database(self) -> None:
+        """Create the configured Spanner database when it does not exist."""
+        if not self.instance_id or not self.database_id:
+            raise RuntimeError(
+                "Spanner database creation requires spanner_instance and spanner_database."
+            )
+        try:
+            from google.api_core.exceptions import AlreadyExists
+            from google.cloud import spanner
+        except ImportError as e:
+            raise RuntimeError(
+                "Spanner storage backend requires google-cloud-spanner. "
+                "Install with: uv sync --extra server"
+            ) from e
+
+        if self._client is None:
+            project, credentials = self._project_and_credentials()
+            self._client = spanner.Client(
+                project=project, credentials=credentials, disable_builtin_metrics=True
+            )
+        instance = self._client.instance(self.instance_id)
+        database = instance.database(self.database_id, ddl_statements=get_spanner_schema_ddl())
+        try:
+            operation = database.create()
+            operation.result()
+            logger.info("Created Spanner database %s", self.database_id)
+        except AlreadyExists:
+            logger.info("Spanner database %s already exists", self.database_id)
+        self._instance = instance
+        self._database = instance.database(self.database_id)
+
+    def _project_and_credentials(self):
+        """Resolve project and credentials for Spanner clients."""
+        from claude_history_rag.gcp_auth import default_project_and_credentials
+
+        resolved_project, credentials = default_project_and_credentials(
+            ["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        if credentials is not None and not credentials.valid:
+            from google.auth.transport.requests import Request
+
+            credentials.refresh(Request())
+        project = self.project or resolved_project
+        if not project:
+            raise RuntimeError(
+                "Spanner project is not configured. Set CLAUDE_HISTORY_RAG_SPANNER_PROJECT "
+                "or configure a gcloud/ADC project."
+            )
+        self.project = project
+        return project, credentials
+
+    def ensure_schema(self) -> None:
+        """Create Spanner tables/indexes required by this backend if missing."""
+        database = self._database
+        if database is None:
+            return
+        if self._table_exists(SPANNER_TABLE_NAME):
+            self.ensure_search_schema()
+            self.ensure_embedding_model()
+            return
+        operation = database.update_ddl(get_spanner_schema_ddl())
+        operation.result()
+        logger.info("Created Spanner schema for %s", SPANNER_TABLE_NAME)
+        self.ensure_embedding_model()
+
+    def _run_ddl(self, ddl: str, description: str) -> bool:
+        """Run one DDL statement and treat already-existing objects as success."""
+        database = self._database
+        if database is None:
+            return False
+        try:
+            from google.api_core.exceptions import (
+                AlreadyExists,
+                FailedPrecondition,
+                InvalidArgument,
+            )
+        except ImportError as e:
+            raise RuntimeError("google-api-core is required") from e
+        try:
+            operation = database.update_ddl([ddl])
+            operation.result()
+            logger.info("Created Spanner %s", description)
+            return True
+        except AlreadyExists:
+            logger.info("Spanner %s already exists", description)
+            return True
+        except (FailedPrecondition, InvalidArgument) as e:
+            if "already exists" in str(e).lower():
+                logger.info("Spanner %s already exists", description)
+                return True
+            logger.warning("Failed to create Spanner %s: %s", description, e)
+            return False
+
+    def ensure_search_schema(self) -> None:
+        """Ensure generated token column and full-text search index exist."""
+        if not settings.spanner_enable_full_text:
+            return
+        if not self._column_exists(SPANNER_TABLE_NAME, SPANNER_CONTENT_TOKENS_COLUMN):
+            self._run_ddl(
+                f"""
+                ALTER TABLE {SPANNER_TABLE_NAME}
+                ADD COLUMN {SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST
+                    AS (TOKENIZE_FULLTEXT(Content)) HIDDEN
+                """,
+                f"generated token column {SPANNER_CONTENT_TOKENS_COLUMN}",
+            )
+        if not self._index_exists(SPANNER_CONTENT_SEARCH_INDEX):
+            self._run_ddl(
+                f"""
+                CREATE SEARCH INDEX {SPANNER_CONTENT_SEARCH_INDEX}
+                ON {SPANNER_TABLE_NAME}({SPANNER_CONTENT_TOKENS_COLUMN})
+                """,
+                f"search index {SPANNER_CONTENT_SEARCH_INDEX}",
+            )
+
+    def ensure_embedding_model(self) -> None:
+        """Register the configured Gemini embedding model in Spanner when enabled."""
+        if settings.spanner_embedding_mode != "spanner":
+            return
+        self._run_ddl(
+            get_spanner_embedding_model_ddl(self.project or self._resolve_project()),
+            f"embedding model {settings.spanner_embedding_model_id}",
+        )
+
+    def _table_exists(self, table_name: str) -> bool:
+        """Return whether a table exists in the configured Spanner database."""
+        database = self._database
+        if database is None:
+            return False
+        sql = """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_catalog = '' AND table_schema = '' AND table_name = @table_name
+        """
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        with database.snapshot() as snapshot:
+            rows = list(
+                snapshot.execute_sql(
+                    sql,
+                    params={"table_name": table_name},
+                    param_types={"table_name": param_types.STRING},
+                )
+            )
+        return bool(rows)
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """Return whether a column exists in the configured Spanner database."""
+        database = self._database
+        if database is None:
+            return False
+        sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_catalog = ''
+              AND table_schema = ''
+              AND table_name = @table_name
+              AND column_name = @column_name
+        """
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        with database.snapshot() as snapshot:
+            rows = list(
+                snapshot.execute_sql(
+                    sql,
+                    params={"table_name": table_name, "column_name": column_name},
+                    param_types={
+                        "table_name": param_types.STRING,
+                        "column_name": param_types.STRING,
+                    },
+                )
+            )
+        return bool(rows)
+
+    def _index_exists(self, index_name: str) -> bool:
+        """Return whether any Spanner index-like object exists by name."""
+        database = self._database
+        if database is None:
+            return False
+        sql = """
+            SELECT index_name
+            FROM information_schema.indexes
+            WHERE table_catalog = '' AND table_schema = '' AND index_name = @index_name
+        """
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        try:
+            with database.snapshot() as snapshot:
+                rows = list(
+                    snapshot.execute_sql(
+                        sql,
+                        params={"index_name": index_name},
+                        param_types={"index_name": param_types.STRING},
+                    )
+                )
+            return bool(rows)
+        except Exception as e:
+            logger.debug("Failed to inspect Spanner indexes: %s", e)
+            return False
+
+    def _vector_index_exists(self) -> bool:
+        """Return whether the configured Spanner vector index exists."""
+        return self._index_exists(SPANNER_VECTOR_INDEX)
+
+    def _row_count(self) -> int:
+        """Return the current number of stored chunks."""
+        database = self.connect()
+        with database.snapshot() as snapshot:
+            rows = list(snapshot.execute_sql(f"SELECT COUNT(*) FROM {SPANNER_TABLE_NAME}"))
+        return int(rows[0][0]) if rows else 0
+
+    def create_vector_index(self, force: bool = False) -> bool:
+        """Create Spanner ANN vector index when enabled and useful."""
+        if not settings.spanner_enable_vector_index:
+            return False
+        database = self.connect()
+        del database
+        if self._vector_index_exists():
+            return True
+        row_count = self._row_count()
+        if not force and row_count < VECTOR_INDEX_THRESHOLD:
+            logger.info("Skipping Spanner vector index creation (only %s rows)", row_count)
+            return False
+        return self._run_ddl(get_spanner_vector_index_ddl(), f"vector index {SPANNER_VECTOR_INDEX}")
+
+    def _chunk_values(self, chunk: dict[str, Any]) -> list[Any]:
+        """Convert an embedded chunk dict to Spanner mutation values."""
+        return [
+            chunk.get("id"),
+            chunk.get("content"),
+            [float(v) for v in chunk.get("vector", [])],
+            chunk.get("chunk_type"),
+            chunk.get("session_id"),
+            chunk.get("project_path"),
+            chunk.get("project_name"),
+            _normalize_timestamp(chunk.get("timestamp")),
+            chunk.get("user_uuid"),
+            chunk.get("assistant_uuid"),
+            chunk.get("file_path"),
+            chunk.get("operation"),
+            chunk.get("model"),
+            chunk.get("source_file"),
+            int(chunk.get("source_line", 0)),
+            chunk.get("parent_chunk_id"),
+            chunk.get("child_chunk_ids"),
+            chunk.get("machine_id"),
+        ]
+
+    def _chunk_params(self, chunk: dict[str, Any]) -> dict[str, Any]:
+        """Convert a chunk dict to DML parameters."""
+        return {
+            "id": chunk.get("id"),
+            "content": chunk.get("content"),
+            "chunk_type": chunk.get("chunk_type"),
+            "session_id": chunk.get("session_id"),
+            "project_path": chunk.get("project_path"),
+            "project_name": chunk.get("project_name"),
+            "timestamp": _normalize_timestamp(chunk.get("timestamp")),
+            "user_uuid": chunk.get("user_uuid"),
+            "assistant_uuid": chunk.get("assistant_uuid"),
+            "file_path": chunk.get("file_path"),
+            "operation": chunk.get("operation"),
+            "model": chunk.get("model"),
+            "source_file": chunk.get("source_file"),
+            "source_line": int(chunk.get("source_line", 0)),
+            "parent_chunk_id": chunk.get("parent_chunk_id"),
+            "child_chunk_ids": chunk.get("child_chunk_ids"),
+            "machine_id": chunk.get("machine_id"),
+        }
+
+    def _chunk_param_types(self) -> dict[str, Any]:
+        """Return Spanner parameter types for chunk DML."""
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        return {
+            "id": param_types.STRING,
+            "content": param_types.STRING,
+            "chunk_type": param_types.STRING,
+            "session_id": param_types.STRING,
+            "project_path": param_types.STRING,
+            "project_name": param_types.STRING,
+            "timestamp": param_types.TIMESTAMP,
+            "user_uuid": param_types.STRING,
+            "assistant_uuid": param_types.STRING,
+            "file_path": param_types.STRING,
+            "operation": param_types.STRING,
+            "model": param_types.STRING,
+            "source_file": param_types.STRING,
+            "source_line": param_types.INT64,
+            "parent_chunk_id": param_types.STRING,
+            "child_chunk_ids": param_types.Array(param_types.STRING),
+            "machine_id": param_types.STRING,
+        }
+
+    def _embedding_vector_sql(self, content_sql: str, task_type_sql: str) -> str:
+        """Return SQL expression that generates a FLOAT32 embedding via ML.PREDICT."""
+        return f"""
+            (
+                SELECT ARRAY(
+                    SELECT CAST(value AS FLOAT32)
+                    FROM UNNEST(embeddings.values) AS value
+                )
+                FROM ML.PREDICT(
+                    MODEL {settings.spanner_embedding_model_id},
+                    (SELECT {content_sql} AS content, {task_type_sql} AS task_type),
+                    STRUCT({get_current_vector_dim()} AS outputDimensionality)
+                )
+            )
+        """
+
+    def _insert_with_spanner_embedding_sql(self) -> str:
+        """Return DML that upserts one chunk and generates its embedding in Spanner."""
+        vector_expr = self._embedding_vector_sql("@content", "@task_type")
+        return f"""
+            INSERT OR UPDATE INTO {SPANNER_TABLE_NAME} (
+                Id, Content, Vector, ChunkType, SessionId, ProjectPath, ProjectName,
+                Timestamp, UserUuid, AssistantUuid, FilePath, Operation, Model,
+                SourceFile, SourceLine, ParentChunkId, ChildChunkIds, MachineId
+            )
+            VALUES (
+                @id, @content, {vector_expr}, @chunk_type, @session_id, @project_path,
+                @project_name, @timestamp, @user_uuid, @assistant_uuid, @file_path,
+                @operation, @model, @source_file, @source_line, @parent_chunk_id,
+                @child_chunk_ids, @machine_id
+            )
+        """
+
+    def _add_chunks_with_spanner_embeddings(self, chunks: list[dict[str, Any]]) -> None:
+        """Add unembedded chunks and generate vectors inside Spanner with ML.PREDICT."""
+        self.ensure_embedding_model()
+        database = self.connect()
+        sql = self._insert_with_spanner_embedding_sql()
+        param_types = self._chunk_param_types()
+        param_types["task_type"] = param_types["content"]
+
+        def insert_chunks(transaction):
+            row_count = 0
+            for chunk in chunks:
+                params = self._chunk_params(chunk)
+                params["task_type"] = settings.vertex_document_task_type
+                row_count += transaction.execute_update(
+                    sql,
+                    params=params,
+                    param_types=param_types,
+                )
+            return row_count
+
+        row_count = database.run_in_transaction(insert_chunks)
+        logger.info(
+            "Added %s chunks to Spanner store using Spanner-native embeddings",
+            row_count,
+        )
+
+    def add_chunks(self, chunks: list[dict[str, Any]]) -> None:
+        """Add embedded chunks to Spanner."""
+        if not chunks:
+            return
+        if settings.spanner_embedding_mode == "spanner":
+            unembedded_chunks = [chunk for chunk in chunks if not chunk.get("vector")]
+            if len(unembedded_chunks) == len(chunks):
+                self._add_chunks_with_spanner_embeddings(chunks)
+                return
+            if unembedded_chunks:
+                raise ValueError("Cannot mix embedded and unembedded chunks in one Spanner batch")
+        expected_dim = get_current_vector_dim()
+        for chunk in chunks:
+            vector = chunk.get("vector")
+            chunk_id = chunk.get("id", "unknown")
+            if not isinstance(vector, list):
+                raise ValueError(f"Vector must be a list, got {type(vector).__name__}")
+            if len(vector) != expected_dim:
+                raise ValueError(
+                    f"Vector dimension mismatch: expected {expected_dim}, got {len(vector)}"
+                )
+            if not all(isinstance(v, (int, float)) for v in vector):
+                raise ValueError("Vector must contain only numeric values")
+            _validate_vector(vector, chunk_id)
+
+        database = self.connect()
+        values = [self._chunk_values(chunk) for chunk in chunks]
+        with database.batch() as batch:
+            batch.insert_or_update(table=SPANNER_TABLE_NAME, columns=SPANNER_COLUMNS, values=values)
+        logger.info("Added %s chunks to Spanner store", len(chunks))
+
+    async def add_chunks_async(self, chunks: list[dict[str, Any]]) -> None:
+        """Add chunks asynchronously."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.add_chunks, chunks)
+
+    def _vector_distance_sql(self, filters_use_unstored_columns: bool = False) -> str:
+        """Return the best available Spanner vector distance expression."""
+        if self._can_use_ann(filters_use_unstored_columns):
+            return (
+                "APPROX_COSINE_DISTANCE(Vector, @query_vector, "
+                f'options => JSON \'{{"num_leaves_to_search": '
+                f"{settings.spanner_num_leaves_to_search}}}')"
+            )
+        return "COSINE_DISTANCE(Vector, @query_vector)"
+
+    def _can_use_ann(self, filters_use_unstored_columns: bool = False) -> bool:
+        """Return whether current settings/query shape can use Spanner ANN."""
+        return (
+            settings.spanner_use_approx_vector_search
+            and not filters_use_unstored_columns
+            and self._vector_index_exists()
+        )
+
+    def _vector_table_source_sql(self, filters_use_unstored_columns: bool = False) -> str:
+        """Return table source with vector index hint when ANN is selected."""
+        if self._can_use_ann(filters_use_unstored_columns):
+            return f"{SPANNER_TABLE_NAME}@{{FORCE_INDEX={SPANNER_VECTOR_INDEX}}}"
+        return SPANNER_TABLE_NAME
+
+    def embed_query_text(self, query: str) -> list[float]:
+        """Generate a query embedding inside Spanner via ML.PREDICT."""
+        if not query.strip():
+            raise ValueError("Query cannot be empty")
+        self.ensure_embedding_model()
+        database = self.connect()
+        sql = f"""
+            SELECT {self._embedding_vector_sql("@query", "@task_type")} AS Vector
+        """
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        with database.snapshot() as snapshot:
+            rows = list(
+                snapshot.execute_sql(
+                    sql,
+                    params={"query": query, "task_type": settings.vertex_query_task_type},
+                    param_types={
+                        "query": param_types.STRING,
+                        "task_type": param_types.STRING,
+                    },
+                )
+            )
+        if not rows:
+            raise RuntimeError("Spanner embedding query returned no rows")
+        vector = [float(v) for v in rows[0][0]]
+        _validate_vector(vector, "query")
+        return vector
+
+    async def embed_query_text_async(self, query: str) -> list[float]:
+        """Generate a query embedding inside Spanner asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.embed_query_text, query)
+
+    def search(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+        file_path_filter: str | None = None,
+        operation_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """KNN vector search via Spanner exact or indexed ANN cosine distance."""
+        if len(query_vector) != get_current_vector_dim():
+            raise ValueError(
+                f"Query vector dimension mismatch: expected {get_current_vector_dim()}, "
+                f"got {len(query_vector)}"
+            )
+        _validate_vector(query_vector, "query")
+        database = self.connect()
+        filters = ["Vector IS NOT NULL"]
+        params: dict[str, Any] = {
+            "query_vector": [float(v) for v in query_vector],
+            "limit": limit,
+        }
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        types: dict[str, Any] = {
+            "query_vector": param_types.Array(param_types.FLOAT32),
+            "limit": param_types.INT64,
+        }
+        if project_filter:
+            filters.append("ProjectPath = @project_filter")
+            params["project_filter"] = project_filter
+            types["project_filter"] = param_types.STRING
+        if chunk_type_filter:
+            filters.append("ChunkType = @chunk_type_filter")
+            params["chunk_type_filter"] = chunk_type_filter
+            types["chunk_type_filter"] = param_types.STRING
+        if file_path_filter:
+            filters.append("FilePath LIKE @file_path_filter")
+            params["file_path_filter"] = f"%{file_path_filter}%"
+            types["file_path_filter"] = param_types.STRING
+        if operation_filter:
+            filters.append("Operation = @operation_filter")
+            params["operation_filter"] = operation_filter
+            types["operation_filter"] = param_types.STRING
+
+        filters_use_unstored_columns = bool(project_filter or file_path_filter or operation_filter)
+        distance_expr = self._vector_distance_sql(
+            filters_use_unstored_columns=filters_use_unstored_columns
+        )
+        table_source = self._vector_table_source_sql(
+            filters_use_unstored_columns=filters_use_unstored_columns
+        )
+        sql = f"""
+            SELECT
+                Id, Content, ChunkType, SessionId, ProjectPath, ProjectName, Timestamp,
+                FilePath, Operation, MachineId, {distance_expr} AS Distance
+            FROM {table_source}
+            WHERE {" AND ".join(filters)}
+            ORDER BY Distance ASC
+            LIMIT @limit
+        """
+        with database.snapshot() as snapshot:
+            rows = list(snapshot.execute_sql(sql, params=params, param_types=types))
+        return [self._row_to_result(row) for row in rows]
+
+    def vector_search(
+        self,
+        query_vector: list[float],
+        limit: int = 5,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Protocol alias for vector search."""
+        return self.search(
+            query_vector=query_vector,
+            limit=limit,
+            project_filter=project_filter,
+            chunk_type_filter=chunk_type_filter,
+        )
+
+    async def search_async(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        project_filter: str | None = None,
+        chunk_type_filter: str | None = None,
+        file_path_filter: str | None = None,
+        operation_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.search(
+                query_vector,
+                limit,
+                project_filter,
+                chunk_type_filter,
+                file_path_filter,
+                operation_filter,
+            ),
+        )
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_vector: list[float],
+        limit: int = 10,
+        project_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hybrid search using Spanner full-text SCORE plus vector RRF fusion."""
+        if not query.strip() or not self.has_fts_index():
+            results = self.search(
+                query_vector=query_vector, limit=limit, project_filter=project_filter
+            )
+            for result in results:
+                result["_search_type"] = "vector"
+            return results
+        if len(query_vector) != get_current_vector_dim():
+            raise ValueError(
+                f"Query vector dimension mismatch: expected {get_current_vector_dim()}, "
+                f"got {len(query_vector)}"
+            )
+        _validate_vector(query_vector, "query")
+        database = self.connect()
+        vector_filters = ["Vector IS NOT NULL"]
+        text_filters = [f"SEARCH({SPANNER_CONTENT_TOKENS_COLUMN}, @query)"]
+        params: dict[str, Any] = {
+            "query": query,
+            "query_vector": [float(v) for v in query_vector],
+            "limit": limit,
+            "candidate_limit": max(limit, settings.spanner_hybrid_candidate_limit),
+            "rrf_k": float(settings.spanner_rrf_k),
+        }
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        types: dict[str, Any] = {
+            "query": param_types.STRING,
+            "query_vector": param_types.Array(param_types.FLOAT32),
+            "limit": param_types.INT64,
+            "candidate_limit": param_types.INT64,
+            "rrf_k": param_types.FLOAT64,
+        }
+        if project_filter:
+            vector_filters.append("ProjectPath = @project_filter")
+            text_filters.append("ProjectPath = @project_filter")
+            params["project_filter"] = project_filter
+            types["project_filter"] = param_types.STRING
+
+        filters_use_unstored_columns = bool(project_filter)
+        distance_expr = self._vector_distance_sql(
+            filters_use_unstored_columns=filters_use_unstored_columns
+        )
+        vector_table_source = self._vector_table_source_sql(
+            filters_use_unstored_columns=filters_use_unstored_columns
+        )
+        max_rrf_score_expr = "2.0 / (@rrf_k + 1)"
+        sql = f"""
+            WITH VectorCandidates AS (
+                SELECT rank, chunk_id AS Id
+                FROM UNNEST(ARRAY(
+                    SELECT Id
+                    FROM {vector_table_source}
+                    WHERE {" AND ".join(vector_filters)}
+                    ORDER BY {distance_expr} ASC
+                    LIMIT @candidate_limit
+                )) AS chunk_id WITH OFFSET AS rank
+            ),
+            TextCandidates AS (
+                SELECT rank, chunk_id AS Id
+                FROM UNNEST(ARRAY(
+                    SELECT Id
+                    FROM {SPANNER_TABLE_NAME}
+                    WHERE {" AND ".join(text_filters)}
+                    ORDER BY SCORE({SPANNER_CONTENT_TOKENS_COLUMN}, @query) DESC
+                    LIMIT @candidate_limit
+                )) AS chunk_id WITH OFFSET AS rank
+            ),
+            FusedCandidates AS (
+                SELECT Id, SUM(1.0 / (@rrf_k + rank + 1)) AS Score
+                FROM (
+                    SELECT Id, rank FROM VectorCandidates
+                    UNION ALL
+                    SELECT Id, rank FROM TextCandidates
+                )
+                GROUP BY Id
+            )
+            SELECT
+                c.Id, c.Content, c.ChunkType, c.SessionId, c.ProjectPath,
+                c.ProjectName, c.Timestamp, c.FilePath, c.Operation, c.MachineId,
+                1.0 - LEAST(1.0, f.Score / ({max_rrf_score_expr})) AS Distance
+            FROM FusedCandidates f
+            JOIN {SPANNER_TABLE_NAME} c ON c.Id = f.Id
+            ORDER BY f.Score DESC
+            LIMIT @limit
+        """
+        try:
+            with database.snapshot() as snapshot:
+                rows = list(snapshot.execute_sql(sql, params=params, param_types=types))
+        except Exception as e:
+            logger.warning(
+                "Spanner hybrid search failed; falling back to vector search: "
+                "error_type=%s limit=%s project_filter_present=%s candidate_limit=%s vector_mode=%s",
+                type(e).__name__,
+                limit,
+                bool(project_filter),
+                settings.spanner_hybrid_candidate_limit,
+                "ann" if self._can_use_ann(False) else "exact",
+            )
+            fallback_results = self.search(
+                query_vector=query_vector, limit=limit, project_filter=project_filter
+            )
+            for result in fallback_results:
+                result["_search_type"] = "vector"
+            return fallback_results
+        return [self._row_to_result(row) for row in rows]
+
+    def has_fts_index(self) -> bool:
+        """Return whether Spanner full-text search is configured and indexed."""
+        if not settings.spanner_enable_full_text:
+            return False
+        database = self.connect()
+        del database
+        return self._column_exists(
+            SPANNER_TABLE_NAME, SPANNER_CONTENT_TOKENS_COLUMN
+        ) and self._index_exists(SPANNER_CONTENT_SEARCH_INDEX)
+
+    async def hybrid_search_async(
+        self,
+        query: str,
+        query_vector: list[float],
+        limit: int = 10,
+        project_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hybrid search asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self.hybrid_search(query, query_vector, limit, project_filter)
+        )
+
+    def _row_to_result(self, row: Any) -> dict[str, Any]:
+        """Convert a Spanner result row to the API shape expected by MCP tools."""
+        (
+            chunk_id,
+            content,
+            chunk_type,
+            session_id,
+            project_path,
+            project_name,
+            timestamp,
+            file_path,
+            operation,
+            machine_id,
+            distance,
+        ) = row
+        return {
+            "id": chunk_id,
+            "content": content,
+            "chunk_type": chunk_type,
+            "session_id": session_id,
+            "project_path": project_path,
+            "project_name": project_name,
+            "timestamp": _format_timestamp(timestamp),
+            "file_path": file_path,
+            "operation": operation,
+            "machine_id": machine_id,
+            "score": distance,
+        }
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get Spanner store statistics."""
+        row_count = self._row_count()
+        return {
+            "total_chunks": row_count,
+            "backend": "spanner",
+            "project": self.project,
+            "instance": self.instance_id,
+            "database": self.database_id,
+            "dimension": get_current_vector_dim(),
+            "fts_index_available": self.has_fts_index(),
+            "vector_index_available": self._vector_index_exists(),
+            "vector_search_mode": "ann"
+            if settings.spanner_use_approx_vector_search and self._vector_index_exists()
+            else "exact",
+            "embedding_mode": settings.spanner_embedding_mode,
+            "embedding_model_id": settings.spanner_embedding_model_id
+            if settings.spanner_embedding_mode == "spanner"
+            else None,
+        }
+
+    async def get_stats_async(self) -> dict[str, Any]:
+        """Get store statistics asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.get_stats)
+
+    def clear_all(self) -> int:
+        """Delete all chunks."""
+        count = self.get_stats()["total_chunks"]
+        database = self.connect()
+        database.execute_partitioned_dml(f"DELETE FROM {SPANNER_TABLE_NAME} WHERE TRUE")
+        return int(count)
+
+    async def clear_all_async(self) -> int:
+        """Clear chunks asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.clear_all)
+
+    def delete_by_machine_id(self, machine_id: str) -> int:
+        """Delete all chunks for a specific machine_id."""
+        if not machine_id:
+            return 0
+        database = self.connect()
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        with database.snapshot() as snapshot:
+            rows = list(
+                snapshot.execute_sql(
+                    f"SELECT COUNT(*) FROM {SPANNER_TABLE_NAME} WHERE MachineId = @machine_id",
+                    params={"machine_id": machine_id},
+                    param_types={"machine_id": param_types.STRING},
+                )
+            )
+        deleted = int(rows[0][0]) if rows else 0
+        database.execute_partitioned_dml(
+            f"DELETE FROM {SPANNER_TABLE_NAME} WHERE MachineId = @machine_id",
+            params={"machine_id": machine_id},
+            param_types={"machine_id": param_types.STRING},
+        )
+        return deleted
+
+    async def delete_by_machine_id_async(self, machine_id: str) -> int:
+        """Delete all chunks for a specific machine_id asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.delete_by_machine_id, machine_id)
+
+    def optimize(self) -> None:
+        """Create deferred Spanner ANN index once enough rows have been ingested."""
+        self.ensure_search_schema()
+        created = self.create_vector_index(force=False)
+        if created:
+            logger.info("Spanner vector index is available")
+        else:
+            logger.info("Spanner optimize completed without vector index creation")
+
+    async def optimize_async(self) -> None:
+        """Optimize asynchronously."""
+        self.optimize()
+
+    def chunk_exists(self, chunk_id: str) -> bool:
+        """Check whether a chunk exists."""
+        database = self.connect()
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        with database.snapshot() as snapshot:
+            rows = list(
+                snapshot.execute_sql(
+                    f"SELECT Id FROM {SPANNER_TABLE_NAME} WHERE Id = @chunk_id LIMIT 1",
+                    params={"chunk_id": chunk_id},
+                    param_types={"chunk_id": param_types.STRING},
+                )
+            )
+        return bool(rows)
+
+    def close(self) -> None:
+        """Release cached Spanner handles."""
+        self._database = None
+        self._instance = None
+        self._client = None
+
+    async def close_async(self) -> None:
+        """Close asynchronously."""
+        self.close()
+
+
+def create_store() -> ConversationStore:
+    """Create the configured conversation storage backend."""
+    if settings.storage_backend == "lancedb":
+        return VectorStore()
+    if settings.storage_backend == "spanner":
+        return SpannerStore()
+    raise ValueError(f"Unsupported storage backend: {settings.storage_backend}")
+
+
 # Global store instance
-store = VectorStore()
+store = create_store()

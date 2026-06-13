@@ -2,14 +2,62 @@
 
 import json
 import logging
+import re
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from claude_history_rag.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_reason(value: str, default: str = "error") -> str:
+    """Return a bounded status reason suitable for dashboard/API payloads."""
+    reason = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or default)).strip("_")
+    return (reason or default)[:120]
+
+
+def _safe_scalar(value: Any) -> Any:
+    """Return small scalar values; redact arbitrary strings."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int | float):
+        return value
+    if isinstance(value, str):
+        return _sanitize_reason(value, "value")
+    return type(value).__name__
+
+
+def _safe_heartbeat_section(value: Any) -> dict[str, Any] | None:
+    """Summarize heartbeat sections without retaining arbitrary diagnostics."""
+    if not isinstance(value, dict):
+        return None
+    summary: dict[str, Any] = {}
+    for key in (
+        "size",
+        "queued",
+        "pending",
+        "failed",
+        "failed_count",
+        "queue_size",
+        "queue_max_size",
+        "files_indexed",
+        "files_pending",
+        "files_failed",
+        "total",
+        "count",
+        "memory_mb",
+        "cpu_percent",
+    ):
+        raw = value.get(key)
+        if isinstance(raw, int | float | bool):
+            summary[key] = raw
+    status = value.get("status")
+    if isinstance(status, str):
+        summary["status"] = _sanitize_reason(status, "unknown")
+    return summary or None
 
 
 class ClientRegistry:
@@ -69,6 +117,22 @@ class ClientRegistry:
             clients[machine_id] = entry
             self._save()
 
+    def set_client_identity_hash(self, machine_id: str, identity_hash: str) -> None:
+        with self._lock:
+            self._load()
+            clients = self._state.setdefault("clients", {})
+            entry = clients.get(machine_id) or {}
+            entry["identity_hash"] = identity_hash
+            entry["last_identity_update_at"] = self._now()
+            clients[machine_id] = entry
+            self._save()
+
+    def get_client_identity_hash(self, machine_id: str) -> str | None:
+        with self._lock:
+            self._load()
+            entry = self._state.get("clients", {}).get(machine_id) or {}
+            return entry.get("identity_hash")
+
     def get_client_key_hash(self, machine_id: str) -> str | None:
         with self._lock:
             self._load()
@@ -98,7 +162,7 @@ class ClientRegistry:
             self._load()
             clients = self._state.setdefault("clients", {})
             entry = clients.get(machine_id) or {}
-            entry["key_rotation_error"] = error
+            entry["key_rotation_error"] = _sanitize_reason(error, "rotation_failed")
             entry["key_status"] = "error"
             entry["last_key_error_at"] = self._now()
             clients[machine_id] = entry
@@ -176,9 +240,9 @@ class ClientRegistry:
             if reindex_requested_at:
                 entry["reindex_ack_for"] = reindex_requested_at
             if status:
-                entry["reindex_ack_status"] = status
+                entry["reindex_ack_status"] = _sanitize_reason(status, "queued")
             if reason:
-                entry["reindex_ack_reason"] = reason
+                entry["reindex_ack_reason"] = _sanitize_reason(reason, "reason")
             clients[machine_id] = entry
             self._save()
 
@@ -214,8 +278,6 @@ class ClientRegistry:
             entry["last_heartbeat_at"] = self._now()
 
             if heartbeat:
-                entry["heartbeat"] = heartbeat
-
                 for field in (
                     "client_version",
                     "os",
@@ -229,7 +291,7 @@ class ClientRegistry:
                     "last_indexed_at",
                 ):
                     if field in heartbeat and heartbeat[field] is not None:
-                        entry[field] = heartbeat[field]
+                        entry[field] = _safe_scalar(heartbeat[field])
 
                 for field in (
                     "queue",
@@ -241,7 +303,9 @@ class ClientRegistry:
                     "resources",
                 ):
                     if field in heartbeat and heartbeat[field] is not None:
-                        entry[field] = heartbeat[field]
+                        safe_section = _safe_heartbeat_section(heartbeat[field])
+                        if safe_section is not None:
+                            entry[field] = safe_section
 
             clients[machine_id] = entry
             self._save()
@@ -337,7 +401,6 @@ class ClientRegistry:
                         "config": entry.get("config"),
                         "doctor": entry.get("doctor"),
                         "resources": entry.get("resources"),
-                        "heartbeat": entry.get("heartbeat"),
                         "stale": stale,
                         "reindex_pending": reindex_pending,
                         "key_status": entry.get("key_status"),

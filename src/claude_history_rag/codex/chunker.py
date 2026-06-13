@@ -78,10 +78,7 @@ def _summarize_tool_call(payload: dict) -> tuple[str, list[dict]]:
     if ptype == "function_call":
         name = str(payload.get("name", "unknown"))
         args = payload.get("arguments")
-        if isinstance(args, str):
-            args_str = args
-        else:
-            args_str = json.dumps(args) if args else ""
+        args_str = args if isinstance(args, str) else json.dumps(args) if args else ""
         ops = _extract_tool_ops(name, args)
         if name == "apply_patch" and isinstance(args, str):
             ops = _extract_apply_patch_ops(args)
@@ -363,8 +360,7 @@ def _create_file_change_chunks(
         operation = op.get("operation", "edit")
         summary = op.get("summary", "File change")
         content = (
-            f"In project {project_name}, file {file_path} was {operation}.\n"
-            f"Summary: {summary}"
+            f"In project {project_name}, file {file_path} was {operation}.\nSummary: {summary}"
         )
         chunk_id = generate_chunk_id(content, session_id, str(timestamp) + file_path)
         chunks.append(

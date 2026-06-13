@@ -1,9 +1,14 @@
 """Pydantic models for parsing and chunking."""
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
+
+MachineId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")]
+ShortText = Annotated[str, Field(min_length=1, max_length=512)]
+PathText = Annotated[str, Field(min_length=1, max_length=4096)]
+DiagnosticMap = Annotated[dict[str, Any], Field(max_length=64)]
 
 
 class UserMessage(BaseModel):
@@ -50,9 +55,15 @@ class AssistantMessage(BaseModel):
 class HistoryEntry(BaseModel):
     """A single entry from the JSONL history file."""
 
-    type: str  # "user", "assistant", "summary", "system"
+    type: str  # "user", "assistant", "summary", "system", and newer no-op types
     message: UserMessage | AssistantMessage | None = None
-    summary: str | None = None  # For summary type
+    summary: str | None = None  # For legacy "summary" type entries (pre-2.1)
+    # Current Claude Code (>=2.1) emits compaction summaries as ordinary
+    # "user"/"assistant" entries flagged with isCompactSummary instead of a
+    # dedicated "summary" type. The summary text lives in message.content.
+    isCompactSummary: bool = Field(default=False, alias="isCompactSummary")
+    isVisibleInTranscriptOnly: bool = Field(default=False, alias="isVisibleInTranscriptOnly")
+    isMeta: bool = Field(default=False, alias="isMeta")
     subtype: str | None = None  # For system type (e.g., "init")
     uuid: str | None = None
     parentUuid: str | None = Field(default=None, alias="parentUuid")
@@ -97,11 +108,11 @@ class Chunk(BaseModel):
 class ChunkUploadRequest(BaseModel):
     """Request to upload chunks from a client to the server."""
 
-    machine_id: str  # Identifies source machine
-    client_name: str | None = None
-    chunks: list[dict[str, Any]]  # Chunks without vectors (server will embed)
-    source_file: str  # Source file being indexed
-    file_position: int  # Line number reached in file
+    machine_id: MachineId  # Identifies source machine
+    client_name: str | None = Field(default=None, max_length=256)
+    chunks: list[dict[str, Any]] = Field(max_length=500)  # Chunks without vectors
+    source_file: PathText  # Source file being indexed
+    file_position: int = Field(ge=0)  # Line number reached in file
 
 
 class ChunkUploadResponse(BaseModel):
@@ -121,9 +132,9 @@ class ChunkUploadResponse(BaseModel):
 class SearchRequest(BaseModel):
     """Request for semantic search."""
 
-    query: str
-    limit: int = 5
-    project_filter: str | None = None
+    query: ShortText
+    limit: int = Field(default=5, ge=1, le=100)
+    project_filter: str | None = Field(default=None, max_length=4096)
     use_hybrid: bool = True
     enable_analysis: bool = True
     enable_synthesis: bool = False
@@ -148,11 +159,11 @@ class SearchResponse(BaseModel):
 class FileSearchRequest(BaseModel):
     """Request for file change search."""
 
-    file_path: str | None = None
-    query: str | None = None
-    project_filter: str | None = None
-    operation_filter: str | None = None
-    limit: int = 10
+    file_path: str | None = Field(default=None, max_length=4096)
+    query: str | None = Field(default=None, max_length=512)
+    project_filter: str | None = Field(default=None, max_length=4096)
+    operation_filter: str | None = Field(default=None, max_length=128)
+    limit: int = Field(default=10, ge=1, le=100)
 
 
 class FileSearchResponse(BaseModel):
@@ -168,9 +179,9 @@ class FileSearchResponse(BaseModel):
 class SessionSummaryRequest(BaseModel):
     """Request for session summary."""
 
-    session_id: str | None = None
-    project_filter: str | None = None
-    count: int = 1
+    session_id: str | None = Field(default=None, max_length=256)
+    project_filter: str | None = Field(default=None, max_length=4096)
+    count: int = Field(default=1, ge=1, le=50)
 
 
 class SessionSummaryResponse(BaseModel):
@@ -184,10 +195,10 @@ class SessionSummaryResponse(BaseModel):
 class PositionSyncRequest(BaseModel):
     """Request to sync file positions for a machine."""
 
-    machine_id: str
-    client_name: str | None = None
-    file_path: str
-    position: int
+    machine_id: MachineId
+    client_name: str | None = Field(default=None, max_length=256)
+    file_path: PathText
+    position: int = Field(ge=0)
 
 
 class PositionSyncResponse(BaseModel):
@@ -204,25 +215,25 @@ class PositionSyncResponse(BaseModel):
 class ClientHeartbeatRequest(BaseModel):
     """Client heartbeat payload for status and diagnostics."""
 
-    machine_id: str
-    client_name: str | None = None
-    client_version: str | None = None
-    os: str | None = None
-    arch: str | None = None
-    python_version: str | None = None
-    hostname: str | None = None
-    timezone: str | None = None
+    machine_id: MachineId
+    client_name: str | None = Field(default=None, max_length=256)
+    client_version: str | None = Field(default=None, max_length=128)
+    os: str | None = Field(default=None, max_length=128)
+    arch: str | None = Field(default=None, max_length=64)
+    python_version: str | None = Field(default=None, max_length=64)
+    hostname: str | None = Field(default=None, max_length=256)
+    timezone: str | None = Field(default=None, max_length=128)
     heartbeat_interval_s: int | None = None
-    status: str | None = None
+    status: str | None = Field(default=None, max_length=64)
     last_upload_at: datetime | None = None
     last_indexed_at: datetime | None = None
-    queue: dict[str, Any] | None = None
-    watcher: dict[str, Any] | None = None
-    reindex: dict[str, Any] | None = None
-    errors: dict[str, Any] | None = None
-    config: dict[str, Any] | None = None
-    doctor: dict[str, Any] | None = None
-    resources: dict[str, Any] | None = None
+    queue: DiagnosticMap | None = None
+    watcher: DiagnosticMap | None = None
+    reindex: DiagnosticMap | None = None
+    errors: DiagnosticMap | None = None
+    config: DiagnosticMap | None = None
+    doctor: DiagnosticMap | None = None
+    resources: DiagnosticMap | None = None
     sent_at: datetime | None = None
 
 
@@ -238,7 +249,7 @@ class ClientHeartbeatResponse(BaseModel):
 class GetPositionsRequest(BaseModel):
     """Request to get all positions for a machine."""
 
-    machine_id: str
+    machine_id: MachineId
 
 
 class GetPositionsResponse(BaseModel):
@@ -255,19 +266,19 @@ class GetPositionsResponse(BaseModel):
 class ReindexAckRequest(BaseModel):
     """Client acknowledgement for a server reindex request."""
 
-    machine_id: str
-    client_name: str | None = None
+    machine_id: MachineId
+    client_name: str | None = Field(default=None, max_length=256)
     reindex_requested_at: str | None = None
-    status: str = "queued"
-    reason: str | None = None
+    status: str = Field(default="queued", max_length=64)
+    reason: str | None = Field(default=None, max_length=512)
 
 
 class AuthRotateAckRequest(BaseModel):
     """Client acknowledgement for key rotation."""
 
-    machine_id: str
-    client_name: str | None = None
-    rotate_id: str | None = None
+    machine_id: MachineId
+    client_name: str | None = Field(default=None, max_length=256)
+    rotate_id: str | None = Field(default=None, max_length=128)
 
 
 class ReindexAckResponse(BaseModel):
@@ -284,8 +295,8 @@ class ReindexAckResponse(BaseModel):
 class PurgeClientRequest(BaseModel):
     """Request to purge a single client's data."""
 
-    machine_id: str
-    reason: str | None = None
+    machine_id: MachineId
+    reason: str | None = Field(default=None, max_length=512)
 
 
 class PurgeClientResponse(BaseModel):

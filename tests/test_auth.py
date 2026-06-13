@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -45,7 +44,9 @@ def test_client_hash_validation(auth_manager: AuthManager, tmp_path: Path):
     assert first.ok
 
     # Bad hash should be rejected when key_id matches
-    registry.set_client_key_hash("client-1", "bad-hash", auth_manager.get_rotation_state()["active"]["key_id"])
+    registry.set_client_key_hash(
+        "client-1", "bad-hash", auth_manager.get_rotation_state()["active"]["key_id"]
+    )
     second = auth_manager.validate_key(active_key, "client-1", registry)
     assert not second.ok
     assert second.error == "invalid_client_key"
