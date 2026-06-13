@@ -158,6 +158,19 @@ async def run_daemon():
             except Exception as e:
                 logger.error(f"Failed to start status server: {e}", exc_info=True)
 
+        # Start the embedding backfill BEFORE the (blocking) startup sync so vectors fill
+        # concurrently with ingest, not only after the whole backlog has finished landing.
+        if (
+            is_server_mode
+            and settings.storage_backend == "spanner"
+            and settings.spanner_defer_embeddings
+        ):
+            logger.info(
+                "[SERVER] Deferred embeddings enabled; backfilling every %ss via partitioned DML",
+                settings.spanner_backfill_interval_seconds,
+            )
+            backfill_task = asyncio.create_task(periodic_backfill(stop_event))
+
         # Start watcher (runs startup sync, then starts background tasks)
         # Works in both modes - client mode uploads, server mode embeds locally
         for history_watcher in watchers:
@@ -178,14 +191,6 @@ async def run_daemon():
 
             # Start periodic optimization task
             optimize_task = asyncio.create_task(periodic_optimize(stop_event))
-
-            # Start periodic embedding backfill (deferred Spanner-embedding mode only)
-            if settings.storage_backend == "spanner" and settings.spanner_defer_embeddings:
-                logger.info(
-                    "[SERVER] Deferred embeddings enabled; backfilling every %ss via partitioned DML",
-                    settings.spanner_backfill_interval_seconds,
-                )
-                backfill_task = asyncio.create_task(periodic_backfill(stop_event))
 
         # Set up signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
