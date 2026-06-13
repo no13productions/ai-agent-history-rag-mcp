@@ -126,7 +126,7 @@ def _single_chunker(file_path, start_line=0):
 @pytest.mark.asyncio
 async def test_local_direct_indexing_stamps_machine_id(monkeypatch, tmp_path):
     """Direct Spanner/local indexing must keep rows attributable by machine."""
-    monkeypatch.setattr(settings, "machine_id", "macbook-laptop")
+    monkeypatch.setattr(settings, "machine_id", "test-machine")
     monkeypatch.setattr(settings, "storage_backend", "spanner")
     monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
     history_file = tmp_path / "session.jsonl"
@@ -142,11 +142,11 @@ async def test_local_direct_indexing_stamps_machine_id(monkeypatch, tmp_path):
     await watcher._index_file(history_file, embedder=None, store=store)
 
     stored = store.chunks[0]
-    assert stored["machine_id"] == "macbook-laptop"
-    assert stored["id"] == _machine_scoped_chunk_id("macbook-laptop", "chunk-1")
-    assert stored["parent_chunk_id"] == _machine_scoped_chunk_id("macbook-laptop", "parent-1")
+    assert stored["machine_id"] == "test-machine"
+    assert stored["id"] == _machine_scoped_chunk_id("test-machine", "chunk-1")
+    assert stored["parent_chunk_id"] == _machine_scoped_chunk_id("test-machine", "parent-1")
     assert stored["child_chunk_ids"] == [
-        _machine_scoped_chunk_id("macbook-laptop", "child-1")
+        _machine_scoped_chunk_id("test-machine", "child-1")
     ]
 
 

@@ -12,7 +12,7 @@ from claude_history_rag.parser import (
 
 def test_decode_project_path():
     """Test project path decoding."""
-    assert decode_project_path("-Users-brandon-projects-myapp") == "/Users/brandon/projects/myapp"
+    assert decode_project_path("-Users-youruser-projects-myapp") == "/Users/youruser/projects/myapp"
     # On macOS, /home resolves to /System/Volumes/Data/home due to firmlinks
     # So we check that the path ends correctly rather than exact match
     result = decode_project_path("-home-user-code")
@@ -21,7 +21,7 @@ def test_decode_project_path():
 
 def test_get_project_name():
     """Test project name extraction."""
-    assert get_project_name("/Users/brandon/projects/myapp") == "myapp"
+    assert get_project_name("/Users/youruser/projects/myapp") == "myapp"
     assert get_project_name("/home/user/code") == "code"
 
 

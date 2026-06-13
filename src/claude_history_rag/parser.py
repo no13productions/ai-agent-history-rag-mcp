@@ -20,7 +20,7 @@ MAX_JSON_DEPTH = 50  # Prevent stack overflow from deeply nested JSON
 def decode_project_path(encoded: str) -> str:
     """Decode Claude Code's project path encoding.
 
-    Example: "-Users-brandon-projects-aidition" -> "/Users/brandon/projects/aidition"
+    Example: "-Users-youruser-projects-myapp" -> "/Users/youruser/projects/myapp"
 
     Security: Validates against path traversal attempts in the encoded string.
     Note: This returns the decoded path as-is without filesystem resolution,

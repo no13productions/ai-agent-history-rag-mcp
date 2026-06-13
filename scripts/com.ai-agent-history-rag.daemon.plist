@@ -7,9 +7,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/brandon/.local/bin/uv</string>
+        <string>/Users/YOUR_USERNAME/.local/bin/uv</string>
         <string>--directory</string>
-        <string>/Users/brandon/develop/claude-history-rag-mcp</string>
+        <string>/path/to/ai-agent-history-rag-mcp</string>
         <string>run</string>
         <string>ai-agent-history-rag-daemon</string>
         <string>start</string>
@@ -18,7 +18,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>CLAUDE_HISTORY_RAG_OLLAMA_HOST</key>
-        <string>http://192.168.4.204:11434</string>
+        <string>http://YOUR_OLLAMA_HOST:11434</string>
         <key>CLAUDE_HISTORY_RAG_OLLAMA_MODEL</key>
         <string>bge-m3</string>
         <key>CLAUDE_HISTORY_RAG_BATCH_SIZE</key>
@@ -32,12 +32,12 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/brandon/.claude-history-rag/launchd-stdout.log</string>
+    <string>/Users/YOUR_USERNAME/.claude-history-rag/launchd-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/brandon/.claude-history-rag/launchd-stderr.log</string>
+    <string>/Users/YOUR_USERNAME/.claude-history-rag/launchd-stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/brandon/develop/claude-history-rag-mcp</string>
+    <string>/path/to/ai-agent-history-rag-mcp</string>
 </dict>
 </plist>

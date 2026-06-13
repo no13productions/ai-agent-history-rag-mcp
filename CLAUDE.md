@@ -78,7 +78,7 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 
 ### Claude Code History Format
 - History files are at `~/.claude/projects/` in JSONL format
-- Project paths are encoded: `/Users/brandon/project` → `-Users-brandon-project`
+- Project paths are encoded: `/Users/youruser/project` → `-Users-youruser-project`
 - Content entry types: `user`, `assistant`, `system`. Current Claude Code (>=2.1)
   also emits many no-op metadata types the chunker safely ignores
   (`queue-operation`, `attachment`, `last-prompt`, `custom-title`, `ai-title`,
