@@ -1086,6 +1086,9 @@ class SpannerStore:
         self._lock = threading.Lock()
         # TTL cache for the expensive total/embedded count scan (drives backfill progress).
         self._counts_cache: tuple[float, int, int] | None = None  # (monotonic_ts, total, embedded)
+        # TTL cache for the whole get_stats result (count scan + index-existence info_schema
+        # checks are all slow under backfill contention; status polls must stay cheap).
+        self._stats_cache: tuple[float, dict[str, Any]] | None = None  # (monotonic_ts, stats)
 
     def _resolve_project(self) -> str:
         """Resolve the Spanner project from config or ADC."""
@@ -2097,7 +2100,21 @@ class SpannerStore:
         }
 
     def get_stats(self) -> dict[str, Any]:
-        """Get Spanner store statistics."""
+        """Get Spanner store statistics, TTL-cached so status polls stay cheap.
+
+        Both the count scan and the index-existence checks are O(table)/info_schema and slow
+        under backfill contention, so the whole result is cached for EMBEDDING_COUNTS_CACHE_TTL
+        seconds and served stale in between (fine for a progress display).
+        """
+        cached = self._stats_cache
+        if cached is not None and (time.monotonic() - cached[0]) < EMBEDDING_COUNTS_CACHE_TTL:
+            return cached[1]
+        stats = self._compute_stats()
+        self._stats_cache = (time.monotonic(), stats)
+        return stats
+
+    def _compute_stats(self) -> dict[str, Any]:
+        """Compute fresh store statistics (count scan + index-existence checks)."""
         total, embedded = self._embedding_counts()
         return {
             "total_chunks": total,
