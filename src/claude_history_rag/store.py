@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from datetime import datetime as dt
 from pathlib import Path
@@ -1541,7 +1542,7 @@ class SpannerStore:
             )
 
         row_count = database.run_in_transaction(insert_batch)
-        logger.info(
+        logger.debug(
             "Added %s chunks to Spanner store via batched Spanner-native embeddings (rpc_batch=%s)",
             row_count,
             settings.spanner_embedding_rpc_batch_size,
@@ -1566,39 +1567,107 @@ class SpannerStore:
             len(chunks),
         )
 
-    def backfill_embeddings(self) -> int:
-        """Fill NULL vectors via partitioned DML — parallel, throttle-retrying, re-runnable.
+    # Spanner columns needed to re-embed a row (everything except the recomputed Vector),
+    # in the order their values map to _BACKFILL_DICT_KEYS below.
+    _BACKFILL_READ_COLUMNS = [
+        "Id",
+        "Content",
+        "ChunkType",
+        "SessionId",
+        "ProjectPath",
+        "ProjectName",
+        "Timestamp",
+        "UserUuid",
+        "AssistantUuid",
+        "FilePath",
+        "Operation",
+        "Model",
+        "SourceFile",
+        "SourceLine",
+        "ParentChunkId",
+        "ChildChunkIds",
+        "MachineId",
+    ]
+    _BACKFILL_DICT_KEYS = [
+        "id",
+        "content",
+        "chunk_type",
+        "session_id",
+        "project_path",
+        "project_name",
+        "timestamp",
+        "user_uuid",
+        "assistant_uuid",
+        "file_path",
+        "operation",
+        "model",
+        "source_file",
+        "source_line",
+        "parent_chunk_id",
+        "child_chunk_ids",
+        "machine_id",
+    ]
 
-        Spanner fans the UPDATE across partitions (pdml_max_parallelism), batches Vertex
-        calls (remote_udf_max_rows_per_rpc), and auto-retries throttled requests. SAFE.ML.PREDICT
-        yields NULL on per-row failure; the WHERE clause keeps such rows NULL so a re-run picks
-        them up. Returns the number of rows updated. No-op (0) when no rows need embedding.
+    def _row_to_chunk_dict(self, row: Any) -> dict[str, Any]:
+        """Map a positional Spanner backfill-read row to the app chunk-dict shape."""
+        return {key: row[index] for index, key in enumerate(self._BACKFILL_DICT_KEYS)}
+
+    def _read_unembedded_batch(self, prefix: str, limit: int) -> list[dict[str, Any]]:
+        """Read up to `limit` un-embedded rows whose Id starts with `prefix`."""
+        try:
+            from google.cloud.spanner_v1 import param_types
+        except ImportError as e:
+            raise RuntimeError("google-cloud-spanner is required") from e
+        database = self.connect()
+        columns = ", ".join(self._BACKFILL_READ_COLUMNS)
+        sql = (
+            f"SELECT {columns} FROM {SPANNER_TABLE_NAME} "
+            "WHERE Vector IS NULL AND STARTS_WITH(Id, @prefix) LIMIT @limit"
+        )
+        with database.snapshot() as snapshot:
+            rows = list(
+                snapshot.execute_sql(
+                    sql,
+                    params={"prefix": prefix, "limit": limit},
+                    param_types={"prefix": param_types.STRING, "limit": param_types.INT64},
+                )
+            )
+        return [self._row_to_chunk_dict(row) for row in rows]
+
+    def _backfill_shard(self, prefix: str) -> int:
+        """Drain one Id-prefix shard: read NULL-vector rows in batches and re-embed them."""
+        batch_size = settings.spanner_backfill_batch_size
+        embedded = 0
+        while True:
+            rows = self._read_unembedded_batch(prefix, batch_size)
+            if not rows:
+                break
+            self._add_chunks_with_spanner_embeddings(rows)
+            embedded += len(rows)
+        return embedded
+
+    def backfill_embeddings(self) -> int:
+        """Fill NULL vectors with app-controlled concurrency (not PDML split-bound).
+
+        NULL-vector rows are sharded by Id hex-prefix (Id is a sha256 hex digest) into 256
+        disjoint slices, drained by a pool of `spanner_backfill_concurrency` workers. Each
+        worker re-embeds its rows through the batched INSERT ... SELECT FROM ML.PREDICT path,
+        so aggregate throughput is bounded by the Vertex quota rather than the table's Spanner
+        split count (which caps partitioned DML on a freshly loaded table). Idempotent and
+        re-runnable (WHERE Vector IS NULL). Returns the rows embedded; 0 when none need it.
         """
         self.ensure_embedding_model()
-        database = self.connect()
-        model_id = settings.spanner_embedding_model_id
-        dim = get_current_vector_dim()
-        task_type = settings.vertex_document_task_type  # validated to a fixed token set
-        rpc = settings.spanner_embedding_rpc_batch_size
-        parallelism = settings.spanner_pdml_max_parallelism
-        sql = f"""
-            @{{pdml_max_parallelism={parallelism}}}
-            UPDATE {SPANNER_TABLE_NAME}
-            SET Vector = (
-                SELECT ARRAY(SELECT CAST(value AS FLOAT32) FROM UNNEST(embeddings.values) AS value)
-                FROM SAFE.ML.PREDICT(
-                    MODEL {model_id},
-                    (SELECT Content AS content, '{task_type}' AS task_type),
-                    STRUCT({dim} AS outputDimensionality)
-                ) @{{remote_udf_max_rows_per_rpc={rpc}}}
-                WHERE embeddings.values IS NOT NULL
+        self.connect()
+        prefixes = [f"{value:02x}" for value in range(256)]
+        concurrency = settings.spanner_backfill_concurrency
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            counts = list(executor.map(self._backfill_shard, prefixes))
+        total = sum(counts)
+        if total:
+            logger.info(
+                "Backfilled embeddings for %s rows via %s sharded workers", total, concurrency
             )
-            WHERE Vector IS NULL
-        """
-        row_count = database.execute_partitioned_dml(sql)
-        if row_count:
-            logger.info("Backfilled embeddings for %s rows via partitioned DML", row_count)
-        return row_count
+        return total
 
     async def backfill_embeddings_async(self) -> int:
         """Run backfill_embeddings() off the event loop."""

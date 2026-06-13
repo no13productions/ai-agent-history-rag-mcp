@@ -372,29 +372,85 @@ def test_spanner_store_defer_embeddings_inserts_without_vector(monkeypatch):
     assert call["values"][0][0] == "chunk-1"
 
 
-def test_spanner_store_backfill_embeddings_uses_partitioned_dml(monkeypatch):
-    """backfill_embeddings issues a partitioned DML UPDATE with SAFE.ML.PREDICT."""
-    monkeypatch.setattr(settings, "embedding_dimension", 3)
-    monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
-    monkeypatch.setattr(settings, "spanner_embedding_model_id", "ConversationEmbeddingModel")
-    monkeypatch.setattr(settings, "vertex_document_task_type", "RETRIEVAL_DOCUMENT")
-    monkeypatch.setattr(settings, "spanner_pdml_max_parallelism", 12)
-    monkeypatch.setattr(store_module, "_vector_dim", None)
-    database = FakeDatabase()
+def test_spanner_store_backfill_embeddings_shards_and_embeds(monkeypatch):
+    """backfill_embeddings drains Id-prefix shards via the batched embed path."""
+    monkeypatch.setattr(settings, "spanner_backfill_concurrency", 4)
+    monkeypatch.setattr(settings, "spanner_backfill_batch_size", 2)
     store = SpannerStore(project="p", instance="i", database="d")
-    store._database = database
+    store._database = FakeDatabase()
     monkeypatch.setattr(store, "ensure_embedding_model", lambda: None)
 
-    updated = store.backfill_embeddings()
+    # One shard ('00') yields a single batch then drains; every other prefix is empty.
+    served: dict[str, bool] = {}
 
-    assert updated == 7
-    sql = database.pdml_calls[-1]
-    assert "pdml_max_parallelism=12" in sql
-    assert "UPDATE ConversationChunks" in sql
-    assert "SAFE.ML.PREDICT" in sql
-    assert "WHERE Vector IS NULL" in sql
-    assert "remote_udf_max_rows_per_rpc=" in sql
-    assert "'RETRIEVAL_DOCUMENT'" in sql  # task type is a safe, validated literal
+    def fake_read(prefix, limit):
+        if prefix == "00" and not served.get(prefix):
+            served[prefix] = True
+            return [{"id": "00aaa", "content": "c1"}, {"id": "00bbb", "content": "c2"}]
+        return []
+
+    embedded_batches: list[list[dict]] = []
+    monkeypatch.setattr(store, "_read_unembedded_batch", fake_read)
+    monkeypatch.setattr(
+        store,
+        "_add_chunks_with_spanner_embeddings",
+        lambda rows: embedded_batches.append(list(rows)),
+    )
+
+    total = store.backfill_embeddings()
+
+    assert total == 2
+    assert embedded_batches == [
+        [{"id": "00aaa", "content": "c1"}, {"id": "00bbb", "content": "c2"}]
+    ]
+
+
+def test_read_unembedded_batch_filters_by_id_prefix(monkeypatch):
+    """_read_unembedded_batch targets one Id shard with a bounded SELECT."""
+    store = SpannerStore(project="p", instance="i", database="d")
+    database = FakeDatabase()
+    store._database = database
+
+    rows = store._read_unembedded_batch("ab", 50)
+
+    call = database.sql_calls[-1]
+    assert "WHERE Vector IS NULL AND STARTS_WITH(Id, @prefix)" in call["sql"]
+    assert "LIMIT @limit" in call["sql"]
+    assert "Vector" not in call["sql"].split("FROM")[0]  # Vector is recomputed, not read
+    assert call["params"]["prefix"] == "ab"
+    assert call["params"]["limit"] == 50
+    assert rows == []  # fake DB has no matching rows
+
+
+def test_row_to_chunk_dict_maps_columns_in_order():
+    """A positional Spanner read row maps to the app chunk-dict shape."""
+    store = SpannerStore(project="p", instance="i", database="d")
+    row = [
+        "id1",
+        "content1",
+        "turn",
+        "s1",
+        "/p",
+        "p",
+        datetime(2026, 1, 1, tzinfo=UTC),
+        "u",
+        "a",
+        "/f",
+        "edit",
+        "m",
+        "/src.jsonl",
+        7,
+        "parent",
+        ["c1", "c2"],
+        "machine",
+    ]
+    mapped = store._row_to_chunk_dict(row)
+    assert len(mapped) == len(store._BACKFILL_DICT_KEYS)
+    assert mapped["id"] == "id1"
+    assert mapped["content"] == "content1"
+    assert mapped["source_line"] == 7
+    assert mapped["child_chunk_ids"] == ["c1", "c2"]
+    assert mapped["machine_id"] == "machine"
 
 
 def test_spanner_store_treats_none_vector_as_unembedded(monkeypatch):
