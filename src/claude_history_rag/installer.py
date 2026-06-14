@@ -21,6 +21,53 @@ from urllib.parse import urlparse
 
 from claude_history_rag.settings_wizard import get_daemon_env_from_service
 
+MCP_SAFE_ENV_KEYS = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "CLOUDSDK_CONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLAUDE_HISTORY_RAG_SERVER_URL",
+        "CLAUDE_HISTORY_RAG_MACHINE_ID",
+        "CLAUDE_HISTORY_RAG_CLIENT_NAME",
+        "CLAUDE_HISTORY_RAG_UPLOAD_RETRY_COUNT",
+        "CLAUDE_HISTORY_RAG_UPLOAD_RETRY_DELAY_SECONDS",
+        "CLAUDE_HISTORY_RAG_CLIENT_AUTH_PATH",
+        "CLAUDE_HISTORY_RAG_LOG_LEVEL",
+        "CLAUDE_HISTORY_RAG_DB_PATH",
+        "CLAUDE_HISTORY_RAG_STORAGE_BACKEND",
+        "CLAUDE_HISTORY_RAG_DEFER_STARTUP_INDEXING",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_MODEL",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION",
+        "CLAUDE_HISTORY_RAG_OPENAI_EMBEDDING_SEND_DIMENSIONS",
+        "CLAUDE_HISTORY_RAG_VERTEX_PROJECT",
+        "CLAUDE_HISTORY_RAG_VERTEX_LOCATION",
+        "CLAUDE_HISTORY_RAG_VERTEX_AUTO_TRUNCATE",
+        "CLAUDE_HISTORY_RAG_VERTEX_QUERY_TASK_TYPE",
+        "CLAUDE_HISTORY_RAG_VERTEX_DOCUMENT_TASK_TYPE",
+        "CLAUDE_HISTORY_RAG_SPANNER_PROJECT",
+        "CLAUDE_HISTORY_RAG_SPANNER_INSTANCE",
+        "CLAUDE_HISTORY_RAG_SPANNER_DATABASE",
+        "CLAUDE_HISTORY_RAG_SPANNER_ENABLE_FULL_TEXT",
+        "CLAUDE_HISTORY_RAG_SPANNER_ENABLE_VECTOR_INDEX",
+        "CLAUDE_HISTORY_RAG_SPANNER_USE_APPROX_VECTOR_SEARCH",
+        "CLAUDE_HISTORY_RAG_SPANNER_VECTOR_INDEX_LEAVES",
+        "CLAUDE_HISTORY_RAG_SPANNER_NUM_LEAVES_TO_SEARCH",
+        "CLAUDE_HISTORY_RAG_SPANNER_HYBRID_CANDIDATE_LIMIT",
+        "CLAUDE_HISTORY_RAG_SPANNER_RRF_K",
+        "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE",
+        "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID",
+        "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_RPC_BATCH_SIZE",
+        "CLAUDE_HISTORY_RAG_SPANNER_DEFER_EMBEDDINGS",
+        "CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_CONCURRENCY",
+        "CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_BATCH_SIZE",
+        "CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_INTERVAL_SECONDS",
+    }
+)
+
 try:
     import httpx
 
@@ -623,6 +670,7 @@ def build_mcp_server_config(
     client_name: str | None = None,
     embedding_url: str | None = None,
     embedding_model: str | None = None,
+    env_vars: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the MCP server configuration dict."""
     config: dict[str, Any] = {
@@ -630,7 +678,7 @@ def build_mcp_server_config(
         "args": ["--directory", str(project_dir), "run", "ai-agent-history-rag"],
     }
 
-    env: dict[str, str] = {}
+    env = project_mcp_env(env_vars or {})
 
     # Client mode
     if server_url:
@@ -650,6 +698,15 @@ def build_mcp_server_config(
         config["env"] = env
 
     return config
+
+
+def project_mcp_env(env_vars: dict[str, str]) -> dict[str, str]:
+    """Project daemon env into the subset that is safe and useful for MCP apps."""
+    return {
+        key: value
+        for key, value in env_vars.items()
+        if key in MCP_SAFE_ENV_KEYS and value not in {"", None}
+    }
 
 
 def add_mcp_to_target(
@@ -1567,6 +1624,7 @@ def run_wizard() -> int:
                 client_name=client_name,
                 embedding_url=embedding_url,
                 embedding_model=embedding_model,
+                env_vars=env_vars,
             )
 
             for target in selected_targets:
