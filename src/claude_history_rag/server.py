@@ -19,6 +19,33 @@ from claude_history_rag.watcher import get_all_watchers
 logger = logging.getLogger(__name__)
 
 
+def _local_status_auth_headers() -> dict[str, str]:
+    """Authorize the in-process snapshot call to the always-on daemon status server.
+
+    When auth is enabled the daemon's ``/status`` endpoint requires a Bearer PSK,
+    so an unauthenticated call gets 401 and the snapshot silently falls back to this
+    (idle) MCP process's own watcher state -- which is why watcher_running read False.
+    The MCP server and daemon share the same ``auth_state`` file, so the active key
+    matches; read it straight from the file rather than via the auth manager to avoid
+    a stray write to the daemon-owned ``auth.json``.
+    """
+    if not settings.auth_enabled:
+        return {}
+    psk = settings.server_psk
+    if not psk:
+        try:
+            import json
+
+            data = json.loads(settings.auth_state_path.read_text())
+            psk = (data.get("active") or {}).get("key_plain")
+        except Exception as e:
+            logger.debug("Local status PSK unavailable: %s", type(e).__name__)
+            return {}
+    if not psk:
+        return {}
+    return {"Authorization": f"Bearer {psk}"}
+
+
 async def _get_status_server_snapshot(detail_level: str = "full") -> dict[str, Any] | None:
     """Fetch the always-on daemon status server when this MCP process is lightweight."""
     if not settings.status_server_enabled:
@@ -36,6 +63,7 @@ async def _get_status_server_snapshot(detail_level: str = "full") -> dict[str, A
             response = await client.get(
                 f"http://{host}:{settings.status_server_port}/status",
                 params={"detail": detail_level},
+                headers=_local_status_auth_headers(),
             )
         if response.status_code != 200:
             return None
