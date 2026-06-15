@@ -18,6 +18,100 @@ from claude_history_rag.watcher import get_all_watchers
 logger = logging.getLogger(__name__)
 
 
+async def _get_status_server_snapshot(detail_level: str = "full") -> dict[str, Any] | None:
+    """Fetch the always-on daemon status server when this MCP process is lightweight."""
+    if not settings.status_server_enabled:
+        return None
+
+    host = settings.status_server_host
+    if host in {"", "0.0.0.0", "::"}:
+        host = "127.0.0.1"
+
+    try:
+        import httpx
+
+        timeout = httpx.Timeout(30.0, connect=1.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"http://{host}:{settings.status_server_port}/status",
+                params={"detail": detail_level},
+            )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception as e:
+        logger.debug("Daemon status snapshot unavailable: %s", type(e).__name__)
+        return None
+
+
+def _is_external_daemon_snapshot(snapshot: dict[str, Any]) -> bool:
+    server = snapshot.get("server")
+    if not isinstance(server, dict):
+        return False
+    return server.get("pid") not in {None, os.getpid()}
+
+
+def _index_status_from_daemon_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    indexing = snapshot.get("indexing") if isinstance(snapshot.get("indexing"), dict) else {}
+    file_watcher = (
+        snapshot.get("file_watcher") if isinstance(snapshot.get("file_watcher"), dict) else {}
+    )
+    database = snapshot.get("database") if isinstance(snapshot.get("database"), dict) else {}
+    embedder = snapshot.get("embedder") if isinstance(snapshot.get("embedder"), dict) else {}
+    sources = indexing.get("sources") if isinstance(indexing.get("sources"), dict) else {}
+
+    source_status = {
+        name: {
+            "watched_files": source.get("files_indexed", source.get("watched_files", 0)),
+            "pending_files": source.get("files_pending", source.get("pending_files", 0)),
+            "running": source.get("is_running", source.get("running", False)),
+            "failed_files": source.get("files_failed", source.get("failed_files", 0)),
+            "watch_path": source.get("watch_path"),
+        }
+        for name, source in sources.items()
+        if isinstance(source, dict)
+    }
+
+    return {
+        "mode": "server",
+        "source": "daemon",
+        "daemon_pid": snapshot.get("server", {}).get("pid"),
+        "total_chunks": database.get("total_chunks", 0),
+        "embedding_model_loaded": bool(embedder.get("loaded", True)),
+        "watched_files": sum(source["watched_files"] for source in source_status.values()),
+        "pending_files": sum(source["pending_files"] for source in source_status.values()),
+        "sources": source_status,
+        "watcher_running": bool(file_watcher.get("all_sources_running")),
+        "status": snapshot.get("health", {}).get("status", snapshot.get("status", "unknown")),
+        "cache_stats": snapshot.get("cache"),
+        "storage_backend": database.get("backend", settings.storage_backend),
+        "database": {
+            key: value
+            for key, value in database.items()
+            if key
+            in {
+                "db_path",
+                "backend",
+                "project",
+                "instance",
+                "database",
+                "dimension",
+                "fts_index_available",
+                "vector_index_available",
+                "vector_search_mode",
+                "embedding_mode",
+                "embedding_model_id",
+                "awaiting_embedding",
+                "backfill_rate_per_min",
+                "backfill_eta_seconds",
+            }
+        },
+    }
+
+
 def _get_decision_engine():
     """Get decision engine with thread-safe lazy initialization.
 
@@ -586,6 +680,9 @@ async def get_index_status() -> dict:
     """
     try:
         logger.debug("get_index_status called")
+        daemon_snapshot = await _get_status_server_snapshot(detail_level="full")
+        if daemon_snapshot and _is_external_daemon_snapshot(daemon_snapshot):
+            return _index_status_from_daemon_snapshot(daemon_snapshot)
 
         watchers = get_all_watchers()
         source_status = {
@@ -728,6 +825,11 @@ async def get_server_status(detail_level: str = "basic") -> dict:
         - configuration: Current settings (full detail only)
     """
     try:
+        daemon_snapshot = await _get_status_server_snapshot(detail_level=detail_level)
+        if daemon_snapshot and _is_external_daemon_snapshot(daemon_snapshot):
+            daemon_snapshot["source"] = "daemon"
+            return daemon_snapshot
+
         # Import here to avoid circular dependency
         from claude_history_rag.status import get_status_collector
 

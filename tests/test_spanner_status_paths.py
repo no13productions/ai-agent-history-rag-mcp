@@ -106,6 +106,52 @@ class CapturingStore:
         self.chunks.extend(chunks)
 
 
+async def _no_daemon_status(*args, **kwargs):
+    return None
+
+
+def _daemon_status_snapshot() -> dict:
+    return {
+        "server": {"pid": 999999},
+        "health": {"status": "healthy"},
+        "database": {
+            "total_chunks": 703496,
+            "backend": "spanner",
+            "project": "jeeves-486102",
+            "instance": "jeeves-rg-spanner-prod-4d0e4c43",
+            "database": "ai-agent-history-rag",
+            "dimension": 3072,
+            "fts_index_available": True,
+            "vector_index_available": True,
+            "vector_search_mode": "ann",
+            "embedding_mode": "spanner",
+            "embedding_model_id": "ConversationEmbeddingModel",
+            "awaiting_embedding": 3,
+        },
+        "embedder": {"loaded": True},
+        "cache": {"size": 0},
+        "indexing": {
+            "sources": {
+                "Codex": {
+                    "files_indexed": 112,
+                    "files_pending": 0,
+                    "files_failed": 0,
+                    "is_running": True,
+                    "watch_path": "/Users/brandon/.codex/sessions",
+                },
+                "Claude Code": {
+                    "files_indexed": 4532,
+                    "files_pending": 0,
+                    "files_failed": 0,
+                    "is_running": True,
+                    "watch_path": "/Users/brandon/.claude/projects",
+                },
+            }
+        },
+        "file_watcher": {"all_sources_running": True},
+    }
+
+
 def _single_chunker(file_path, start_line=0):
     del start_line
     yield Chunk(
@@ -145,9 +191,7 @@ async def test_local_direct_indexing_stamps_machine_id(monkeypatch, tmp_path):
     assert stored["machine_id"] == "test-machine"
     assert stored["id"] == _machine_scoped_chunk_id("test-machine", "chunk-1")
     assert stored["parent_chunk_id"] == _machine_scoped_chunk_id("test-machine", "parent-1")
-    assert stored["child_chunk_ids"] == [
-        _machine_scoped_chunk_id("test-machine", "child-1")
-    ]
+    assert stored["child_chunk_ids"] == [_machine_scoped_chunk_id("test-machine", "child-1")]
 
 
 @pytest.mark.asyncio
@@ -156,6 +200,7 @@ async def test_get_index_status_supports_spanner_stats(monkeypatch):
     fake_store = FakeSpannerStore()
     monkeypatch.setattr("claude_history_rag.store.store", fake_store)
     monkeypatch.setattr(settings, "storage_backend", "spanner")
+    monkeypatch.setattr(server_module, "_get_status_server_snapshot", _no_daemon_status)
     monkeypatch.setattr(server_module, "get_all_watchers", lambda: [FakeWatcher()])
     monkeypatch.setattr("claude_history_rag.embedder.get_embedder", lambda: FakeEmbedder())
 
@@ -166,6 +211,41 @@ async def test_get_index_status_supports_spanner_stats(monkeypatch):
     assert result["storage_backend"] == "spanner"
     assert result["database"]["vector_search_mode"] == "ann"
     assert "db_path" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_index_status_uses_external_daemon_status(monkeypatch):
+    """Lightweight MCP status should report the always-on daemon watcher when present."""
+
+    async def fake_daemon_status(*args, **kwargs):
+        return _daemon_status_snapshot()
+
+    monkeypatch.setattr(server_module, "_get_status_server_snapshot", fake_daemon_status)
+
+    result = await server_module.get_index_status()
+
+    assert result["source"] == "daemon"
+    assert result["daemon_pid"] == 999999
+    assert result["watcher_running"] is True
+    assert result["watched_files"] == 4644
+    assert result["sources"]["Codex"]["running"] is True
+    assert result["database"]["awaiting_embedding"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_server_status_uses_external_daemon_status(monkeypatch):
+    """Full MCP server status should prefer daemon health over idle MCP process state."""
+
+    async def fake_daemon_status(*args, **kwargs):
+        return _daemon_status_snapshot()
+
+    monkeypatch.setattr(server_module, "_get_status_server_snapshot", fake_daemon_status)
+
+    result = await server_module.get_server_status(detail_level="full")
+
+    assert result["source"] == "daemon"
+    assert result["server"]["pid"] == 999999
+    assert result["file_watcher"]["all_sources_running"] is True
 
 
 @pytest.mark.asyncio
