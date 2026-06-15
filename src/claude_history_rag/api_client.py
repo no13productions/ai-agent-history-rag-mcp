@@ -335,6 +335,8 @@ class APIClient:
         query: str,
         limit: int = 5,
         project_filter: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
         use_hybrid: bool = True,
         enable_analysis: bool = True,
         enable_synthesis: bool = False,
@@ -346,6 +348,8 @@ class APIClient:
             query: Search query
             limit: Maximum results
             project_filter: Filter by project path
+            date_from: Inclusive lower timestamp bound (ISO-8601)
+            date_to: Inclusive upper timestamp bound (ISO-8601)
             use_hybrid: Use hybrid search
             enable_analysis: Enable query analysis
             enable_synthesis: Enable result synthesis
@@ -361,6 +365,8 @@ class APIClient:
             query=query,
             limit=limit,
             project_filter=project_filter,
+            date_from=date_from,
+            date_to=date_to,
             use_hybrid=use_hybrid,
             enable_analysis=enable_analysis,
             enable_synthesis=enable_synthesis,
@@ -379,6 +385,8 @@ class APIClient:
         query: str | None = None,
         project_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
         limit: int = 10,
     ) -> FileSearchResponse:
         """Search file changes on the central server.
@@ -388,6 +396,8 @@ class APIClient:
             query: Semantic query about changes
             project_filter: Filter by project
             operation_filter: Filter by operation (edit/write)
+            date_from: Inclusive lower timestamp bound (ISO-8601)
+            date_to: Inclusive upper timestamp bound (ISO-8601)
             limit: Maximum results
 
         Returns:
@@ -401,6 +411,8 @@ class APIClient:
             query=query,
             project_filter=project_filter,
             operation_filter=operation_filter,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
         )
 

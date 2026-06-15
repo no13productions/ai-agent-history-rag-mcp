@@ -191,6 +191,8 @@ def test_spanner_schema_ddl_uses_configured_vector_dimension(monkeypatch):
     assert f"{SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST" in ddl
     assert "TOKENIZE_FULLTEXT(Content)" in ddl
     assert f"CREATE SEARCH INDEX {SPANNER_CONTENT_SEARCH_INDEX}" in ddl
+    assert f"CREATE INDEX {SPANNER_TABLE_NAME}ByTimestamp" in ddl
+    assert f"CREATE INDEX {SPANNER_TABLE_NAME}ByProjectTimestamp" in ddl
 
 
 def test_spanner_vector_index_ddl_is_separate_from_base_schema(monkeypatch):
@@ -634,6 +636,28 @@ def test_spanner_store_search_uses_ann_when_vector_index_exists(monkeypatch):
     assert '"num_leaves_to_search": 25' in search_call["sql"]
 
 
+def test_spanner_store_search_applies_timeframe_filter(monkeypatch):
+    """Spanner vector search constrains results to requested timestamps."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_use_approx_vector_search", True)
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+    monkeypatch.setattr(store, "_vector_index_exists", lambda: True)
+    date_from = datetime(2026, 6, 13, 4, 12, 25, tzinfo=UTC)
+    date_to = datetime(2026, 6, 15, 4, 12, 25, tzinfo=UTC)
+
+    store.search([0.1, 0.2, 0.3], date_from=date_from, date_to=date_to)
+
+    search_call = database.sql_calls[-1]
+    assert "Timestamp >= @date_from" in search_call["sql"]
+    assert "Timestamp <= @date_to" in search_call["sql"]
+    assert search_call["params"]["date_from"] == date_from
+    assert search_call["params"]["date_to"] == date_to
+    assert "FORCE_INDEX=ConversationChunksVectorIndex" not in search_call["sql"]
+
+
 def test_spanner_store_hybrid_search_uses_full_text_and_rrf(monkeypatch):
     """Spanner hybrid search combines vector and text candidate ranks."""
     monkeypatch.setattr(settings, "embedding_dimension", 3)
@@ -654,6 +678,31 @@ def test_spanner_store_hybrid_search_uses_full_text_and_rrf(monkeypatch):
     assert "1.0 - LEAST(1.0, f.Score /" in search_call["sql"]
     assert "ProjectPath = @project_filter" in search_call["sql"]
     assert search_call["params"]["query"] == "oauth token"
+
+
+def test_spanner_store_hybrid_search_applies_timeframe_filter(monkeypatch):
+    """Spanner hybrid search applies timeframe filters to vector and text candidates."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_use_approx_vector_search", True)
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+    monkeypatch.setattr(store, "has_fts_index", lambda: True)
+    monkeypatch.setattr(store, "_vector_index_exists", lambda: True)
+    date_from = datetime(2026, 6, 13, 4, 12, 25, tzinfo=UTC)
+    date_to = datetime(2026, 6, 15, 4, 12, 25, tzinfo=UTC)
+
+    store.hybrid_search(
+        "multi-table sql gql", [0.1, 0.2, 0.3], date_from=date_from, date_to=date_to
+    )
+
+    search_call = database.sql_calls[-1]
+    assert search_call["sql"].count("Timestamp >= @date_from") == 2
+    assert search_call["sql"].count("Timestamp <= @date_to") == 2
+    assert search_call["params"]["date_from"] == date_from
+    assert search_call["params"]["date_to"] == date_to
+    assert "FORCE_INDEX=ConversationChunksVectorIndex" not in search_call["sql"]
 
 
 def test_spanner_store_hybrid_search_marks_vector_fallback_without_fts(monkeypatch):

@@ -682,6 +682,8 @@ Search conversation history for relevant context.
 Arguments:
   query: str           - Natural language query
   project_filter: str  - Limit to specific project (optional)
+  date_from: str       - Inclusive lower timestamp bound, ISO date/datetime (optional)
+  date_to: str         - Inclusive upper timestamp bound, ISO date/datetime (optional)
   limit: int           - Maximum results (default: 5)
   use_hybrid: bool     - Use hybrid search (default: True)
 ```
@@ -696,6 +698,8 @@ Arguments:
   query: str           - Semantic query about changes (optional)
   project_filter: str  - Limit to specific project (optional)
   operation_filter: str - Filter by "edit" or "write" (optional)
+  date_from: str       - Inclusive lower timestamp bound, ISO date/datetime (optional)
+  date_to: str         - Inclusive upper timestamp bound, ISO date/datetime (optional)
   limit: int           - Maximum results (default: 10)
 ```
 

@@ -44,6 +44,7 @@ from claude_history_rag.models import (
     SessionSummaryResponse,
 )
 from claude_history_rag.status import get_status_collector
+from claude_history_rag.time_filters import parse_timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -625,6 +626,7 @@ class StatusServer:
                 return auth_result
             data = await request.json()
             search_request = SearchRequest(**data)
+            date_from, date_to = parse_timeframe(search_request.date_from, search_request.date_to)
 
             # Import here to avoid circular imports
             from claude_history_rag.store import store
@@ -647,6 +649,8 @@ class StatusServer:
                     query_vector=query_vector,
                     limit=search_request.limit,
                     project_filter=search_request.project_filter,
+                    date_from=date_from,
+                    date_to=date_to,
                 )
                 search_type = "hybrid"
             else:
@@ -654,6 +658,8 @@ class StatusServer:
                     query_vector=query_vector,
                     limit=search_request.limit,
                     project_filter=search_request.project_filter,
+                    date_from=date_from,
+                    date_to=date_to,
                 )
                 search_type = "vector"
 
@@ -685,6 +691,15 @@ class StatusServer:
                 error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
             )
             return web.json_response(response.model_dump(), status=400)
+        except ValueError as e:
+            response = SearchResponse(
+                results=[],
+                count=0,
+                query=data.get("query", "") if "data" in dir() else "",
+                search_type="error",
+                error=str(e),
+            )
+            return web.json_response(response.model_dump(), status=400)
         except Exception as e:
             logger.error(f"Search failed: {type(e).__name__}: {e}", exc_info=True)
             response = SearchResponse(
@@ -704,6 +719,7 @@ class StatusServer:
                 return auth_result
             data = await request.json()
             search_request = FileSearchRequest(**data)
+            date_from, date_to = parse_timeframe(search_request.date_from, search_request.date_to)
 
             # Import here to avoid circular imports
             from claude_history_rag.store import store
@@ -740,6 +756,8 @@ class StatusServer:
                 chunk_type_filter="file_change",
                 file_path_filter=search_request.file_path,
                 operation_filter=search_request.operation_filter,
+                date_from=date_from,
+                date_to=date_to,
             )
 
             response = FileSearchResponse(
@@ -763,6 +781,13 @@ class StatusServer:
                 results=[],
                 count=0,
                 error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+            )
+            return web.json_response(response.model_dump(), status=400)
+        except ValueError as e:
+            response = FileSearchResponse(
+                results=[],
+                count=0,
+                error=str(e),
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:

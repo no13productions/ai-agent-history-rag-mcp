@@ -135,6 +135,8 @@ class SearchRequest(BaseModel):
     query: ShortText
     limit: int = Field(default=5, ge=1, le=100)
     project_filter: str | None = Field(default=None, max_length=4096)
+    date_from: str | None = Field(default=None, max_length=64)
+    date_to: str | None = Field(default=None, max_length=64)
     use_hybrid: bool = True
     enable_analysis: bool = True
     enable_synthesis: bool = False
@@ -163,6 +165,8 @@ class FileSearchRequest(BaseModel):
     query: str | None = Field(default=None, max_length=512)
     project_filter: str | None = Field(default=None, max_length=4096)
     operation_filter: str | None = Field(default=None, max_length=128)
+    date_from: str | None = Field(default=None, max_length=64)
+    date_to: str | None = Field(default=None, max_length=64)
     limit: int = Field(default=10, ge=1, le=100)
 
 

@@ -56,6 +56,8 @@ class FakeSpannerStore:
         self.hybrid_calls = 0
         self.vector_calls = 0
         self.native_embed_queries: list[str] = []
+        self.last_hybrid_kwargs = {}
+        self.last_vector_kwargs = {}
 
     def has_fts_index(self) -> bool:
         return self.fts_available
@@ -84,6 +86,7 @@ class FakeSpannerStore:
 
     async def hybrid_search_async(self, **kwargs):
         self.hybrid_calls += 1
+        self.last_hybrid_kwargs = kwargs
         return [
             {
                 "id": "chunk-1",
@@ -95,6 +98,7 @@ class FakeSpannerStore:
 
     async def search_async(self, **kwargs):
         self.vector_calls += 1
+        self.last_vector_kwargs = kwargs
         return [{"id": "chunk-1", "content": "content", "score": 0.1}]
 
 
@@ -299,6 +303,28 @@ async def test_search_conversations_reports_runtime_vector_fallback(monkeypatch)
 
     assert result["search_type"] == "vector"
     assert "_search_type" not in result["results"][0]
+
+
+@pytest.mark.asyncio
+async def test_search_conversations_passes_timeframe_to_store(monkeypatch):
+    """MCP search should pass parsed timeframe filters into backend search."""
+    fake_store = FakeSpannerStore(fts_available=True)
+    monkeypatch.setattr("claude_history_rag.store.store", fake_store)
+    monkeypatch.setattr("claude_history_rag.embedder.get_embedder", lambda: FakeEmbedder())
+
+    result = await server_module.search_conversations(
+        query="multi-table sql gql",
+        date_from="2026-06-13T04:12:25Z",
+        date_to="2026-06-15T04:12:25Z",
+        limit=2,
+        use_hybrid=True,
+        enable_analysis=False,
+    )
+
+    assert result["date_from"] == "2026-06-13T04:12:25Z"
+    assert result["date_to"] == "2026-06-15T04:12:25Z"
+    assert fake_store.last_hybrid_kwargs["date_from"].isoformat() == ("2026-06-13T04:12:25+00:00")
+    assert fake_store.last_hybrid_kwargs["date_to"].isoformat() == ("2026-06-15T04:12:25+00:00")
 
 
 @pytest.mark.asyncio

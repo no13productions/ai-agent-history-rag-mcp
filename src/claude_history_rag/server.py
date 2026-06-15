@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 
 from claude_history_rag.config import settings
 from claude_history_rag.errors import record_error
+from claude_history_rag.time_filters import format_time_filter, parse_timeframe
 from claude_history_rag.watcher import get_all_watchers
 
 logger = logging.getLogger(__name__)
@@ -225,6 +226,8 @@ async def _embed_query(query: str) -> list[float]:
 async def search_conversations(
     query: str,
     project_filter: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = 5,
     use_hybrid: bool = True,
     enable_analysis: bool = True,
@@ -241,6 +244,10 @@ async def search_conversations(
     Args:
         query: Natural language query
         project_filter: Limit to specific project path
+        date_from: Inclusive lower timestamp bound. Accepts ISO-8601 datetime
+            or date-only values such as 2026-06-13.
+        date_to: Inclusive upper timestamp bound. Accepts ISO-8601 datetime
+            or date-only values such as 2026-06-15.
         limit: Maximum results (default 5, min 1, max 50)
         use_hybrid: Use hybrid search (vector + BM25) for better results
             (default True)
@@ -291,6 +298,13 @@ async def search_conversations(
                 "error": "Invalid limit: must be between 1 and 50",
                 "results": [],
             }
+        try:
+            parsed_date_from, parsed_date_to = parse_timeframe(date_from, date_to)
+        except ValueError as e:
+            logger.warning("Validation failure: %s", e)
+            return {"error": str(e), "results": []}
+        normalized_date_from = format_time_filter(parsed_date_from)
+        normalized_date_to = format_time_filter(parsed_date_to)
 
         # ============================================================
         # Client Mode: Proxy to central server
@@ -307,6 +321,8 @@ async def search_conversations(
                     query=query,
                     limit=limit,
                     project_filter=project_filter,
+                    date_from=normalized_date_from,
+                    date_to=normalized_date_to,
                     use_hybrid=use_hybrid,
                     enable_analysis=enable_analysis,
                     enable_synthesis=enable_synthesis,
@@ -341,11 +357,15 @@ async def search_conversations(
                         query_vector=search_vector,
                         limit=search_limit,
                         project_filter=search_project_filter,
+                        date_from=parsed_date_from,
+                        date_to=parsed_date_to,
                     )
                 return await store.search_async(
                     query_vector=search_vector,
                     limit=search_limit,
                     project_filter=search_project_filter,
+                    date_from=parsed_date_from,
+                    date_to=parsed_date_to,
                 )
 
             # Pass enable_synthesis as parameter instead of mutating global state (T2 fix)
@@ -363,6 +383,8 @@ async def search_conversations(
                 result["search_type"] = _consume_search_type_marker(
                     result["results"], result.get("search_type", search_type)
                 )
+            result["date_from"] = normalized_date_from
+            result["date_to"] = normalized_date_to
 
             return result
 
@@ -376,6 +398,8 @@ async def search_conversations(
                 query_vector=query_vector,
                 limit=limit,
                 project_filter=project_filter,
+                date_from=parsed_date_from,
+                date_to=parsed_date_to,
             )
         else:
             # Fall back to vector-only search
@@ -383,6 +407,8 @@ async def search_conversations(
                 query_vector=query_vector,
                 limit=limit,
                 project_filter=project_filter,
+                date_from=parsed_date_from,
+                date_to=parsed_date_to,
             )
 
         return {
@@ -391,6 +417,8 @@ async def search_conversations(
             "query": query,
             "search_type": _consume_search_type_marker(results, search_type),
             "cache_hit": False,
+            "date_from": normalized_date_from,
+            "date_to": normalized_date_to,
         }
 
     except FileNotFoundError:
@@ -417,6 +445,8 @@ async def search_file_changes(
     query: str | None = None,
     project_filter: str | None = None,
     operation_filter: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = 10,
 ) -> dict:
     """Find file modifications in conversation history.
@@ -431,6 +461,10 @@ async def search_file_changes(
         query: Semantic query about changes
         project_filter: Limit to specific project
         operation_filter: Filter by "edit" or "write"
+        date_from: Inclusive lower timestamp bound. Accepts ISO-8601 datetime
+            or date-only values such as 2026-06-13.
+        date_to: Inclusive upper timestamp bound. Accepts ISO-8601 datetime
+            or date-only values such as 2026-06-15.
         limit: Maximum results (default 10, min 1, max 50)
 
     Returns:
@@ -479,6 +513,13 @@ async def search_file_changes(
                 ),
                 "results": [],
             }
+        try:
+            parsed_date_from, parsed_date_to = parse_timeframe(date_from, date_to)
+        except ValueError as e:
+            logger.warning("Validation failure: %s", e)
+            return {"error": str(e), "results": []}
+        normalized_date_from = format_time_filter(parsed_date_from)
+        normalized_date_to = format_time_filter(parsed_date_to)
 
         # ============================================================
         # Client Mode: Proxy to central server
@@ -496,6 +537,8 @@ async def search_file_changes(
                     query=query,
                     project_filter=project_filter,
                     operation_filter=operation_filter,
+                    date_from=normalized_date_from,
+                    date_to=normalized_date_to,
                     limit=limit,
                 )
                 return response.model_dump()
@@ -533,6 +576,8 @@ async def search_file_changes(
             chunk_type_filter="file_change",
             file_path_filter=file_path,
             operation_filter=operation_filter,
+            date_from=parsed_date_from,
+            date_to=parsed_date_to,
         )
 
         return {
@@ -540,6 +585,8 @@ async def search_file_changes(
             "count": len(results),
             "file_path_filter": file_path,
             "operation_filter": operation_filter,
+            "date_from": normalized_date_from,
+            "date_to": normalized_date_to,
         }
 
     except FileNotFoundError:

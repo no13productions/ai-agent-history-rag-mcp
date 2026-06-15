@@ -39,6 +39,8 @@ class ConversationStore(Protocol):
         chunk_type_filter: str | None = None,
         file_path_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search by vector similarity with optional filters."""
         ...
@@ -61,6 +63,8 @@ class ConversationStore(Protocol):
         chunk_type_filter: str | None = None,
         file_path_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search asynchronously by vector similarity with optional filters."""
         ...
@@ -71,6 +75,8 @@ class ConversationStore(Protocol):
         query_vector: list[float],
         limit: int = 5,
         project_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search by combined lexical and vector relevance."""
         ...
@@ -81,6 +87,8 @@ class ConversationStore(Protocol):
         query_vector: list[float],
         limit: int = 5,
         project_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search asynchronously by combined lexical and vector relevance."""
         ...
@@ -263,6 +271,9 @@ def get_spanner_schema_ddl() -> list[str]:
         """,
         f"CREATE INDEX {SPANNER_TABLE_NAME}ByProject ON {SPANNER_TABLE_NAME}(ProjectPath)",
         f"CREATE INDEX {SPANNER_TABLE_NAME}ByMachine ON {SPANNER_TABLE_NAME}(MachineId)",
+        f"CREATE INDEX {SPANNER_TABLE_NAME}ByTimestamp ON {SPANNER_TABLE_NAME}(Timestamp)",
+        f"CREATE INDEX {SPANNER_TABLE_NAME}ByProjectTimestamp "
+        f"ON {SPANNER_TABLE_NAME}(ProjectPath, Timestamp)",
     ]
     if settings.spanner_enable_full_text:
         ddl.append(
@@ -370,6 +381,12 @@ def _format_timestamp(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _lance_timestamp_literal(value: dt) -> str:
+    """Format a UTC timestamp literal for LanceDB SQL filters."""
+    timestamp = _normalize_timestamp(value).replace(tzinfo=None)
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def _relevance_to_distance(value: Any) -> float:
@@ -513,6 +530,8 @@ class VectorStore:
         chunk_type_filter: str | None = None,
         file_path_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search for similar chunks.
 
@@ -523,6 +542,8 @@ class VectorStore:
             chunk_type_filter: Filter by chunk type
             file_path_filter: Filter by file path (supports LIKE)
             operation_filter: Filter by operation type (edit/write)
+            date_from: Inclusive lower timestamp bound
+            date_to: Inclusive upper timestamp bound
 
         Returns:
             List of matching chunks with scores
@@ -559,6 +580,10 @@ class VectorStore:
                 filters.append(f"operation = '{safe_operation}'")
             else:
                 logger.warning("operation_filter became empty after sanitization, ignoring")
+        if date_from:
+            filters.append(f"timestamp >= timestamp '{_lance_timestamp_literal(date_from)}'")
+        if date_to:
+            filters.append(f"timestamp <= timestamp '{_lance_timestamp_literal(date_to)}'")
 
         if filters:
             query = query.where(" AND ".join(filters))
@@ -623,18 +648,22 @@ class VectorStore:
         chunk_type_filter: str | None = None,
         file_path_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search asynchronously."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self.search(
-                query_vector,
-                limit,
-                project_filter,
-                chunk_type_filter,
-                file_path_filter,
-                operation_filter,
+                query_vector=query_vector,
+                limit=limit,
+                project_filter=project_filter,
+                chunk_type_filter=chunk_type_filter,
+                file_path_filter=file_path_filter,
+                operation_filter=operation_filter,
+                date_from=date_from,
+                date_to=date_to,
             ),
         )
 
@@ -644,6 +673,8 @@ class VectorStore:
         query_vector: list[float],
         limit: int = 10,
         project_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search combining vector and full-text search with RRF reranking.
 
@@ -655,13 +686,20 @@ class VectorStore:
             # Try hybrid search with both vector and text components
             search_query = table.search(query_type="hybrid").vector(query_vector).text(query)
 
+            filters = []
             # Apply project filter if specified (sanitized)
             if project_filter:
                 safe_project = _sanitize_filter_value(project_filter)
                 if safe_project:
-                    search_query = search_query.where(f"project_path = '{safe_project}'")
+                    filters.append(f"project_path = '{safe_project}'")
                 else:
                     logger.warning("project_filter became empty after sanitization, ignoring")
+            if date_from:
+                filters.append(f"timestamp >= timestamp '{_lance_timestamp_literal(date_from)}'")
+            if date_to:
+                filters.append(f"timestamp <= timestamp '{_lance_timestamp_literal(date_to)}'")
+            if filters:
+                search_query = search_query.where(" AND ".join(filters))
 
             # Use RRF reranker for fusion
             try:
@@ -676,10 +714,8 @@ class VectorStore:
                     search_query = (
                         table.search(query_type="hybrid").vector(query_vector).text(query)
                     )
-                    if project_filter:
-                        safe_project = _sanitize_filter_value(project_filter)
-                        if safe_project:
-                            search_query = search_query.where(f"project_path = '{safe_project}'")
+                    if filters:
+                        search_query = search_query.where(" AND ".join(filters))
                     results = search_query.rerank(reranker=RRFReranker()).limit(limit).to_list()
                 else:
                     raise
@@ -691,6 +727,8 @@ class VectorStore:
                     query_vector=query_vector,
                     limit=limit,
                     project_filter=project_filter,
+                    date_from=date_from,
+                    date_to=date_to,
                 )
             else:
                 raise
@@ -722,12 +760,21 @@ class VectorStore:
         query_vector: list[float],
         limit: int = 10,
         project_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search asynchronously."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
-            lambda: self.hybrid_search(query, query_vector, limit, project_filter),
+            lambda: self.hybrid_search(
+                query=query,
+                query_vector=query_vector,
+                limit=limit,
+                project_filter=project_filter,
+                date_from=date_from,
+                date_to=date_to,
+            ),
         )
 
     def create_fts_index(self) -> None:
@@ -1201,6 +1248,7 @@ class SpannerStore:
         if database is None:
             return
         if self._table_exists(SPANNER_TABLE_NAME):
+            self.ensure_filter_indexes()
             self.ensure_search_schema()
             self.ensure_embedding_model()
             return
@@ -1236,6 +1284,22 @@ class SpannerStore:
                 return True
             logger.warning("Failed to create Spanner %s: %s", description, e)
             return False
+
+    def ensure_filter_indexes(self) -> None:
+        """Ensure secondary indexes used by search filters exist."""
+        timestamp_index = f"{SPANNER_TABLE_NAME}ByTimestamp"
+        if not self._index_exists(timestamp_index):
+            self._run_ddl(
+                f"CREATE INDEX {timestamp_index} ON {SPANNER_TABLE_NAME}(Timestamp)",
+                f"index {timestamp_index}",
+            )
+        project_timestamp_index = f"{SPANNER_TABLE_NAME}ByProjectTimestamp"
+        if not self._index_exists(project_timestamp_index):
+            self._run_ddl(
+                f"CREATE INDEX {project_timestamp_index} "
+                f"ON {SPANNER_TABLE_NAME}(ProjectPath, Timestamp)",
+                f"index {project_timestamp_index}",
+            )
 
     def ensure_search_schema(self) -> None:
         """Ensure generated token column and full-text search index exist."""
@@ -1827,6 +1891,8 @@ class SpannerStore:
         chunk_type_filter: str | None = None,
         file_path_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """KNN vector search via Spanner exact or indexed ANN cosine distance."""
         if len(query_vector) != get_current_vector_dim():
@@ -1865,8 +1931,18 @@ class SpannerStore:
             filters.append("Operation = @operation_filter")
             params["operation_filter"] = operation_filter
             types["operation_filter"] = param_types.STRING
+        if date_from:
+            filters.append("Timestamp >= @date_from")
+            params["date_from"] = date_from
+            types["date_from"] = param_types.TIMESTAMP
+        if date_to:
+            filters.append("Timestamp <= @date_to")
+            params["date_to"] = date_to
+            types["date_to"] = param_types.TIMESTAMP
 
-        filters_use_unstored_columns = bool(project_filter or file_path_filter or operation_filter)
+        filters_use_unstored_columns = bool(
+            project_filter or file_path_filter or operation_filter or date_from or date_to
+        )
         distance_expr = self._vector_distance_sql(
             filters_use_unstored_columns=filters_use_unstored_columns
         )
@@ -1909,18 +1985,22 @@ class SpannerStore:
         chunk_type_filter: str | None = None,
         file_path_filter: str | None = None,
         operation_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Search asynchronously."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self.search(
-                query_vector,
-                limit,
-                project_filter,
-                chunk_type_filter,
-                file_path_filter,
-                operation_filter,
+                query_vector=query_vector,
+                limit=limit,
+                project_filter=project_filter,
+                chunk_type_filter=chunk_type_filter,
+                file_path_filter=file_path_filter,
+                operation_filter=operation_filter,
+                date_from=date_from,
+                date_to=date_to,
             ),
         )
 
@@ -1930,11 +2010,17 @@ class SpannerStore:
         query_vector: list[float],
         limit: int = 10,
         project_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search using Spanner full-text SCORE plus vector RRF fusion."""
         if not query.strip() or not self.has_fts_index():
             results = self.search(
-                query_vector=query_vector, limit=limit, project_filter=project_filter
+                query_vector=query_vector,
+                limit=limit,
+                project_filter=project_filter,
+                date_from=date_from,
+                date_to=date_to,
             )
             for result in results:
                 result["_search_type"] = "vector"
@@ -1971,8 +2057,18 @@ class SpannerStore:
             text_filters.append("ProjectPath = @project_filter")
             params["project_filter"] = project_filter
             types["project_filter"] = param_types.STRING
+        if date_from:
+            vector_filters.append("Timestamp >= @date_from")
+            text_filters.append("Timestamp >= @date_from")
+            params["date_from"] = date_from
+            types["date_from"] = param_types.TIMESTAMP
+        if date_to:
+            vector_filters.append("Timestamp <= @date_to")
+            text_filters.append("Timestamp <= @date_to")
+            params["date_to"] = date_to
+            types["date_to"] = param_types.TIMESTAMP
 
-        filters_use_unstored_columns = bool(project_filter)
+        filters_use_unstored_columns = bool(project_filter or date_from or date_to)
         distance_expr = self._vector_distance_sql(
             filters_use_unstored_columns=filters_use_unstored_columns
         )
@@ -2033,7 +2129,11 @@ class SpannerStore:
                 "ann" if self._can_use_ann(False) else "exact",
             )
             fallback_results = self.search(
-                query_vector=query_vector, limit=limit, project_filter=project_filter
+                query_vector=query_vector,
+                limit=limit,
+                project_filter=project_filter,
+                date_from=date_from,
+                date_to=date_to,
             )
             for result in fallback_results:
                 result["_search_type"] = "vector"
@@ -2056,11 +2156,21 @@ class SpannerStore:
         query_vector: list[float],
         limit: int = 10,
         project_filter: str | None = None,
+        date_from: dt | None = None,
+        date_to: dt | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search asynchronously."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, lambda: self.hybrid_search(query, query_vector, limit, project_filter)
+            None,
+            lambda: self.hybrid_search(
+                query=query,
+                query_vector=query_vector,
+                limit=limit,
+                project_filter=project_filter,
+                date_from=date_from,
+                date_to=date_to,
+            ),
         )
 
     def _row_to_result(self, row: Any) -> dict[str, Any]:
