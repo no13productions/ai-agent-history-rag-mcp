@@ -1,5 +1,6 @@
 """Regression tests for Spanner backend status/search call paths."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -549,3 +550,38 @@ async def test_dashboard_html_bootstraps_without_bearer_auth(monkeypatch):
 
     assert response.status == 200
     assert "text/html" in response.content_type
+
+
+def test_local_status_auth_headers_uses_shared_psk(monkeypatch, tmp_path):
+    """The in-process status snapshot must Bearer the shared daemon PSK when auth is on.
+
+    Without this header the daemon returns 401 and the snapshot falls back to the idle
+    MCP process's own watchers, reporting watcher_running False even while the daemon runs.
+    """
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps({"active": {"key_plain": "shared-psk-123"}}))
+    monkeypatch.setattr(settings, "auth_enabled", True)
+    monkeypatch.setattr(settings, "server_psk", "")
+    monkeypatch.setattr(settings, "auth_state_path", auth_file)
+
+    assert server_module._local_status_auth_headers() == {
+        "Authorization": "Bearer shared-psk-123"
+    }
+
+
+def test_local_status_auth_headers_prefers_env_override(monkeypatch, tmp_path):
+    """An explicit server_psk env override should win over the auth-state file."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps({"active": {"key_plain": "file-psk"}}))
+    monkeypatch.setattr(settings, "auth_enabled", True)
+    monkeypatch.setattr(settings, "server_psk", "env-psk")
+    monkeypatch.setattr(settings, "auth_state_path", auth_file)
+
+    assert server_module._local_status_auth_headers() == {"Authorization": "Bearer env-psk"}
+
+
+def test_local_status_auth_headers_empty_when_auth_disabled(monkeypatch):
+    """No Authorization header should be sent when auth is disabled."""
+    monkeypatch.setattr(settings, "auth_enabled", False)
+
+    assert server_module._local_status_auth_headers() == {}
