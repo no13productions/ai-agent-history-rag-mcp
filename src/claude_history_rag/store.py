@@ -1905,7 +1905,6 @@ class SpannerStore:
         filters = ["Vector IS NOT NULL"]
         params: dict[str, Any] = {
             "query_vector": [float(v) for v in query_vector],
-            "limit": limit,
         }
         try:
             from google.cloud.spanner_v1 import param_types
@@ -1913,7 +1912,6 @@ class SpannerStore:
             raise RuntimeError("google-cloud-spanner is required") from e
         types: dict[str, Any] = {
             "query_vector": param_types.Array(param_types.FLOAT32),
-            "limit": param_types.INT64,
         }
         if project_filter:
             filters.append("ProjectPath = @project_filter")
@@ -1956,7 +1954,7 @@ class SpannerStore:
             FROM {table_source}
             WHERE {" AND ".join(filters)}
             ORDER BY Distance ASC
-            LIMIT @limit
+            LIMIT {int(limit)}
         """
         with database.snapshot() as snapshot:
             rows = list(snapshot.execute_sql(sql, params=params, param_types=types))
@@ -2034,11 +2032,15 @@ class SpannerStore:
         database = self.connect()
         vector_filters = ["Vector IS NOT NULL"]
         text_filters = [f"SEARCH({SPANNER_CONTENT_TOKENS_COLUMN}, @query)"]
+        # ANN vector index requires the ORDER BY APPROX_*_DISTANCE ... LIMIT to be a
+        # constant literal; a bound @limit parameter silently disqualifies the vector
+        # index and forces an exhaustive full-table KNN scan (72k+ ms over 772k rows).
+        # These are validated ints, so f-string interpolation is injection-safe.
+        candidate_limit = max(int(limit), int(settings.spanner_hybrid_candidate_limit))
+        result_limit = int(limit)
         params: dict[str, Any] = {
             "query": query,
             "query_vector": [float(v) for v in query_vector],
-            "limit": limit,
-            "candidate_limit": max(limit, settings.spanner_hybrid_candidate_limit),
             "rrf_k": float(settings.spanner_rrf_k),
         }
         try:
@@ -2048,8 +2050,6 @@ class SpannerStore:
         types: dict[str, Any] = {
             "query": param_types.STRING,
             "query_vector": param_types.Array(param_types.FLOAT32),
-            "limit": param_types.INT64,
-            "candidate_limit": param_types.INT64,
             "rrf_k": param_types.FLOAT64,
         }
         if project_filter:
@@ -2084,7 +2084,7 @@ class SpannerStore:
                     FROM {vector_table_source}
                     WHERE {" AND ".join(vector_filters)}
                     ORDER BY {distance_expr} ASC
-                    LIMIT @candidate_limit
+                    LIMIT {candidate_limit}
                 )) AS chunk_id WITH OFFSET AS rank
             ),
             TextCandidates AS (
@@ -2094,7 +2094,7 @@ class SpannerStore:
                     FROM {SPANNER_TABLE_NAME}
                     WHERE {" AND ".join(text_filters)}
                     ORDER BY SCORE({SPANNER_CONTENT_TOKENS_COLUMN}, @query) DESC
-                    LIMIT @candidate_limit
+                    LIMIT {candidate_limit}
                 )) AS chunk_id WITH OFFSET AS rank
             ),
             FusedCandidates AS (
@@ -2113,7 +2113,7 @@ class SpannerStore:
             FROM FusedCandidates f
             JOIN {SPANNER_TABLE_NAME} c ON c.Id = f.Id
             ORDER BY f.Score DESC
-            LIMIT @limit
+            LIMIT {result_limit}
         """
         try:
             with database.snapshot() as snapshot:
