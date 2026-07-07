@@ -99,6 +99,17 @@ class StatusCollector:
             settings.storage_backend == "spanner" and settings.spanner_embedding_mode == "spanner"
         )
 
+    def _get_cached_store_stats(self) -> dict[str, Any] | None:
+        """Return the store's last stats snapshot when the backend exposes one."""
+        cached = getattr(store, "_stats_cache", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and isinstance(cached[1], dict)
+        ):
+            return cached[1]
+        return None
+
     async def collect_status(self, detail_level: str = "full") -> dict[str, Any]:
         """Collect comprehensive server status.
 
@@ -176,12 +187,17 @@ class StatusCollector:
 
         # Database check
         try:
-            # get_stats() can perform a Spanner count scan on cache miss; keep
-            # status collection off the event loop just like full database stats.
-            stats = await store.get_stats_async()
+            stats = self._get_cached_store_stats()
+            stats_source = "cache"
+            if stats is None:
+                # get_stats() can perform a Spanner count scan on cache miss; keep
+                # status collection off the event loop and bound the health probe.
+                stats = await asyncio.wait_for(store.get_stats_async(), timeout=2.0)
+                stats_source = "fresh"
             checks["database"] = {
                 "status": "ok",
                 "chunks": stats.get("total_chunks", 0),
+                "stats_source": stats_source,
             }
             if stats.get("error"):
                 checks["database"] = {
