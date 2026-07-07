@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +119,22 @@ class AsyncOnlyStatsStore(FakeSpannerStore):
 
     def get_stats(self) -> dict:
         raise AssertionError("health status must use get_stats_async")
+
+
+class CachedStatsOnlyStore(AsyncOnlyStatsStore):
+    def __init__(self):
+        super().__init__()
+        self._stats_cache = (
+            time.monotonic() - 3600,
+            {
+                "total_chunks": 42,
+                "backend": "spanner",
+                "fts_index_available": True,
+            },
+        )
+
+    async def get_stats_async(self) -> dict:
+        raise AssertionError("health status should use cached stats")
 
 
 class CapturingStore:
@@ -312,6 +329,19 @@ async def test_health_status_uses_async_store_stats(monkeypatch):
 
     assert fake_store.async_stats_called is True
     assert status["checks"]["database"]["chunks"] == 7
+    assert status["checks"]["database"]["stats_source"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_health_status_uses_cached_store_stats(monkeypatch):
+    """Basic status should stay responsive when exact Spanner stats are slow."""
+    fake_store = CachedStatsOnlyStore()
+    monkeypatch.setattr("claude_history_rag.status.store", fake_store)
+
+    status = await StatusCollector()._get_health_status()
+
+    assert status["checks"]["database"]["chunks"] == 42
+    assert status["checks"]["database"]["stats_source"] == "cache"
 
 
 @pytest.mark.asyncio
