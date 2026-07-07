@@ -176,7 +176,9 @@ class StatusCollector:
 
         # Database check
         try:
-            stats = store.get_stats()
+            # get_stats() can perform a Spanner count scan on cache miss; keep
+            # status collection off the event loop just like full database stats.
+            stats = await store.get_stats_async()
             checks["database"] = {
                 "status": "ok",
                 "chunks": stats.get("total_chunks", 0),
@@ -325,9 +327,11 @@ class StatusCollector:
         """Get indexing progress and status."""
         try:
             watchers = get_all_watchers()
+            loop = asyncio.get_running_loop()
             source_status: dict[str, dict[str, Any]] = {}
             for source_watcher in watchers:
-                discovered = len(source_watcher.discover_files())
+                # Recursive discovery can traverse thousands of history files.
+                discovered = len(await loop.run_in_executor(None, source_watcher.discover_files))
                 indexed = len(source_watcher.state.get_all_files())
                 source_status[source_watcher.source_name] = {
                     "files_discovered": discovered,

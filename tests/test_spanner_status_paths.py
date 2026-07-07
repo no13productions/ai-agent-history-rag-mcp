@@ -1,6 +1,7 @@
 """Regression tests for Spanner backend status/search call paths."""
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +49,9 @@ class FakeWatcher:
     failed_files_count = 0
 
     def get_watched_files(self):
+        return []
+
+    def discover_files(self):
         return []
 
 
@@ -103,12 +107,41 @@ class FakeSpannerStore:
         return [{"id": "chunk-1", "content": "content", "score": 0.1}]
 
 
+class AsyncOnlyStatsStore(FakeSpannerStore):
+    def __init__(self):
+        super().__init__()
+        self.async_stats_called = False
+
+    async def get_stats_async(self) -> dict:
+        self.async_stats_called = True
+        return FakeSpannerStore.get_stats(self)
+
+    def get_stats(self) -> dict:
+        raise AssertionError("health status must use get_stats_async")
+
+
 class CapturingStore:
     def __init__(self):
         self.chunks: list[dict] = []
 
     async def add_chunks_async(self, chunks: list[dict]) -> None:
         self.chunks.extend(chunks)
+
+
+class ThreadCheckingWatcher(FakeWatcher):
+    def __init__(self, event_loop_thread_id: int):
+        self.event_loop_thread_id = event_loop_thread_id
+        self.discover_thread_id: int | None = None
+        self.state = SimpleNamespace(get_all_files=lambda: ["/tmp/history/session.jsonl"])
+        self.queue = SimpleNamespace(qsize=lambda: 0, maxsize=10)
+
+    def discover_files(self):
+        self.discover_thread_id = threading.get_ident()
+        assert self.discover_thread_id != self.event_loop_thread_id
+        return ["/tmp/history/session.jsonl"]
+
+    def failed_files(self):
+        return []
 
 
 async def _no_daemon_status(*args, **kwargs):
@@ -267,6 +300,31 @@ async def test_status_collector_spanner_database_stats_are_backend_specific(monk
     assert stats["vector_search_mode"] == "ann"
     assert "database_path" not in stats
     assert "database_size_bytes" not in stats
+
+
+@pytest.mark.asyncio
+async def test_health_status_uses_async_store_stats(monkeypatch):
+    """Basic status health must not run synchronous Spanner stats on the event loop."""
+    fake_store = AsyncOnlyStatsStore()
+    monkeypatch.setattr("claude_history_rag.status.store", fake_store)
+
+    status = await StatusCollector()._get_health_status()
+
+    assert fake_store.async_stats_called is True
+    assert status["checks"]["database"]["chunks"] == 7
+
+
+@pytest.mark.asyncio
+async def test_indexing_status_discovers_files_off_event_loop(monkeypatch):
+    """Full status indexing discovery must not block the status server event loop."""
+    watcher = ThreadCheckingWatcher(threading.get_ident())
+    monkeypatch.setattr("claude_history_rag.status.get_all_watchers", lambda: [watcher])
+
+    status = await StatusCollector()._get_indexing_status()
+
+    assert watcher.discover_thread_id is not None
+    assert status["files_discovered"] == 1
+    assert status["sources"]["Claude Code"]["files_pending"] == 0
 
 
 @pytest.mark.asyncio
