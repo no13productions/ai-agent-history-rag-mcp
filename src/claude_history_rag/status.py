@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 # Global start time for uptime calculation
 _start_time = time.time()
 _start_datetime = datetime.now(timezone.utc)
-HEALTH_STATS_TIMEOUT_SECONDS = 2.0
-FULL_STATS_TIMEOUT_SECONDS = 2.0
+HEALTH_STATS_TIMEOUT_SECONDS = 1.0
+FULL_STATS_TIMEOUT_SECONDS = 1.0
 FAILED_FILES_STATUS_LIMIT = 20
 
 
