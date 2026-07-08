@@ -1131,6 +1131,14 @@ class SpannerStore:
         self._instance = None
         self._database = None
         self._lock = threading.Lock()
+        self._schema_lock = threading.Lock()
+        self._filter_indexes_lock = threading.Lock()
+        self._search_schema_lock = threading.Lock()
+        self._embedding_model_lock = threading.Lock()
+        self._schema_ready = False
+        self._filter_indexes_ready = False
+        self._search_schema_ready = False
+        self._embedding_model_ready = False
         # Single TTL cache for the whole get_stats result. Single-flighted so concurrent status
         # polls don't all run the scan, and so the embed-rate sample below advances exactly once
         # per real recompute.
@@ -1187,9 +1195,19 @@ class SpannerStore:
             )
             self._instance = self._client.instance(self.instance_id)
             self._database = self._instance.database(self.database_id)
-            if self.create_schema:
-                self.ensure_schema()
             return self._database
+
+    def initialize_schema(self) -> None:
+        """Run schema/model initialization explicitly during startup or migration."""
+        if not self.create_schema:
+            return
+        self.connect()
+        self.ensure_schema()
+
+    async def initialize_schema_async(self) -> None:
+        """Run startup schema/model initialization off the event loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.initialize_schema)
 
     def ensure_database(self) -> None:
         """Create the configured Spanner database when it does not exist."""
@@ -1244,18 +1262,27 @@ class SpannerStore:
 
     def ensure_schema(self) -> None:
         """Create Spanner tables/indexes required by this backend if missing."""
-        database = self._database
-        if database is None:
+        if self._schema_ready:
             return
-        if self._table_exists(SPANNER_TABLE_NAME):
-            self.ensure_filter_indexes()
-            self.ensure_search_schema()
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            database = self._database
+            if database is None:
+                return
+            if self._table_exists(SPANNER_TABLE_NAME):
+                self.ensure_filter_indexes()
+                self.ensure_search_schema()
+                self.ensure_embedding_model()
+                self._schema_ready = True
+                return
+            operation = database.update_ddl(get_spanner_schema_ddl())
+            operation.result()
+            logger.info("Created Spanner schema for %s", SPANNER_TABLE_NAME)
+            self._filter_indexes_ready = True
+            self._search_schema_ready = settings.spanner_enable_full_text
             self.ensure_embedding_model()
-            return
-        operation = database.update_ddl(get_spanner_schema_ddl())
-        operation.result()
-        logger.info("Created Spanner schema for %s", SPANNER_TABLE_NAME)
-        self.ensure_embedding_model()
+            self._schema_ready = True
 
     def _run_ddl(self, ddl: str, description: str) -> bool:
         """Run one DDL statement and treat already-existing objects as success."""
@@ -1273,7 +1300,7 @@ class SpannerStore:
         try:
             operation = database.update_ddl([ddl])
             operation.result()
-            logger.info("Created Spanner %s", description)
+            logger.info("Ensured Spanner %s", description)
             return True
         except AlreadyExists:
             logger.info("Spanner %s already exists", description)
@@ -1287,50 +1314,70 @@ class SpannerStore:
 
     def ensure_filter_indexes(self) -> None:
         """Ensure secondary indexes used by search filters exist."""
-        timestamp_index = f"{SPANNER_TABLE_NAME}ByTimestamp"
-        if not self._index_exists(timestamp_index):
-            self._run_ddl(
-                f"CREATE INDEX {timestamp_index} ON {SPANNER_TABLE_NAME}(Timestamp)",
-                f"index {timestamp_index}",
-            )
-        project_timestamp_index = f"{SPANNER_TABLE_NAME}ByProjectTimestamp"
-        if not self._index_exists(project_timestamp_index):
-            self._run_ddl(
-                f"CREATE INDEX {project_timestamp_index} "
-                f"ON {SPANNER_TABLE_NAME}(ProjectPath, Timestamp)",
-                f"index {project_timestamp_index}",
-            )
+        if self._filter_indexes_ready:
+            return
+        with self._filter_indexes_lock:
+            if self._filter_indexes_ready:
+                return
+            timestamp_index = f"{SPANNER_TABLE_NAME}ByTimestamp"
+            if not self._index_exists(timestamp_index):
+                self._run_ddl(
+                    f"CREATE INDEX {timestamp_index} ON {SPANNER_TABLE_NAME}(Timestamp)",
+                    f"index {timestamp_index}",
+                )
+            project_timestamp_index = f"{SPANNER_TABLE_NAME}ByProjectTimestamp"
+            if not self._index_exists(project_timestamp_index):
+                self._run_ddl(
+                    f"CREATE INDEX {project_timestamp_index} "
+                    f"ON {SPANNER_TABLE_NAME}(ProjectPath, Timestamp)",
+                    f"index {project_timestamp_index}",
+                )
+            self._filter_indexes_ready = True
 
     def ensure_search_schema(self) -> None:
         """Ensure generated token column and full-text search index exist."""
         if not settings.spanner_enable_full_text:
             return
-        if not self._column_exists(SPANNER_TABLE_NAME, SPANNER_CONTENT_TOKENS_COLUMN):
-            self._run_ddl(
-                f"""
-                ALTER TABLE {SPANNER_TABLE_NAME}
-                ADD COLUMN {SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST
-                    AS (TOKENIZE_FULLTEXT(Content)) HIDDEN
-                """,
-                f"generated token column {SPANNER_CONTENT_TOKENS_COLUMN}",
-            )
-        if not self._index_exists(SPANNER_CONTENT_SEARCH_INDEX):
-            self._run_ddl(
-                f"""
-                CREATE SEARCH INDEX {SPANNER_CONTENT_SEARCH_INDEX}
-                ON {SPANNER_TABLE_NAME}({SPANNER_CONTENT_TOKENS_COLUMN})
-                """,
-                f"search index {SPANNER_CONTENT_SEARCH_INDEX}",
-            )
+        if self._search_schema_ready:
+            return
+        with self._search_schema_lock:
+            if self._search_schema_ready:
+                return
+            if not self._column_exists(SPANNER_TABLE_NAME, SPANNER_CONTENT_TOKENS_COLUMN):
+                self._run_ddl(
+                    f"""
+                    ALTER TABLE {SPANNER_TABLE_NAME}
+                    ADD COLUMN {SPANNER_CONTENT_TOKENS_COLUMN} TOKENLIST
+                        AS (TOKENIZE_FULLTEXT(Content)) HIDDEN
+                    """,
+                    f"generated token column {SPANNER_CONTENT_TOKENS_COLUMN}",
+                )
+            if not self._index_exists(SPANNER_CONTENT_SEARCH_INDEX):
+                self._run_ddl(
+                    f"""
+                    CREATE SEARCH INDEX {SPANNER_CONTENT_SEARCH_INDEX}
+                    ON {SPANNER_TABLE_NAME}({SPANNER_CONTENT_TOKENS_COLUMN})
+                    """,
+                    f"search index {SPANNER_CONTENT_SEARCH_INDEX}",
+                )
+            self._search_schema_ready = True
 
     def ensure_embedding_model(self) -> None:
         """Register the configured Gemini embedding model in Spanner when enabled."""
         if settings.spanner_embedding_mode != "spanner":
             return
-        self._run_ddl(
-            get_spanner_embedding_model_ddl(self.project or self._resolve_project()),
-            f"embedding model {settings.spanner_embedding_model_id}",
-        )
+        if self._embedding_model_ready:
+            return
+        with self._embedding_model_lock:
+            if self._embedding_model_ready:
+                return
+            if self._database is None:
+                self.connect()
+            if self._run_ddl(
+                get_spanner_embedding_model_ddl(self.project or self._resolve_project()),
+                f"embedding model {settings.spanner_embedding_model_id}",
+            ):
+                self._embedding_model_ready = True
 
     def _table_exists(self, table_name: str) -> bool:
         """Return whether a table exists in the configured Spanner database."""
@@ -1615,7 +1662,6 @@ class SpannerStore:
         except ImportError as e:
             raise RuntimeError("google-cloud-spanner is required") from e
 
-        self.ensure_embedding_model()
         database = self.connect()
         sql = self._batched_insert_with_spanner_embedding_sql()
         params = {
@@ -1766,7 +1812,6 @@ class SpannerStore:
         split count (which caps partitioned DML on a freshly loaded table). Idempotent and
         re-runnable (WHERE Vector IS NULL). Returns the rows embedded; 0 when none need it.
         """
-        self.ensure_embedding_model()
         self.connect()
         prefixes = [f"{value:02x}" for value in range(256)]
         concurrency = settings.spanner_backfill_concurrency
@@ -1852,7 +1897,6 @@ class SpannerStore:
         """Generate a query embedding inside Spanner via ML.PREDICT."""
         if not query.strip():
             raise ValueError("Query cannot be empty")
-        self.ensure_embedding_model()
         database = self.connect()
         sql = f"""
             SELECT {self._embedding_vector_sql("@query", "@task_type")} AS Vector
