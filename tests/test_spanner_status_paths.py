@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from claude_history_rag import server as server_module
+from claude_history_rag import status as status_module
 from claude_history_rag.api_client import _redact_url
 from claude_history_rag.config import settings
 from claude_history_rag.models import (
@@ -28,6 +29,7 @@ from claude_history_rag.status_server import (
     _server_chunk_id,
     _validate_upload_chunks,
 )
+from claude_history_rag.store import STATS_CACHE_TTL
 from claude_history_rag.watcher import (
     HistoryWatcher,
     _count_file_lines,
@@ -263,6 +265,13 @@ def _single_chunker(file_path, start_line=0):
         parent_chunk_id="parent-1",
         child_chunk_ids=["child-1"],
     )
+
+
+def test_status_timeouts_cover_one_spanner_stats_cache_window():
+    """Live Spanner first-hit status should have enough budget to fill the stats cache."""
+    assert status_module.HEALTH_STATS_TIMEOUT_SECONDS >= STATS_CACHE_TTL
+    assert status_module.FULL_STATS_TIMEOUT_SECONDS >= STATS_CACHE_TTL
+    assert status_module.FTS_CHECK_TIMEOUT_SECONDS >= STATS_CACHE_TTL
 
 
 @pytest.mark.asyncio
