@@ -55,7 +55,7 @@ else
         <string>$PROJECT_DIR</string>
         <string>run</string>
         <string>ai-agent-history-rag-daemon</string>
-        <string>start</string>
+        <string>supervise</string>
     </array>
 
     <key>EnvironmentVariables</key>

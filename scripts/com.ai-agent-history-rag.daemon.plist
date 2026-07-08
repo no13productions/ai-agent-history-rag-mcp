@@ -12,7 +12,7 @@
         <string>/path/to/ai-agent-history-rag-mcp</string>
         <string>run</string>
         <string>ai-agent-history-rag-daemon</string>
-        <string>start</string>
+        <string>supervise</string>
     </array>
 
     <key>EnvironmentVariables</key>

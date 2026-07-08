@@ -42,7 +42,7 @@ if ($existingTask) {
 }
 
 # Build the command arguments
-$Arguments = "--directory `"$ProjectDir`" run ai-agent-history-rag-daemon start"
+$Arguments = "--directory `"$ProjectDir`" run ai-agent-history-rag-daemon supervise"
 
 # Create the scheduled task action
 $Action = New-ScheduledTaskAction -Execute $UvPath -Argument $Arguments -WorkingDirectory $ProjectDir
