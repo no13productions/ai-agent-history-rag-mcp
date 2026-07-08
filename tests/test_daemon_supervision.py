@@ -35,6 +35,7 @@ def test_supervise_replaces_pid_file_daemon_before_foreground_run(monkeypatch, c
     calls: list[tuple[str, int | None]] = []
 
     monkeypatch.setattr(daemon, "is_daemon_running", lambda: (True, 1234))
+    monkeypatch.setattr(daemon, "_find_history_mcp_worker_pids", lambda: [])
 
     def fake_terminate(pid):
         calls.append(("terminate", pid))
@@ -56,6 +57,7 @@ def test_supervise_fails_closed_when_existing_daemon_cannot_stop(monkeypatch, ca
     """A supervisor must not start a second daemon if the old owner survives."""
     monkeypatch.setattr(daemon, "is_daemon_running", lambda: (True, 1234))
     monkeypatch.setattr(daemon, "terminate_daemon_process", lambda pid: False)
+    monkeypatch.setattr(daemon, "_find_history_mcp_worker_pids", lambda: [])
 
     def fail_run():
         raise AssertionError("supervise must not run while the old daemon is alive")
@@ -64,6 +66,87 @@ def test_supervise_fails_closed_when_existing_daemon_cannot_stop(monkeypatch, ca
 
     assert daemon.cmd_supervise(SimpleNamespace()) == 1
     assert "Failed to stop existing daemon (PID 1234)" in capsys.readouterr().out
+
+
+def test_supervise_cleans_stale_mcp_workers_before_foreground_run(monkeypatch, capsys):
+    """Service-manager restarts should clean same-checkout lightweight MCP workers."""
+    calls: list[tuple[str, list[int] | None]] = []
+
+    monkeypatch.setattr(daemon, "is_daemon_running", lambda: (False, None))
+    monkeypatch.setattr(daemon, "_find_history_mcp_worker_pids", lambda: [111, 222])
+
+    def fake_terminate(pids):
+        calls.append(("terminate_workers", pids))
+        return True
+
+    def fake_run():
+        calls.append(("run", None))
+        return 0
+
+    monkeypatch.setattr(daemon, "terminate_worker_processes", fake_terminate)
+    monkeypatch.setattr(daemon, "_run_foreground_daemon", fake_run)
+
+    assert daemon.cmd_supervise(SimpleNamespace()) == 0
+    assert calls == [("terminate_workers", [111, 222]), ("run", None)]
+    assert "Stopping stale MCP worker processes" in capsys.readouterr().out
+
+
+def test_supervise_fails_closed_when_stale_mcp_workers_survive(monkeypatch, capsys):
+    """A supervisor must not run if stale workers cannot be cleaned up."""
+    monkeypatch.setattr(daemon, "is_daemon_running", lambda: (False, None))
+    monkeypatch.setattr(daemon, "_find_history_mcp_worker_pids", lambda: [111])
+    monkeypatch.setattr(daemon, "terminate_worker_processes", lambda pids: False)
+
+    def fail_run():
+        raise AssertionError("supervise must not run while stale MCP workers survive")
+
+    monkeypatch.setattr(daemon, "_run_foreground_daemon", fail_run)
+
+    assert daemon.cmd_supervise(SimpleNamespace()) == 1
+    assert "Failed to stop stale MCP worker processes" in capsys.readouterr().out
+
+
+def test_find_history_mcp_worker_pids_excludes_daemon_and_other_checkouts(monkeypatch, tmp_path):
+    """Only same-checkout lightweight MCP workers are cleanup targets."""
+    project_root = tmp_path / "AI-HISTORY-RAG"
+
+    class FakeProcess:
+        def __init__(self, pid: int, cmdline: list[str]):
+            self.info = {"pid": pid, "cmdline": cmdline}
+
+    class FakePsutil:
+        @staticmethod
+        def process_iter(attrs):
+            return [
+                FakeProcess(101, [str(project_root / ".venv/bin/ai-agent-history-rag")]),
+                FakeProcess(
+                    102,
+                    [
+                        "/Users/brandon/.local/bin/uv",
+                        "--directory",
+                        str(project_root),
+                        "run",
+                        "ai-agent-history-rag",
+                    ],
+                ),
+                FakeProcess(
+                    103,
+                    [
+                        "/Users/brandon/.local/bin/uv",
+                        "--directory",
+                        str(project_root),
+                        "run",
+                        "ai-agent-history-rag-daemon",
+                        "supervise",
+                    ],
+                ),
+                FakeProcess(104, ["/other/install/.venv/bin/ai-agent-history-rag"]),
+            ]
+
+    monkeypatch.setattr(daemon.os, "getpid", lambda: 999)
+    monkeypatch.setitem(daemon.sys.modules, "psutil", FakePsutil)
+
+    assert daemon._find_history_mcp_worker_pids(project_root) == [101, 102]
 
 
 def test_stop_uses_shared_daemon_termination_path(monkeypatch, capsys):

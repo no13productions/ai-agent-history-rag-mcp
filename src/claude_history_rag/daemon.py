@@ -58,6 +58,45 @@ def _pid_is_history_daemon(pid: int) -> bool:
     return "ai-agent-history-rag-daemon" in command or "claude_history_rag.daemon" in command
 
 
+def _command_belongs_to_project(command: str, project_root: Path) -> bool:
+    """Return whether a command points at this checkout."""
+    return str(project_root) in command
+
+
+def _find_history_mcp_worker_pids(project_root: Path | None = None) -> list[int]:
+    """Find lightweight MCP worker processes launched from this checkout.
+
+    The launchd-owned daemon is the only process that should keep watchers and
+    the status listener alive. Historical MCP worker processes are lightweight
+    stdio clients; when their parent client disappears they can linger and make
+    process-shape proof noisy. Limit cleanup to this checkout so another install
+    is never swept up by accident.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    root = project_root or Path.cwd()
+    current_pid = os.getpid()
+    worker_pids: list[int] = []
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        pid = process.info.get("pid")
+        if pid in {None, current_pid}:
+            continue
+        cmdline = process.info.get("cmdline") or []
+        command = " ".join(cmdline)
+        if not command:
+            continue
+        if not _command_belongs_to_project(command, root):
+            continue
+        if "ai-agent-history-rag-daemon" in command or "claude_history_rag.daemon" in command:
+            continue
+        if "ai-agent-history-rag" in command or "claude_history_rag.__main__" in command:
+            worker_pids.append(int(pid))
+    return sorted(set(worker_pids))
+
+
 def is_daemon_running() -> tuple[bool, int | None]:
     """Check if daemon is already running.
 
@@ -149,6 +188,40 @@ def terminate_daemon_process(
     return False
 
 
+def terminate_worker_processes(
+    pids: list[int],
+    *,
+    timeout_seconds: float = 5.0,
+    kill_timeout_seconds: float = 3.0,
+) -> bool:
+    """Terminate same-checkout lightweight MCP workers."""
+    targets = sorted({pid for pid in pids if pid != os.getpid()})
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            logger.error("Permission denied to stop MCP worker PID %s", pid)
+            return False
+
+    survivors = [pid for pid in targets if not _wait_for_pid_exit(pid, timeout_seconds)]
+    for pid in survivors:
+        logger.warning("MCP worker PID %s did not stop after SIGTERM; sending SIGKILL", pid)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            logger.error("Permission denied to kill MCP worker PID %s", pid)
+            return False
+
+    remaining = [pid for pid in survivors if not _wait_for_pid_exit(pid, kill_timeout_seconds)]
+    for pid in remaining:
+        logger.error("MCP worker PID %s survived SIGKILL", pid)
+    return not remaining
+
+
 async def periodic_optimize(stop_event: asyncio.Event) -> None:
     """Periodically optimize the database (server mode only)."""
     from claude_history_rag.store import store
@@ -219,9 +292,6 @@ async def run_daemon():
 
         # Initialize status collector early so errors can be recorded
         await get_status_collector()
-        initialize_schema = getattr(store, "initialize_schema_async", None)
-        if initialize_schema is not None:
-            await initialize_schema()
         cache = get_search_cache()
     else:
         # Client mode - log connection info
@@ -244,6 +314,10 @@ async def run_daemon():
                 )
             except Exception as e:
                 logger.error(f"Failed to start status server: {e}", exc_info=True)
+
+            initialize_schema = getattr(store, "initialize_schema_async", None)
+            if initialize_schema is not None:
+                await initialize_schema()
 
         # Start the embedding backfill BEFORE the (blocking) startup sync so vectors fill
         # concurrently with ingest, not only after the whole backlog has finished landing.
@@ -489,6 +563,14 @@ def cmd_supervise(args):
         print(f"Replacing existing daemon (PID {pid}) before supervised start")
         if not terminate_daemon_process(pid):
             print(f"Failed to stop existing daemon (PID {pid})")
+            return 1
+
+    worker_pids = _find_history_mcp_worker_pids()
+    if worker_pids:
+        joined_pids = ", ".join(str(pid) for pid in worker_pids)
+        print(f"Stopping stale MCP worker processes before supervised start: {joined_pids}")
+        if not terminate_worker_processes(worker_pids):
+            print("Failed to stop stale MCP worker processes")
             return 1
 
     return _run_foreground_daemon()
