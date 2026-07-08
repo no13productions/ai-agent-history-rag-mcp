@@ -17,21 +17,86 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-        <!-- Client mode: uncomment and set your server URL -->
-        <!--
-        <key>CLAUDE_HISTORY_RAG_SERVER_URL</key>
-        <string>http://your-server:8765</string>
+        <key>CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT</key>
+        <string>production</string>
+        <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
+        <string>spanner</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
+        <string>jeeves-486102</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_INSTANCE</key>
+        <string>jeeves-rg-spanner-prod-4d0e4c43</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_DATABASE</key>
+        <string>ai-agent-history-rag</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE</key>
+        <string>spanner</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID</key>
+        <string>ConversationEmbeddingModel</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_DEFER_EMBEDDINGS</key>
+        <string>true</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_CONCURRENCY</key>
+        <string>16</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_BATCH_SIZE</key>
+        <string>200</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_INTERVAL_SECONDS</key>
+        <string>30</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_RPC_BATCH_SIZE</key>
+        <string>10</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER</key>
+        <string>vertex</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_MODEL</key>
+        <string>gemini-embedding-001</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION</key>
+        <string>3072</string>
+        <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST</key>
+        <string>127.0.0.1</string>
+        <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT</key>
+        <string>4680</string>
+        <key>CLAUDE_HISTORY_RAG_PROJECTS_PATH</key>
+        <string>__HOME__/.claude/projects</string>
+        <key>CLAUDE_HISTORY_RAG_CODEX_SESSIONS_PATH</key>
+        <string>__HOME__/.codex/sessions</string>
+        <key>CLAUDE_HISTORY_RAG_GEMINI_SESSIONS_PATH</key>
+        <string>__HOME__/.gemini/tmp</string>
+        <key>CLAUDE_HISTORY_RAG_ANTIGRAVITY_SESSIONS_PATH</key>
+        <string>__HOME__/.gemini/antigravity</string>
+        <key>CLAUDE_HISTORY_RAG_CHATGPT_EXPORTS_PATH</key>
+        <string>__HOME__/.claude-history-rag/imports/chatgpt</string>
+        <key>CLAUDE_HISTORY_RAG_CLAUDE_APP_EXPORTS_PATH</key>
+        <string>__HOME__/.claude-history-rag/imports/claude-app</string>
+        <key>CLAUDE_HISTORY_RAG_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/state.json</string>
+        <key>CLAUDE_HISTORY_RAG_CODEX_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/codex_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_GEMINI_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/gemini_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_ANTIGRAVITY_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/antigravity_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_CHATGPT_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/chatgpt_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_CLAUDE_APP_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/claude_app_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_AUTH_ENABLED</key>
+        <string>true</string>
+        <key>CLAUDE_HISTORY_RAG_AUTH_STATE_PATH</key>
+        <string>__HOME__/.claude-history-rag/auth.json</string>
+        <key>CLAUDE_HISTORY_RAG_CLIENT_AUTH_PATH</key>
+        <string>__HOME__/.claude-history-rag/client_auth.json</string>
         <key>CLAUDE_HISTORY_RAG_MACHINE_ID</key>
-        <string>my-mac</string>
-        -->
-
-        <!-- Server mode: configure embedding server -->
-        <key>CLAUDE_RAG_EMBEDDING_BASE_URL</key>
-        <string>http://localhost:11434/v1</string>
-        <key>CLAUDE_RAG_EMBEDDING_MODEL</key>
-        <string>nomic-embed-text</string>
-        <key>CLAUDE_RAG_BATCH_SIZE</key>
-        <string>32</string>
+        <string>mac-mini</string>
+        <key>CLAUDE_HISTORY_RAG_CLIENT_NAME</key>
+        <string>Brandon Mac Mini</string>
+        <key>CLOUDSDK_CONFIG</key>
+        <string>__HOME__/.config/gcloud</string>
+        <key>CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE</key>
+        <string>__HOME__/Meridian/alfred-sa-key.json</string>
+        <key>GOOGLE_APPLICATION_CREDENTIALS</key>
+        <string>__HOME__/Meridian/alfred-sa-key.json</string>
+        <key>GOOGLE_CLOUD_PROJECT</key>
+        <string>jeeves-486102</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <key>RunAtLoad</key>

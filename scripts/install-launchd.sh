@@ -60,10 +60,34 @@ else
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>CLAUDE_RAG_EMBEDDING_BASE_URL</key>
-        <string>http://localhost:11434/v1</string>
-        <key>CLAUDE_RAG_EMBEDDING_MODEL</key>
-        <string>nomic-embed-text</string>
+        <key>CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT</key>
+        <string>production</string>
+        <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
+        <string>spanner</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
+        <string>jeeves-486102</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_INSTANCE</key>
+        <string>jeeves-rg-spanner-prod-4d0e4c43</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_DATABASE</key>
+        <string>ai-agent-history-rag</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE</key>
+        <string>spanner</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID</key>
+        <string>ConversationEmbeddingModel</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER</key>
+        <string>vertex</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_MODEL</key>
+        <string>gemini-embedding-001</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION</key>
+        <string>3072</string>
+        <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST</key>
+        <string>127.0.0.1</string>
+        <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT</key>
+        <string>4680</string>
+        <key>GOOGLE_APPLICATION_CREDENTIALS</key>
+        <string>$HOME/Meridian/alfred-sa-key.json</string>
+        <key>GOOGLE_CLOUD_PROJECT</key>
+        <string>jeeves-486102</string>
     </dict>
 
     <key>RunAtLoad</key>

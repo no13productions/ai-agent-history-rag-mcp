@@ -360,6 +360,22 @@ async def test_status_collector_spanner_database_stats_are_backend_specific(monk
     assert "database_size_bytes" not in stats
 
 
+def test_status_configuration_hides_lancedb_path_for_spanner(monkeypatch):
+    """Production status must not present local LanceDB as the active Spanner data store."""
+    monkeypatch.setattr(settings, "storage_backend", "spanner")
+    monkeypatch.setattr(settings, "spanner_project", "jeeves-486102")
+    monkeypatch.setattr(settings, "spanner_instance", "jeeves-rg-spanner-prod-4d0e4c43")
+    monkeypatch.setattr(settings, "spanner_database", "ai-agent-history-rag")
+
+    configuration = StatusCollector()._get_configuration()
+
+    assert configuration["storage_backend"] == "spanner"
+    assert configuration["spanner_database"] == "ai-agent-history-rag"
+    assert "db_path" not in configuration
+    assert configuration["chatgpt_exports_path"].endswith("/imports/chatgpt")
+    assert configuration["claude_app_exports_path"].endswith("/imports/claude-app")
+
+
 @pytest.mark.asyncio
 async def test_health_status_uses_async_store_stats(monkeypatch):
     """Basic status health must not run synchronous Spanner stats on the event loop."""
