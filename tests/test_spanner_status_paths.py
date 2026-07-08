@@ -147,6 +147,22 @@ class SlowStatsStore(FakeSpannerStore):
         return FakeSpannerStore.get_stats(self)
 
 
+class SlowFTSStore(FakeSpannerStore):
+    def __init__(self):
+        super().__init__()
+        self._stats_cache = (
+            time.monotonic(),
+            {
+                "total_chunks": 42,
+                "backend": "spanner",
+            },
+        )
+
+    def has_fts_index(self) -> bool:
+        time.sleep(0.05)
+        return True
+
+
 class CapturingStore:
     def __init__(self):
         self.chunks: list[dict] = []
@@ -398,6 +414,23 @@ async def test_full_database_status_degrades_on_stats_timeout(monkeypatch):
     assert status["status"] == "degraded"
     assert status["stats_source"] == "timeout"
     assert "timed out" in status["degraded_reason"]
+
+
+@pytest.mark.asyncio
+async def test_health_status_degrades_on_fts_timeout(monkeypatch):
+    """Health must not block on a slow Spanner information_schema FTS check."""
+    monkeypatch.setattr("claude_history_rag.status.store", SlowFTSStore())
+    monkeypatch.setattr("claude_history_rag.status.FTS_CHECK_TIMEOUT_SECONDS", 0.01)
+
+    started = time.monotonic()
+    status = await StatusCollector()._get_health_status()
+
+    assert time.monotonic() - started < 0.5
+    assert status["status"] == "degraded"
+    assert status["checks"]["database"]["stats_source"] == "cache"
+    assert status["checks"]["fts_index"]["status"] == "degraded"
+    assert status["checks"]["fts_index"]["stats_source"] == "timeout"
+    assert "timed out" in status["checks"]["fts_index"]["degraded_reason"]
 
 
 @pytest.mark.asyncio
