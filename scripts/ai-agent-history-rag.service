@@ -19,7 +19,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/uv --directory %h/path/to/claude-history-rag-mcp run ai-agent-history-rag-daemon start
+ExecStart=%h/.local/bin/uv --directory %h/path/to/claude-history-rag-mcp run ai-agent-history-rag-daemon supervise
 Restart=on-failure
 RestartSec=10
 

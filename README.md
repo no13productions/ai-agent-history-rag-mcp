@@ -562,6 +562,10 @@ uv run ai-agent-history-rag --standalone
 
 ### Auto-start on Boot
 
+Auto-start services use `ai-agent-history-rag-daemon supervise`, which replaces
+any PID-file daemon before staying in the foreground for the service manager.
+Use `start` for manual foreground runs.
+
 #### macOS (launchd)
 
 ```bash

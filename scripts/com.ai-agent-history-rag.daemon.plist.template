@@ -12,7 +12,7 @@
         <string>__PROJECT_DIR__</string>
         <string>run</string>
         <string>ai-agent-history-rag-daemon</string>
-        <string>start</string>
+        <string>supervise</string>
     </array>
 
     <key>EnvironmentVariables</key>

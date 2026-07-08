@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from claude_history_rag.config import OPTIMIZE_INTERVAL, settings
@@ -29,6 +30,28 @@ logger = logging.getLogger(__name__)
 
 # PID file location
 PID_FILE = settings.db_path.parent / "daemon.pid"
+
+
+def _pid_is_history_daemon(pid: int) -> bool:
+    """Return whether a live PID looks like this daemon.
+
+    If psutil is unavailable or access is denied, fall back to the historical
+    PID-file behavior rather than falsely declaring the daemon absent.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return True
+
+    try:
+        process = psutil.Process(pid)
+        command = " ".join(process.cmdline())
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return True
+
+    return "ai-agent-history-rag-daemon" in command or "claude_history_rag.daemon" in command
 
 
 def is_daemon_running() -> tuple[bool, int | None]:
@@ -47,6 +70,9 @@ def is_daemon_running() -> tuple[bool, int | None]:
         # If PID matches current process (common in containers), treat as not running
         if pid == os.getpid():
             return False, None
+        if not _pid_is_history_daemon(pid):
+            PID_FILE.unlink(missing_ok=True)
+            return False, None
         return True, pid
     except (ValueError, ProcessLookupError, PermissionError):
         # Invalid PID, process doesn't exist, or no permission
@@ -64,6 +90,59 @@ def write_pid_file():
 def remove_pid_file():
     """Remove PID file."""
     PID_FILE.unlink(missing_ok=True)
+
+
+def _wait_for_pid_exit(pid: int, timeout_seconds: float) -> bool:
+    """Wait until a PID no longer exists."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def terminate_daemon_process(
+    pid: int,
+    *,
+    timeout_seconds: float = 15.0,
+    kill_timeout_seconds: float = 5.0,
+) -> bool:
+    """Terminate an existing PID-file daemon so a supervisor can own the replacement."""
+    if pid == os.getpid():
+        return True
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        remove_pid_file()
+        return True
+    except PermissionError:
+        logger.error("Permission denied to stop existing daemon PID %s", pid)
+        return False
+
+    if _wait_for_pid_exit(pid, timeout_seconds):
+        remove_pid_file()
+        return True
+
+    logger.warning("Daemon PID %s did not stop after SIGTERM; sending SIGKILL", pid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        remove_pid_file()
+        return True
+    except PermissionError:
+        logger.error("Permission denied to kill existing daemon PID %s", pid)
+        return False
+
+    if _wait_for_pid_exit(pid, kill_timeout_seconds):
+        remove_pid_file()
+        return True
+
+    logger.error("Daemon PID %s survived SIGKILL", pid)
+    return False
 
 
 async def periodic_optimize(stop_event: asyncio.Event) -> None:
@@ -336,14 +415,8 @@ def setup_logging(log_file: Path | None = None):
     return log_file
 
 
-def cmd_start(args):
-    """Start the daemon."""
-    is_running, pid = is_daemon_running()
-    if is_running:
-        print(f"Daemon is already running (PID {pid})")
-        # Return success to avoid restart loops in launchd/systemd
-        return 0
-
+def _run_foreground_daemon() -> int:
+    """Run the daemon in the current process."""
     log_file = setup_logging()
 
     # Log startup info based on mode
@@ -379,6 +452,34 @@ def cmd_start(args):
     return 0
 
 
+def cmd_start(args):
+    """Start the daemon."""
+    is_running, pid = is_daemon_running()
+    if is_running:
+        print(f"Daemon is already running (PID {pid})")
+        return 0
+
+    return _run_foreground_daemon()
+
+
+def cmd_supervise(args):
+    """Run under a service manager as the single lifecycle owner.
+
+    Unlike the human-facing start command, this command replaces any live daemon
+    named by the PID file before entering the foreground. That prevents launchd
+    or systemd from supervising a short-lived "already running" wrapper while a
+    stale sibling daemon owns the status port and watchers.
+    """
+    is_running, pid = is_daemon_running()
+    if is_running and pid is not None:
+        print(f"Replacing existing daemon (PID {pid}) before supervised start")
+        if not terminate_daemon_process(pid):
+            print(f"Failed to stop existing daemon (PID {pid})")
+            return 1
+
+    return _run_foreground_daemon()
+
+
 def cmd_stop(args):
     """Stop the daemon."""
     is_running, pid = is_daemon_running()
@@ -387,27 +488,11 @@ def cmd_stop(args):
         return 1
 
     print(f"Stopping daemon (PID {pid})...")
-    try:
-        os.kill(pid, signal.SIGTERM)
-        # Wait for process to exit
-        for _ in range(30):
-            try:
-                os.kill(pid, 0)
-                import time
-
-                time.sleep(0.5)
-            except ProcessLookupError:
-                print("Daemon stopped")
-                return 0
-        print("Daemon did not stop in time, sending SIGKILL...")
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        print("Daemon already stopped")
-        remove_pid_file()
-    except PermissionError:
-        print(f"Permission denied to stop process {pid}")
+    if not terminate_daemon_process(pid, timeout_seconds=15.0, kill_timeout_seconds=5.0):
+        print(f"Failed to stop daemon (PID {pid})")
         return 1
 
+    print("Daemon stopped")
     return 0
 
 
@@ -449,6 +534,12 @@ def main():
     # Start command
     start_parser = subparsers.add_parser("start", help="Start the daemon")
     start_parser.set_defaults(func=cmd_start)
+
+    # Supervised foreground command
+    supervise_parser = subparsers.add_parser(
+        "supervise", help="Run under launchd/systemd as the single lifecycle owner"
+    )
+    supervise_parser.set_defaults(func=cmd_supervise)
 
     # Stop command
     stop_parser = subparsers.add_parser("stop", help="Stop the daemon")

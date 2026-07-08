@@ -37,7 +37,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$UV_PATH --directory $PROJECT_DIR run ai-agent-history-rag-daemon start
+ExecStart=$UV_PATH --directory $PROJECT_DIR run ai-agent-history-rag-daemon supervise
 Restart=on-failure
 RestartSec=10
 WorkingDirectory=$PROJECT_DIR

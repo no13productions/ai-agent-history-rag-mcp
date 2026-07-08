@@ -1088,7 +1088,7 @@ def install_daemon_macos(
         <string>{escape_xml(str(project_dir))}</string>
         <string>run</string>
         <string>ai-agent-history-rag-daemon</string>
-        <string>start</string>
+        <string>supervise</string>
     </array>
 {env_section}
     <key>RunAtLoad</key>
@@ -1172,7 +1172,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={uv_escaped} --directory {project_escaped} run ai-agent-history-rag-daemon start
+ExecStart={uv_escaped} --directory {project_escaped} run ai-agent-history-rag-daemon supervise
 Restart=on-failure
 RestartSec=10
 WorkingDirectory={project_escaped}
@@ -1238,7 +1238,9 @@ def install_daemon_windows(
 
     # Build the full command - schtasks /TR needs the whole thing as one string
     # Escape paths properly for Windows
-    full_command = f'"{uv_path}" --directory "{project_dir}" run ai-agent-history-rag-daemon start'
+    full_command = (
+        f'"{uv_path}" --directory "{project_dir}" run ai-agent-history-rag-daemon supervise'
+    )
 
     # Create task using schtasks
     # Note: Environment variables need to be set in user environment
