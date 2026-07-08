@@ -18,6 +18,9 @@ from claude_history_rag.watcher import get_all_watchers
 
 logger = logging.getLogger(__name__)
 
+DAEMON_STATUS_TIMEOUT_SECONDS = 3.0
+DAEMON_STATUS_CONNECT_TIMEOUT_SECONDS = 0.5
+
 
 def _local_status_auth_headers() -> dict[str, str]:
     """Authorize the in-process snapshot call to the always-on daemon status server.
@@ -58,7 +61,10 @@ async def _get_status_server_snapshot(detail_level: str = "full") -> dict[str, A
     try:
         import httpx
 
-        timeout = httpx.Timeout(30.0, connect=1.0)
+        timeout = httpx.Timeout(
+            DAEMON_STATUS_TIMEOUT_SECONDS,
+            connect=DAEMON_STATUS_CONNECT_TIMEOUT_SECONDS,
+        )
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(
                 f"http://{host}:{settings.status_server_port}/status",

@@ -1,5 +1,6 @@
 """Regression tests for Spanner backend status/search call paths."""
 
+import asyncio
 import json
 import threading
 import time
@@ -137,6 +138,15 @@ class CachedStatsOnlyStore(AsyncOnlyStatsStore):
         raise AssertionError("health status should use cached stats")
 
 
+class SlowStatsStore(FakeSpannerStore):
+    def has_fts_index(self) -> bool:
+        return True
+
+    async def get_stats_async(self) -> dict:
+        await asyncio.sleep(60)
+        return FakeSpannerStore.get_stats(self)
+
+
 class CapturingStore:
     def __init__(self):
         self.chunks: list[dict] = []
@@ -159,6 +169,21 @@ class ThreadCheckingWatcher(FakeWatcher):
 
     def failed_files(self):
         return []
+
+
+class StateOnlyWatcher(FakeWatcher):
+    def __init__(self):
+        self.state = SimpleNamespace(
+            get_all_files=lambda: ["/tmp/history/session-1.jsonl", "/tmp/history/session-2.jsonl"]
+        )
+        self.queue = SimpleNamespace(qsize=lambda: 1, maxsize=10)
+        self.failed_files_count = 2
+
+    def discover_files(self):
+        raise AssertionError("status must not recursively discover files")
+
+    def failed_files(self):
+        return ["/tmp/history/failed-1.jsonl", "/tmp/history/failed-2.jsonl"]
 
 
 async def _no_daemon_status(*args, **kwargs):
@@ -345,16 +370,49 @@ async def test_health_status_uses_cached_store_stats(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_indexing_status_discovers_files_off_event_loop(monkeypatch):
-    """Full status indexing discovery must not block the status server event loop."""
-    watcher = ThreadCheckingWatcher(threading.get_ident())
+async def test_health_status_degrades_on_stats_timeout(monkeypatch):
+    """Basic health must finish even when fresh Spanner stats do not."""
+    monkeypatch.setattr("claude_history_rag.status.store", SlowStatsStore())
+    monkeypatch.setattr("claude_history_rag.status.HEALTH_STATS_TIMEOUT_SECONDS", 0.01)
+
+    started = time.monotonic()
+    status = await StatusCollector()._get_health_status()
+
+    assert time.monotonic() - started < 0.5
+    assert status["status"] == "degraded"
+    assert status["checks"]["database"]["status"] == "degraded"
+    assert status["checks"]["database"]["stats_source"] == "timeout"
+    assert "timed out" in status["checks"]["database"]["degraded_reason"]
+
+
+@pytest.mark.asyncio
+async def test_full_database_status_degrades_on_stats_timeout(monkeypatch):
+    """Full status should return an explicit degraded DB payload on a stats timeout."""
+    monkeypatch.setattr("claude_history_rag.status.store", SlowStatsStore())
+    monkeypatch.setattr("claude_history_rag.status.FULL_STATS_TIMEOUT_SECONDS", 0.01)
+
+    started = time.monotonic()
+    status = await StatusCollector()._get_database_stats()
+
+    assert time.monotonic() - started < 0.5
+    assert status["status"] == "degraded"
+    assert status["stats_source"] == "timeout"
+    assert "timed out" in status["degraded_reason"]
+
+
+@pytest.mark.asyncio
+async def test_indexing_status_uses_watcher_state_without_discovery(monkeypatch):
+    """Full status indexing counts must stay cheap and avoid recursive discovery."""
+    watcher = StateOnlyWatcher()
     monkeypatch.setattr("claude_history_rag.status.get_all_watchers", lambda: [watcher])
 
     status = await StatusCollector()._get_indexing_status()
 
-    assert watcher.discover_thread_id is not None
-    assert status["files_discovered"] == 1
-    assert status["sources"]["Claude Code"]["files_pending"] == 0
+    assert status["files_discovered"] == 3
+    assert status["files_indexed"] == 2
+    assert status["files_pending"] == 1
+    assert status["sources"]["Claude Code"]["discovery_source"] == "watcher_state"
+    assert status["sources"]["Claude Code"]["failed_files_truncated"] is False
 
 
 @pytest.mark.asyncio

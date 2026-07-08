@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # Global start time for uptime calculation
 _start_time = time.time()
 _start_datetime = datetime.now(timezone.utc)
+HEALTH_STATS_TIMEOUT_SECONDS = 2.0
+FULL_STATS_TIMEOUT_SECONDS = 2.0
+FAILED_FILES_STATUS_LIMIT = 20
 
 
 def get_version() -> str:
@@ -110,6 +113,74 @@ class StatusCollector:
             return cached[1]
         return None
 
+    async def _get_store_stats_bounded(
+        self,
+        timeout_seconds: float,
+    ) -> tuple[dict[str, Any] | None, str, str | None]:
+        """Return store stats without letting a cache miss wedge status collection."""
+        stats = self._get_cached_store_stats()
+        if stats is not None:
+            return stats, "cache", None
+        try:
+            stats = await asyncio.wait_for(store.get_stats_async(), timeout=timeout_seconds)
+            return stats, "fresh", None
+        except asyncio.TimeoutError:
+            return None, "timeout", f"Store stats timed out after {timeout_seconds:.1f}s"
+
+    def _database_stats_payload(
+        self,
+        stats: dict[str, Any] | None,
+        stats_source: str,
+        degraded_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Format database stats consistently for health and full status payloads."""
+        if stats is None:
+            return {
+                "status": "degraded",
+                "total_chunks": 0,
+                "stats_source": stats_source,
+                "degraded_reason": degraded_reason or "Database stats unavailable",
+            }
+
+        result = {
+            "status": "degraded" if degraded_reason or stats.get("error") else "ok",
+            "total_chunks": stats.get("total_chunks", 0),
+            "embedded_chunks": stats.get("embedded_chunks"),
+            "awaiting_embedding": stats.get("awaiting_embedding"),
+            "backfill_rate_per_min": stats.get("backfill_rate_per_min"),
+            "backfill_eta_seconds": stats.get("backfill_eta_seconds"),
+            "stats_source": stats_source,
+        }
+        if degraded_reason:
+            result["degraded_reason"] = degraded_reason
+        if stats.get("error"):
+            result["degraded_reason"] = "Database stats unavailable"
+
+        if settings.storage_backend == "lancedb":
+            db_size = 0
+            if settings.db_path.exists():
+                for file_path in settings.db_path.rglob("*"):
+                    if file_path.is_file():
+                        db_size += file_path.stat().st_size
+            result["database_size_bytes"] = db_size
+            result["database_path"] = str(settings.db_path)
+
+        for key in (
+            "backend",
+            "project",
+            "instance",
+            "database",
+            "dimension",
+            "fts_index_available",
+            "vector_index_available",
+            "vector_search_mode",
+            "embedding_mode",
+            "embedding_model_id",
+        ):
+            if key in stats:
+                result[key] = stats[key]
+        return result
+
     async def collect_status(self, detail_level: str = "full") -> dict[str, Any]:
         """Collect comprehensive server status.
 
@@ -187,31 +258,27 @@ class StatusCollector:
 
         # Database check
         try:
-            stats = self._get_cached_store_stats()
-            stats_source = "cache"
-            if stats is None:
-                # get_stats() can perform a Spanner count scan on cache miss; keep
-                # status collection off the event loop and bound the health probe.
-                stats = await asyncio.wait_for(store.get_stats_async(), timeout=2.0)
-                stats_source = "fresh"
+            stats, stats_source, degraded_reason = await self._get_store_stats_bounded(
+                HEALTH_STATS_TIMEOUT_SECONDS
+            )
             checks["database"] = {
-                "status": "ok",
-                "chunks": stats.get("total_chunks", 0),
+                "status": "degraded" if degraded_reason or stats is None else "ok",
+                "chunks": stats.get("total_chunks", 0) if stats else 0,
                 "stats_source": stats_source,
             }
-            if stats.get("error"):
-                checks["database"] = {
-                    "status": "error",
-                    "error": "Database stats unavailable",
-                }
+            if degraded_reason:
+                checks["database"]["degraded_reason"] = degraded_reason
+            if stats and stats.get("error"):
+                checks["database"]["status"] = "degraded"
+                checks["database"]["degraded_reason"] = "Database stats unavailable"
         except Exception as e:
             checks["database"] = {
-                "status": "error",
+                "status": "degraded",
                 "error": _safe_error("Database check failed", e),
             }
             db_error = str(e)
         else:
-            db_error = stats.get("error")
+            db_error = stats.get("error") if stats else degraded_reason
 
         # Data integrity check (e.g., missing Lance files)
         if db_error and "LanceError(IO)" in str(db_error):
@@ -301,62 +368,39 @@ class StatusCollector:
     async def _get_database_stats(self) -> dict[str, Any]:
         """Get database statistics."""
         try:
-            # Off the event loop: get_stats may run a TTL-cache-miss count scan that takes
-            # seconds on a large table — must not block the status server.
-            stats = await store.get_stats_async()
-
-            result = {
-                "total_chunks": stats.get("total_chunks", 0),
-                "embedded_chunks": stats.get("embedded_chunks"),
-                "awaiting_embedding": stats.get("awaiting_embedding"),
-                "backfill_rate_per_min": stats.get("backfill_rate_per_min"),
-                "backfill_eta_seconds": stats.get("backfill_eta_seconds"),
-            }
-            if settings.storage_backend == "lancedb":
-                db_size = 0
-                if settings.db_path.exists():
-                    for file_path in settings.db_path.rglob("*"):
-                        if file_path.is_file():
-                            db_size += file_path.stat().st_size
-                result["database_size_bytes"] = db_size
-                result["database_path"] = str(settings.db_path)
-            for key in (
-                "backend",
-                "project",
-                "instance",
-                "database",
-                "dimension",
-                "fts_index_available",
-                "vector_index_available",
-                "vector_search_mode",
-                "embedding_mode",
-                "embedding_model_id",
-            ):
-                if key in stats:
-                    result[key] = stats[key]
-            return result
+            stats, stats_source, degraded_reason = await self._get_store_stats_bounded(
+                FULL_STATS_TIMEOUT_SECONDS
+            )
+            return self._database_stats_payload(stats, stats_source, degraded_reason)
         except Exception as e:
             logger.error(f"Failed to get database stats: {e}")
-            return {"error": _safe_error("Database stats failed", e)}
+            return {
+                "status": "degraded",
+                "error": _safe_error("Database stats failed", e),
+                "stats_source": "error",
+            }
 
     async def _get_indexing_status(self) -> dict[str, Any]:
         """Get indexing progress and status."""
         try:
             watchers = get_all_watchers()
-            loop = asyncio.get_running_loop()
             source_status: dict[str, dict[str, Any]] = {}
             for source_watcher in watchers:
-                # Recursive discovery can traverse thousands of history files.
-                discovered = len(await loop.run_in_executor(None, source_watcher.discover_files))
                 indexed = len(source_watcher.state.get_all_files())
+                queue_size = source_watcher.queue.qsize()
+                failed_files = (
+                    source_watcher.failed_files() if hasattr(source_watcher, "failed_files") else []
+                )
                 source_status[source_watcher.source_name] = {
-                    "files_discovered": discovered,
+                    "files_discovered": indexed + queue_size,
                     "files_indexed": indexed,
-                    "files_pending": max(0, discovered - indexed),
+                    "files_pending": queue_size,
                     "files_failed": source_watcher.failed_files_count,
-                    "failed_files": source_watcher.failed_files(),
+                    "failed_files": failed_files[:FAILED_FILES_STATUS_LIMIT],
+                    "failed_files_truncated": len(failed_files) > FAILED_FILES_STATUS_LIMIT,
                     "is_running": source_watcher.is_running,
                     "watch_path": str(source_watcher.projects_path),
+                    "discovery_source": "watcher_state",
                 }
             files_discovered = sum(s["files_discovered"] for s in source_status.values())
             files_indexed = sum(s["files_indexed"] for s in source_status.values())
