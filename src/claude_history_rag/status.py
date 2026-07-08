@@ -24,6 +24,7 @@ _start_time = time.time()
 _start_datetime = datetime.now(timezone.utc)
 HEALTH_STATS_TIMEOUT_SECONDS = 1.0
 FULL_STATS_TIMEOUT_SECONDS = 1.0
+FTS_CHECK_TIMEOUT_SECONDS = 1.0
 FAILED_FILES_STATUS_LIMIT = 20
 
 
@@ -126,6 +127,25 @@ class StatusCollector:
             return stats, "fresh", None
         except asyncio.TimeoutError:
             return None, "timeout", f"Store stats timed out after {timeout_seconds:.1f}s"
+
+    async def _get_fts_available_bounded(self) -> tuple[bool | None, str, str | None]:
+        """Return FTS availability without blocking the status server event loop."""
+        stats = self._get_cached_store_stats()
+        if stats is not None and "fts_index_available" in stats:
+            return bool(stats.get("fts_index_available")), "cache", None
+        try:
+            loop = asyncio.get_running_loop()
+            available = await asyncio.wait_for(
+                loop.run_in_executor(None, store.has_fts_index),
+                timeout=FTS_CHECK_TIMEOUT_SECONDS,
+            )
+            return bool(available), "fresh", None
+        except asyncio.TimeoutError:
+            return (
+                None,
+                "timeout",
+                f"FTS index check timed out after {FTS_CHECK_TIMEOUT_SECONDS:.1f}s",
+            )
 
     def _database_stats_payload(
         self,
@@ -340,9 +360,11 @@ class StatusCollector:
 
         # FTS index check (degraded if not available, not error)
         try:
-            fts_available = store.has_fts_index()
+            fts_available, fts_source, fts_degraded_reason = await self._get_fts_available_bounded()
             if fts_available:
                 fts_message = "Hybrid search enabled"
+            elif fts_degraded_reason:
+                fts_message = "Spanner full-text search index status unavailable"
             elif settings.storage_backend == "spanner":
                 fts_message = "Spanner full-text search index unavailable; using vector-only search"
             else:
@@ -353,9 +375,15 @@ class StatusCollector:
                 "status": "ok" if fts_available else "degraded",
                 "available": fts_available,
                 "message": fts_message,
+                "stats_source": fts_source,
             }
+            if fts_degraded_reason:
+                checks["fts_index"]["degraded_reason"] = fts_degraded_reason
         except Exception as e:
-            checks["fts_index"] = {"status": "error", "error": _safe_error("FTS check failed", e)}
+            checks["fts_index"] = {
+                "status": "degraded",
+                "error": _safe_error("FTS check failed", e),
+            }
 
         # Overall status
         all_ok = all(check.get("status") == "ok" for check in checks.values())
