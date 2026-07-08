@@ -51,6 +51,10 @@ async def run_server_standalone():
     optimize_task: asyncio.Task | None = None
     status_server = None
 
+    initialize_schema = getattr(store, "initialize_schema_async", None)
+    if initialize_schema is not None:
+        await initialize_schema()
+
     # Start status server if enabled
     if settings.status_server_enabled:
         try:

@@ -214,6 +214,9 @@ async def run_daemon():
 
         # Initialize status collector early so errors can be recorded
         await get_status_collector()
+        initialize_schema = getattr(store, "initialize_schema_async", None)
+        if initialize_schema is not None:
+            await initialize_schema()
         cache = get_search_cache()
     else:
         # Client mode - log connection info

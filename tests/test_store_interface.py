@@ -1,5 +1,6 @@
 """Tests for storage backend configuration seams."""
 
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -595,6 +596,64 @@ def test_spanner_store_query_embedding_uses_ml_predict(monkeypatch):
     assert "RETRIEVAL_QUERY" not in call["sql"]
     assert call["params"]["query"] == "find auth"
     assert call["params"]["task_type"] == "RETRIEVAL_QUERY"
+
+
+def test_spanner_native_query_embedding_does_not_ensure_model_per_query(monkeypatch):
+    """Repeated Spanner-native query embeddings must not run CREATE MODEL from the query path."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
+    monkeypatch.setattr(settings, "spanner_embedding_model_id", "ConversationEmbeddingModel")
+    monkeypatch.setattr(settings, "vertex_query_task_type", "RETRIEVAL_QUERY")
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+
+    first = store.embed_query_text("find auth")
+    second = store.embed_query_text("find auth again")
+
+    assert first == [0.1, 0.2, 0.3]
+    assert second == [0.1, 0.2, 0.3]
+    assert all("CREATE MODEL" not in ddl for ddl in database.ddl)
+    assert len(database.sql_calls) == 2
+
+
+def test_spanner_embedding_model_initialization_is_single_flight(monkeypatch):
+    """Concurrent startup initialization must not race duplicate model DDL attempts."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
+    monkeypatch.setattr(settings, "spanner_embedding_model_id", "ConversationEmbeddingModel")
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+
+    threads = [threading.Thread(target=store.ensure_embedding_model) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    model_ddls = [ddl for ddl in database.ddl if "CREATE MODEL" in ddl]
+    assert len(model_ddls) == 1
+
+
+def test_spanner_schema_initialization_is_idempotent(monkeypatch):
+    """Repeated startup schema initialization should not rerun schema/model DDL."""
+    monkeypatch.setattr(settings, "embedding_dimension", 3)
+    monkeypatch.setattr(settings, "spanner_embedding_mode", "spanner")
+    monkeypatch.setattr(settings, "spanner_embedding_model_id", "ConversationEmbeddingModel")
+    monkeypatch.setattr(store_module, "_vector_dim", None)
+    database = FakeDatabase()
+    store = SpannerStore(project="p", instance="i", database="d")
+    store._database = database
+
+    store.ensure_schema()
+    ddl_after_first = list(database.ddl)
+    store.ensure_schema()
+
+    assert database.ddl == ddl_after_first
+    assert sum(1 for ddl in database.ddl if "CREATE MODEL" in ddl) == 1
 
 
 def test_spanner_store_search_uses_cosine_distance(monkeypatch):
