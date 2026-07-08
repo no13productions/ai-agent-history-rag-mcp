@@ -594,12 +594,13 @@ class StatusCollector:
 
     def _get_configuration(self) -> dict[str, Any]:
         """Get current configuration."""
-        return {
-            "db_path": str(settings.db_path),
+        configuration = {
             "projects_path": str(settings.projects_path),
             "codex_sessions_path": str(settings.codex_sessions_path),
             "gemini_sessions_path": str(settings.gemini_sessions_path),
             "antigravity_sessions_path": str(settings.antigravity_sessions_path),
+            "chatgpt_exports_path": str(settings.chatgpt_exports_path),
+            "claude_app_exports_path": str(settings.claude_app_exports_path),
             "storage_backend": settings.storage_backend,
             "spanner_project": settings.spanner_project,
             "spanner_instance": settings.spanner_instance,
@@ -622,9 +623,16 @@ class StatusCollector:
             "log_level": settings.log_level,
             "batch_size": settings.batch_size,
             "status_server_enabled": settings.status_server_enabled,
+            "status_server_host": settings.status_server_host,
             "status_server_port_configured": settings.status_server_port,
             "auth_enabled": settings.auth_enabled,
+            "auth_state_path": str(settings.auth_state_path),
+            "client_auth_path": str(settings.client_auth_path),
+            "runtime_contract": settings.runtime_contract,
         }
+        if settings.storage_backend == "lancedb":
+            configuration["db_path"] = str(settings.db_path)
+        return configuration
 
 
 # Global status collector instance

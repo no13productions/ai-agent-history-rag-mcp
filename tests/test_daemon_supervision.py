@@ -102,3 +102,25 @@ def test_service_manager_configs_use_supervise():
         assert "ai-agent-history-rag-daemon supervise" in content or (
             "ai-agent-history-rag-daemon" in content and "<string>supervise</string>" in content
         )
+
+
+def test_launchd_plists_pin_production_spanner_contract():
+    """launchd source must not regress to local LanceDB/Ollama production defaults."""
+    root = daemon.Path(__file__).resolve().parents[1]
+    files = [
+        root / "scripts/com.ai-agent-history-rag.daemon.plist",
+        root / "scripts/com.ai-agent-history-rag.daemon.plist.template",
+    ]
+
+    for path in files:
+        content = path.read_text()
+        assert "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT" in content
+        assert "production" in content
+        assert "CLAUDE_HISTORY_RAG_STORAGE_BACKEND" in content
+        assert "spanner" in content
+        assert "ai-agent-history-rag" in content
+        assert "gemini-embedding-001" in content
+        assert "3072" in content
+        assert "GOOGLE_APPLICATION_CREDENTIALS" in content
+        assert "Meridian/alfred-sa-key.json" in content
+        assert "CLAUDE_RAG_" not in content

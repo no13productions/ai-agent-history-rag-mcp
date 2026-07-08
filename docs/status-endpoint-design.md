@@ -23,7 +23,7 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
 - Additional port to manage
 - Slightly more complexity
 
-**Implementation:** asyncio HTTP server (aiohttp) on localhost:8765
+**Implementation:** asyncio HTTP server (aiohttp) on localhost:4680
 
 ### Option 2: MCP Tool for Status
 **Pros:**
@@ -143,8 +143,14 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
     "by_type": {}
   },
   "configuration": {
-    "db_path": "/Users/youruser/.claude-history-rag/lancedb",
+    "storage_backend": "spanner",
+    "spanner_project": "jeeves-486102",
+    "spanner_instance": "jeeves-rg-spanner-prod-4d0e4c43",
+    "spanner_database": "ai-agent-history-rag",
     "projects_path": "/Users/youruser/.claude/projects",
+    "codex_sessions_path": "/Users/youruser/.codex/sessions",
+    "gemini_sessions_path": "/Users/youruser/.gemini/tmp",
+    "antigravity_sessions_path": "/Users/youruser/.gemini/antigravity",
     "embedding_model": "nomic-ai/nomic-embed-text-v1.5",
     "log_level": "INFO",
     "batch_size": 32
@@ -265,7 +271,7 @@ Add to `config.py`:
 ```python
 status_server_enabled: bool = True
 status_server_host: str = "127.0.0.1"
-status_server_port: int = 8765
+status_server_port: int = 4680
 status_refresh_interval: int = 5  # seconds
 ```
 
@@ -293,13 +299,13 @@ status_refresh_interval: int = 5  # seconds
 
 ### CLI Check
 ```bash
-curl http://localhost:8765/health
+curl http://localhost:4680/health
 # {"status": "healthy"}
 
-curl http://localhost:8765/status | jq .
+curl http://localhost:4680/status | jq .
 # Full JSON status
 
-open http://localhost:8765/dashboard
+open http://localhost:4680/dashboard
 # Opens HTML dashboard in browser
 ```
 
@@ -317,7 +323,7 @@ with 557 files pending. Memory usage is 150MB.
 scrape_configs:
   - job_name: 'mcp-server'
     static_configs:
-      - targets: ['localhost:8765']
+      - targets: ['localhost:4680']
     metrics_path: '/metrics'
 ```
 

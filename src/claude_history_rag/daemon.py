@@ -22,7 +22,11 @@ import sys
 import time
 from pathlib import Path
 
-from claude_history_rag.config import OPTIMIZE_INTERVAL, settings
+from claude_history_rag.config import (
+    OPTIMIZE_INTERVAL,
+    settings,
+    validate_production_runtime_contract,
+)
 from claude_history_rag.embedder import redact_url
 from claude_history_rag.watcher import get_all_watchers
 
@@ -199,6 +203,7 @@ async def run_daemon():
     # Detect mode
     is_server_mode = settings.is_server_mode
     mode_str = "SERVER" if is_server_mode else "CLIENT"
+    validate_production_runtime_contract()
 
     # Write PID file
     write_pid_file()

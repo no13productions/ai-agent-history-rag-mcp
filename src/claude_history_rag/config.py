@@ -1,6 +1,7 @@
 """Configuration management."""
 
 import logging
+import os
 import re
 import socket
 from pathlib import Path
@@ -14,6 +15,32 @@ GCP_LOCATION_PATTERN = re.compile(r"^[a-z]+-[a-z]+[0-9](-[a-z])?$")
 
 # Optimization interval in seconds (15 minutes)
 OPTIMIZE_INTERVAL = 900
+
+PRODUCTION_RUNTIME_CONTRACT = "production"
+PRODUCTION_SPANNER_PROJECT = "jeeves-486102"
+PRODUCTION_SPANNER_INSTANCE = "jeeves-rg-spanner-prod-4d0e4c43"
+PRODUCTION_SPANNER_DATABASE = "ai-agent-history-rag"
+PRODUCTION_SPANNER_EMBEDDING_MODEL_ID = "ConversationEmbeddingModel"
+PRODUCTION_EMBEDDING_PROVIDER = "vertex"
+PRODUCTION_EMBEDDING_MODEL = "gemini-embedding-001"
+PRODUCTION_EMBEDDING_DIMENSION = 3072
+PRODUCTION_STATUS_SERVER_HOST = "127.0.0.1"
+PRODUCTION_STATUS_SERVER_PORT = 4680
+PREFERRED_GOOGLE_APPLICATION_CREDENTIALS = Path(
+    "/Users/brandon/Meridian/alfred-sa-key.json"
+)
+
+PRODUCTION_SOURCE_PATHS = {
+    "projects_path": Path.home() / ".claude" / "projects",
+    "codex_sessions_path": Path.home() / ".codex" / "sessions",
+    "gemini_sessions_path": Path.home() / ".gemini" / "tmp",
+    "antigravity_sessions_path": Path.home() / ".gemini" / "antigravity",
+    "chatgpt_exports_path": Path.home() / ".claude-history-rag" / "imports" / "chatgpt",
+    "claude_app_exports_path": Path.home()
+    / ".claude-history-rag"
+    / "imports"
+    / "claude-app",
+}
 
 
 def _validate_path_safe(path: Path, allowed_prefixes: list[Path]) -> Path:
@@ -108,6 +135,7 @@ class Settings(BaseSettings):
     # ============================================================
     # General Settings
     # ============================================================
+    runtime_contract: str = ""
     log_level: str = "INFO"
     debounce_delay: int = 5000  # Debounce delay in milliseconds
     batch_size: int = 32  # Embedding batch size
@@ -237,6 +265,15 @@ class Settings(BaseSettings):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", model_id):
             raise ValueError("spanner_embedding_model_id must be a simple SQL identifier")
         return model_id
+
+    @field_validator("runtime_contract")
+    @classmethod
+    def validate_runtime_contract(cls, v: str) -> str:
+        """Validate optional runtime contract selector."""
+        contract = v.strip().lower()
+        if contract not in {"", PRODUCTION_RUNTIME_CONTRACT}:
+            raise ValueError("runtime_contract must be empty or production")
+        return contract
 
     @field_validator("embedding_dimension")
     @classmethod
@@ -496,6 +533,20 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_paths_unique(self) -> "Settings":
         """Validate cross-field settings."""
+        if self.storage_backend == "spanner":
+            missing = [
+                env_name
+                for env_name, value in (
+                    ("CLAUDE_HISTORY_RAG_SPANNER_PROJECT", self.spanner_project),
+                    ("CLAUDE_HISTORY_RAG_SPANNER_INSTANCE", self.spanner_instance),
+                    ("CLAUDE_HISTORY_RAG_SPANNER_DATABASE", self.spanner_database),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "Spanner storage requires explicit config: " + ", ".join(missing)
+                )
         if self.embedding_provider == "vertex":
             if self.embedding_model == "nomic-embed-text":
                 self.embedding_model = "gemini-embedding-001"
@@ -555,3 +606,56 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_production_runtime_contract(
+    settings_obj: Settings | None = None,
+    environ: dict[str, str] | None = None,
+    credential_path: Path = PREFERRED_GOOGLE_APPLICATION_CREDENTIALS,
+) -> None:
+    """Fail loudly when the production launch contract drifts or omits credentials."""
+    current = settings_obj or settings
+    if current.runtime_contract != PRODUCTION_RUNTIME_CONTRACT:
+        return
+
+    env = environ if environ is not None else os.environ
+    expected_values = {
+        "storage_backend": ("spanner", current.storage_backend),
+        "spanner_project": (PRODUCTION_SPANNER_PROJECT, current.spanner_project),
+        "spanner_instance": (PRODUCTION_SPANNER_INSTANCE, current.spanner_instance),
+        "spanner_database": (PRODUCTION_SPANNER_DATABASE, current.spanner_database),
+        "spanner_embedding_mode": ("spanner", current.spanner_embedding_mode),
+        "spanner_embedding_model_id": (
+            PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+            current.spanner_embedding_model_id,
+        ),
+        "embedding_provider": (PRODUCTION_EMBEDDING_PROVIDER, current.embedding_provider),
+        "embedding_model": (PRODUCTION_EMBEDDING_MODEL, current.embedding_model),
+        "embedding_dimension": (PRODUCTION_EMBEDDING_DIMENSION, current.embedding_dimension),
+        "status_server_host": (PRODUCTION_STATUS_SERVER_HOST, current.status_server_host),
+        "status_server_port": (PRODUCTION_STATUS_SERVER_PORT, current.status_server_port),
+    }
+    for field_name, expected_path in PRODUCTION_SOURCE_PATHS.items():
+        expected_values[field_name] = (str(expected_path), str(getattr(current, field_name)))
+
+    errors: list[str] = []
+    for field_name, (expected, actual) in expected_values.items():
+        if actual != expected:
+            errors.append(f"{field_name}={actual!r} expected {expected!r}")
+
+    credential = env.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if credential != str(credential_path):
+        errors.append(
+            "GOOGLE_APPLICATION_CREDENTIALS="
+            f"{credential!r} expected {str(credential_path)!r}"
+        )
+    if not credential_path.exists():
+        errors.append(f"credential file missing: {credential_path}")
+
+    if env.get("CLAUDE_HISTORY_RAG_DB_PATH"):
+        errors.append(
+            "CLAUDE_HISTORY_RAG_DB_PATH must be unset in production Spanner runtime"
+        )
+
+    if errors:
+        raise RuntimeError("Production runtime contract invalid: " + "; ".join(errors))

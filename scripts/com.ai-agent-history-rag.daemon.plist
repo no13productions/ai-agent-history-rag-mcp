@@ -7,9 +7,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOUR_USERNAME/.local/bin/uv</string>
+        <string>/Users/brandon/.local/bin/uv</string>
         <string>--directory</string>
-        <string>/path/to/ai-agent-history-rag-mcp</string>
+        <string>/Users/brandon/AI-HISTORY-RAG</string>
         <string>run</string>
         <string>ai-agent-history-rag-daemon</string>
         <string>supervise</string>
@@ -17,12 +17,86 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>CLAUDE_HISTORY_RAG_OLLAMA_HOST</key>
-        <string>http://YOUR_OLLAMA_HOST:11434</string>
-        <key>CLAUDE_HISTORY_RAG_OLLAMA_MODEL</key>
-        <string>bge-m3</string>
-        <key>CLAUDE_HISTORY_RAG_BATCH_SIZE</key>
-        <string>64</string>
+        <key>CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT</key>
+        <string>production</string>
+        <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
+        <string>spanner</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
+        <string>jeeves-486102</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_INSTANCE</key>
+        <string>jeeves-rg-spanner-prod-4d0e4c43</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_DATABASE</key>
+        <string>ai-agent-history-rag</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE</key>
+        <string>spanner</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID</key>
+        <string>ConversationEmbeddingModel</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_DEFER_EMBEDDINGS</key>
+        <string>true</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_CONCURRENCY</key>
+        <string>16</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_BATCH_SIZE</key>
+        <string>200</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_INTERVAL_SECONDS</key>
+        <string>30</string>
+        <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_RPC_BATCH_SIZE</key>
+        <string>10</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER</key>
+        <string>vertex</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_MODEL</key>
+        <string>gemini-embedding-001</string>
+        <key>CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION</key>
+        <string>3072</string>
+        <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST</key>
+        <string>127.0.0.1</string>
+        <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT</key>
+        <string>4680</string>
+        <key>CLAUDE_HISTORY_RAG_PROJECTS_PATH</key>
+        <string>/Users/brandon/.claude/projects</string>
+        <key>CLAUDE_HISTORY_RAG_CODEX_SESSIONS_PATH</key>
+        <string>/Users/brandon/.codex/sessions</string>
+        <key>CLAUDE_HISTORY_RAG_GEMINI_SESSIONS_PATH</key>
+        <string>/Users/brandon/.gemini/tmp</string>
+        <key>CLAUDE_HISTORY_RAG_ANTIGRAVITY_SESSIONS_PATH</key>
+        <string>/Users/brandon/.gemini/antigravity</string>
+        <key>CLAUDE_HISTORY_RAG_CHATGPT_EXPORTS_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/imports/chatgpt</string>
+        <key>CLAUDE_HISTORY_RAG_CLAUDE_APP_EXPORTS_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/imports/claude-app</string>
+        <key>CLAUDE_HISTORY_RAG_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/state.json</string>
+        <key>CLAUDE_HISTORY_RAG_CODEX_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/codex_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_GEMINI_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/gemini_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_ANTIGRAVITY_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/antigravity_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_CHATGPT_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/chatgpt_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_CLAUDE_APP_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/claude_app_state.json</string>
+        <key>CLAUDE_HISTORY_RAG_AUTH_ENABLED</key>
+        <string>true</string>
+        <key>CLAUDE_HISTORY_RAG_AUTH_STATE_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/auth.json</string>
+        <key>CLAUDE_HISTORY_RAG_CLIENT_AUTH_PATH</key>
+        <string>/Users/brandon/.claude-history-rag/client_auth.json</string>
+        <key>CLAUDE_HISTORY_RAG_MACHINE_ID</key>
+        <string>mac-mini</string>
+        <key>CLAUDE_HISTORY_RAG_CLIENT_NAME</key>
+        <string>Brandon Mac Mini</string>
+        <key>CLOUDSDK_CONFIG</key>
+        <string>/Users/brandon/.config/gcloud</string>
+        <key>CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE</key>
+        <string>/Users/brandon/Meridian/alfred-sa-key.json</string>
+        <key>GOOGLE_APPLICATION_CREDENTIALS</key>
+        <string>/Users/brandon/Meridian/alfred-sa-key.json</string>
+        <key>GOOGLE_CLOUD_PROJECT</key>
+        <string>jeeves-486102</string>
+        <key>HOME</key>
+        <string>/Users/brandon</string>
+        <key>PATH</key>
+        <string>/Users/brandon/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -32,12 +106,12 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/YOUR_USERNAME/.claude-history-rag/launchd-stdout.log</string>
+    <string>/Users/brandon/.claude-history-rag/launchd-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/.claude-history-rag/launchd-stderr.log</string>
+    <string>/Users/brandon/.claude-history-rag/launchd-stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/path/to/ai-agent-history-rag-mcp</string>
+    <string>/Users/brandon/AI-HISTORY-RAG</string>
 </dict>
 </plist>

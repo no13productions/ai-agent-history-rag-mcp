@@ -6,7 +6,21 @@ from datetime import UTC, datetime
 import pytest
 
 from claude_history_rag import store as store_module
-from claude_history_rag.config import Settings, settings
+from claude_history_rag.config import (
+    PRODUCTION_EMBEDDING_DIMENSION,
+    PRODUCTION_EMBEDDING_MODEL,
+    PRODUCTION_EMBEDDING_PROVIDER,
+    PRODUCTION_RUNTIME_CONTRACT,
+    PRODUCTION_SPANNER_DATABASE,
+    PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+    PRODUCTION_SPANNER_INSTANCE,
+    PRODUCTION_SPANNER_PROJECT,
+    PRODUCTION_STATUS_SERVER_HOST,
+    PRODUCTION_STATUS_SERVER_PORT,
+    Settings,
+    settings,
+    validate_production_runtime_contract,
+)
 from claude_history_rag.store import (
     SPANNER_CONTENT_SEARCH_INDEX,
     SPANNER_CONTENT_TOKENS_COLUMN,
@@ -154,6 +168,68 @@ def test_spanner_native_embedding_mode_rejects_non_gemini_model():
             spanner_embedding_mode="spanner",
             embedding_model="text-embedding-3-large",
             embedding_dimension=3072,
+        )
+
+
+def test_spanner_storage_requires_explicit_coordinates():
+    """Spanner storage must fail at config load when project/instance/database are ambiguous."""
+    with pytest.raises(ValueError, match="Spanner storage requires explicit config"):
+        Settings(storage_backend="spanner")
+
+
+def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path):
+    """The production contract pins Spanner, 3072d embeddings, status port, and key path."""
+    key_path = tmp_path / "alfred-sa-key.json"
+    key_path.write_text("{}")
+    configured = Settings(
+        runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
+        storage_backend="spanner",
+        spanner_project=PRODUCTION_SPANNER_PROJECT,
+        spanner_instance=PRODUCTION_SPANNER_INSTANCE,
+        spanner_database=PRODUCTION_SPANNER_DATABASE,
+        spanner_embedding_mode="spanner",
+        spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+        embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
+        embedding_model=PRODUCTION_EMBEDDING_MODEL,
+        embedding_dimension=PRODUCTION_EMBEDDING_DIMENSION,
+        status_server_host=PRODUCTION_STATUS_SERVER_HOST,
+        status_server_port=PRODUCTION_STATUS_SERVER_PORT,
+    )
+
+    validate_production_runtime_contract(
+        configured,
+        {"GOOGLE_APPLICATION_CREDENTIALS": str(key_path)},
+        credential_path=key_path,
+    )
+
+
+def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
+    """A production Spanner daemon must not carry a local LanceDB fallback path."""
+    key_path = tmp_path / "alfred-sa-key.json"
+    key_path.write_text("{}")
+    configured = Settings(
+        runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
+        storage_backend="spanner",
+        spanner_project=PRODUCTION_SPANNER_PROJECT,
+        spanner_instance=PRODUCTION_SPANNER_INSTANCE,
+        spanner_database=PRODUCTION_SPANNER_DATABASE,
+        spanner_embedding_mode="spanner",
+        spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+        embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
+        embedding_model=PRODUCTION_EMBEDDING_MODEL,
+        embedding_dimension=PRODUCTION_EMBEDDING_DIMENSION,
+        status_server_host=PRODUCTION_STATUS_SERVER_HOST,
+        status_server_port=PRODUCTION_STATUS_SERVER_PORT,
+    )
+
+    with pytest.raises(RuntimeError, match="CLAUDE_HISTORY_RAG_DB_PATH must be unset"):
+        validate_production_runtime_contract(
+            configured,
+            {
+                "GOOGLE_APPLICATION_CREDENTIALS": str(key_path),
+                "CLAUDE_HISTORY_RAG_DB_PATH": str(tmp_path / "lancedb"),
+            },
+            credential_path=key_path,
         )
 
 

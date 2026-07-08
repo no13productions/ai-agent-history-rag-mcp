@@ -29,12 +29,12 @@ RestartSec=10
 #Environment="CLAUDE_HISTORY_RAG_MACHINE_ID=my-machine"
 
 # Server mode (local embeddings):
-#Environment="CLAUDE_RAG_EMBEDDING_BASE_URL=http://localhost:11434/v1"
-#Environment="CLAUDE_RAG_EMBEDDING_MODEL=nomic-embed-text"
+#Environment="CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL=http://localhost:11434/v1"
+#Environment="CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=nomic-embed-text"
 
 # Common settings:
-#Environment="CLAUDE_RAG_BATCH_SIZE=32"
-#Environment="CLAUDE_RAG_LOG_LEVEL=INFO"
+#Environment="CLAUDE_HISTORY_RAG_BATCH_SIZE=32"
+#Environment="CLAUDE_HISTORY_RAG_LOG_LEVEL=INFO"
 
 [Install]
 WantedBy=default.target

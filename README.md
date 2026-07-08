@@ -245,23 +245,32 @@ uv run ai-agent-history-rag-daemon start
 
 3. **Configure Claude Code** to use the MCP server (see Configuration section)
 
-#### Current Spanner Server Example
+#### Meridian Production Spanner Runtime
 
-On the central machine, run server mode against the shared Spanner DB:
+The Meridian production daemon runs in server mode against the shared Spanner DB. It must be explicit: do not rely on the local LanceDB default for production status or search.
 
 ```bash
+export CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT=production
 export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
-export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=<your-gcp-project>
-export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=<your-spanner-instance>
-export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=<your-rag-database>
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=jeeves-486102
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=jeeves-rg-spanner-prod-4d0e4c43
+export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=ai-agent-history-rag
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE=spanner
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID=ConversationEmbeddingModel
 export CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER=vertex
 export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
 export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
-export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=0.0.0.0
+export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=127.0.0.1
+export CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT=4680
+export GOOGLE_APPLICATION_CREDENTIALS=/Users/brandon/Meridian/alfred-sa-key.json
+export GOOGLE_CLOUD_PROJECT=jeeves-486102
 uv run ai-agent-history-rag-daemon start
 ```
+
+The launchd source at `scripts/com.ai-agent-history-rag.daemon.plist` pins the same contract, including:
+- watch roots: `~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`, `~/.gemini/antigravity`, `~/.claude-history-rag/imports/chatgpt`, and `~/.claude-history-rag/imports/claude-app`
+- state/auth roots: `~/.claude-history-rag/*.json`
+- credential path: `/Users/brandon/Meridian/alfred-sa-key.json`
 
 On another workstation, point at that server and use a stable machine id:
 
@@ -348,6 +357,7 @@ Add to `~/.config/Claude/claude_desktop_config.json`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT` | `""` | Set to `production` for the Meridian launchd runtime; exact Spanner coordinates, status port, watch roots, and credential path are validated at daemon startup |
 | `CLAUDE_HISTORY_RAG_DB_PATH` | `~/.claude-history-rag/lancedb` | LanceDB database location |
 | `CLAUDE_HISTORY_RAG_STATE_PATH` | `~/.claude-history-rag/state.json` | File position state |
 | `CLAUDE_HISTORY_RAG_PROJECTS_PATH` | `~/.claude/projects` | Claude Code projects directory |
@@ -410,10 +420,10 @@ export CLAUDE_HISTORY_RAG_VERTEX_LOCATION=us-central1
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_HISTORY_RAG_STORAGE_BACKEND` | `lancedb` | `lancedb` or `spanner` |
-| `CLAUDE_HISTORY_RAG_SPANNER_PROJECT` | ADC/gcloud project | Cloud Spanner project |
-| `CLAUDE_HISTORY_RAG_SPANNER_INSTANCE` | `""` | Cloud Spanner instance ID |
-| `CLAUDE_HISTORY_RAG_SPANNER_DATABASE` | `""` | Cloud Spanner database ID |
+| `CLAUDE_HISTORY_RAG_STORAGE_BACKEND` | `lancedb` | `lancedb` for local development or `spanner`; Meridian production must set `spanner` |
+| `CLAUDE_HISTORY_RAG_SPANNER_PROJECT` | `""` | Cloud Spanner project; required when `storage_backend=spanner` |
+| `CLAUDE_HISTORY_RAG_SPANNER_INSTANCE` | `""` | Cloud Spanner instance ID; required when `storage_backend=spanner` |
+| `CLAUDE_HISTORY_RAG_SPANNER_DATABASE` | `""` | Cloud Spanner database ID; required when `storage_backend=spanner` |
 | `CLAUDE_HISTORY_RAG_SPANNER_ENABLE_FULL_TEXT` | `true` | Create/use Spanner full-text search index |
 | `CLAUDE_HISTORY_RAG_SPANNER_ENABLE_VECTOR_INDEX` | `true` | Create/use Spanner vector index |
 | `CLAUDE_HISTORY_RAG_SPANNER_USE_APPROX_VECTOR_SEARCH` | `true` | Use indexed ANN when query shape supports it |
