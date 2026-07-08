@@ -430,12 +430,18 @@ def _run_foreground_daemon() -> int:
     # Log startup info based on mode
     mode = "SERVER" if settings.is_server_mode else "CLIENT"
     if settings.is_server_mode:
+        storage_details = (
+            f"db={settings.db_path}"
+            if settings.storage_backend == "lancedb"
+            else (
+                f"spanner={settings.spanner_project}/{settings.spanner_instance}/"
+                f"{settings.spanner_database}"
+            )
+        )
         logger.info(
             f"Starting daemon [{mode}] | "
             f"storage_backend={settings.storage_backend} | "
-            f"db={settings.db_path} | "
-            f"spanner={settings.spanner_project}/{settings.spanner_instance}/"
-            f"{settings.spanner_database} | "
+            f"{storage_details} | "
             f"projects={settings.projects_path} | "
             f"embedding_provider={settings.embedding_provider} | "
             f"embedding_url={redact_url(settings.embedding_base_url)} | "
