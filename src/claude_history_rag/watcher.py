@@ -114,6 +114,29 @@ def _accepts_source_path(chunker: Callable[..., Any]) -> bool:
     return "source_path" in parameters
 
 
+def _durable_failure_reason(refusal_reason: str) -> str:
+    """Map a refusal code to the durable catch-up failure vocabulary.
+
+    The top-severity distinction is preserved deliberately: an operator must be
+    able to tell "this file is too big to snapshot" from "the watched root was
+    substituted", because detecting the latter is what this authority exists
+    for. Collapsing every refusal into one code destroys exactly that signal.
+    """
+    if refusal_reason == durable_io.SOURCE_NOT_DECODABLE:
+        return "source_not_decodable"
+    if refusal_reason == durable_io.SOURCE_TOO_LARGE:
+        return "source_too_large"
+    if refusal_reason in {
+        durable_io.ROOT_IDENTITY_CHANGED,
+        durable_io.ROOT_IS_LINK_OR_REPARSE,
+        durable_io.ROOT_NOT_A_DIRECTORY,
+        durable_io.ROOT_UNAVAILABLE,
+        durable_io.ROOT_UNBOUND,
+    }:
+        return "watch_root_unusable"
+    return "source_outside_authority"
+
+
 class _SourceSnapshot:
     """One immutable copy of a history source plus its original provenance.
 
@@ -280,8 +303,12 @@ async def _maybe_ack_reindex_completed(
         return
     if state.pending_uploads:
         return
-    if state.catchup_failures:
-        return
+    # A TERMINAL failure is not outstanding work: it will never resolve by
+    # waiting, so blocking on it means the server never learns this client
+    # finished, for every source on the machine, forever. Completion is
+    # acknowledged with a reason that names the shortfall instead, and the
+    # failures stay visible in the heartbeat.
+    terminal_failures = len(state.catchup_failures)
 
     if any(
         watcher.queue.qsize() > 0 or watcher._active_queue_claims > 0
@@ -298,7 +325,11 @@ async def _maybe_ack_reindex_completed(
         await api_client.ack_reindex(
             reindex_requested_at=state.reindex_required_at.isoformat(),
             status="completed",
-            reason="uploads_finished",
+            reason=(
+                f"uploads_finished_with_{terminal_failures}_unreadable_sources"
+                if terminal_failures
+                else "uploads_finished"
+            ),
         )
     except Exception as e:
         logger.warning(
@@ -1447,14 +1478,23 @@ class HistoryWatcher:
             reason = self._refuse_unsafe_source(path_str, error, phase="client_index")
             if interval is not None:
                 # Terminal for this interval. Record the observation, then RETIRE
-                # the continuation: a record that can never be expanded would sit
-                # in the outbox forever, and the completion check reads
-                # pending_uploads globally, so one unreadable source would block
-                # reindex acknowledgement for every source on the machine.
+                # the continuation: a record that can never be expanded would
+                # otherwise sit in the outbox forever. Completion acking is kept
+                # unblocked separately, by treating terminal failures as reported
+                # shortfalls rather than outstanding work.
                 await state_manager.record_catchup_failure(
                     interval,
-                    reason if reason == durable_io.SOURCE_NOT_DECODABLE else "source_unreadable",
+                    _durable_failure_reason(reason),
                 )
+                await state_manager.complete_continuation(interval.outbox_record_id)
+        except OSError as error:
+            # A read that aborted for any other reason is still an aborted read:
+            # the bounds came from the whole source. Handled here rather than
+            # left to escape, because an escaping error skips the failed-file
+            # marking and leaves the continuation outstanding forever.
+            self._refuse_unsafe_source(path_str, error, phase="client_index")
+            if interval is not None:
+                await state_manager.record_catchup_failure(interval, "source_outside_authority")
                 await state_manager.complete_continuation(interval.outbox_record_id)
 
     async def _expand_snapshot_into_outbox(
@@ -1631,6 +1671,17 @@ class HistoryWatcher:
                 {"source_hash": self._hash_value(path_str), "error_type": type(e).__name__},
             )
             self._failed_files.add(path_str)
+            if interval is not None:
+                # The source is now marked failed, so this interval will never be
+                # retried. Leaving its continuation in the outbox would keep
+                # outstanding work that nothing can ever drain.
+                await state_manager.record_catchup_failure(
+                    interval,
+                    "source_not_decodable"
+                    if isinstance(e, UnicodeDecodeError)
+                    else "source_outside_authority",
+                )
+                await state_manager.complete_continuation(interval.outbox_record_id)
             return
 
         # The source digest was proved against this snapshot before parsing and

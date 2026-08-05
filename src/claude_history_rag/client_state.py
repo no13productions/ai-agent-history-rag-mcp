@@ -41,10 +41,15 @@ CatchupFailureReason = Literal[
     "unsupported_cursor_contract",
     # The source exists and is bounded, but could not be read as text at all.
     "source_not_decodable",
-    # The source could not be served safely for any other reason. The precise
-    # refusal code is logged; this vocabulary stays small deliberately so the
-    # durable record does not drift every time a new refusal reason is added.
-    "source_unreadable",
+    # The source exceeds the bounded snapshot limit.
+    "source_too_large",
+    # The watched root itself is missing, substituted, or not a plain directory.
+    # Kept distinct from every other refusal because detecting a substituted
+    # watch root is the reason this authority exists; collapsing it into a
+    # generic code would hide the highest-severity condition in the system.
+    "watch_root_unusable",
+    # The source is no longer reachable through the pinned root's authority.
+    "source_outside_authority",
 ]
 CURRENT_CLIENT_STATE_SCHEMA_VERSION = 3
 MAX_CLIENT_STATE_BYTES = 16 * 1024 * 1024
