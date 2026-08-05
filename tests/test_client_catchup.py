@@ -3272,14 +3272,21 @@ def test_prefix_digest_of_a_partial_bound_is_not_the_whole_file(tmp_path: Path):
     Asserting only that the full-count digest equals the whole file is true for
     every byte string and proves nothing about the bound.
     """
+    # CRLF plus a byte that is not valid UTF-8: a text-mode implementation would
+    # translate the line endings and could not decode the source at all, so this
+    # fixture distinguishes the byte-exact digest from a decoded one. An ASCII-LF
+    # fixture cannot - both implementations agree on it.
     source = tmp_path / "session.jsonl"
-    source.write_bytes(b"one\ntwo\nthree\n")
+    source.write_bytes(b"one\r\ntwo\xff\r\nthree\r\n")
 
     whole = hashlib.sha256(source.read_bytes()).hexdigest()
 
     assert watcher_module._prefix_digest(source, 3) == whole
     assert watcher_module._prefix_digest(source, 2) != whole
-    assert watcher_module._prefix_digest(source, 2) == hashlib.sha256(b"one\ntwo\n").hexdigest()
+    assert (
+        watcher_module._prefix_digest(source, 2)
+        == hashlib.sha256(b"one\r\ntwo\xff\r\n").hexdigest()
+    )
 
 
 async def test_committed_cursor_never_regresses_on_an_older_upload(
@@ -4777,14 +4784,8 @@ async def test_undecodable_source_advances_no_cursor_in_server_mode(tmp_path: Pa
     assert str(history) in watcher._failed_files
 
 
-async def test_undecodable_source_does_not_block_reindex_acking_machine_wide(
-    tmp_path: Path,
-):
-    """A record that can never be expanded must not sit in the outbox forever.
-
-    The completion check reads pending_uploads globally, so one unreadable
-    source would otherwise block reindex acknowledgement for every source.
-    """
+async def test_undecodable_source_retires_its_continuation(tmp_path: Path):
+    """A record that can never be expanded must not sit in the outbox forever."""
     root, history, _ = build_partially_undecodable_source(tmp_path)
     watcher = make_pinned_watcher(root, tmp_path)
     manager = ClientStateManager(tmp_path / "client-state.json")
@@ -4795,6 +4796,54 @@ async def test_undecodable_source_does_not_block_reindex_acking_machine_wide(
     state = await manager.get_state()
     assert state.pending_uploads == []
     assert state.catchup_failures[str(history)].reason == durable_io.SOURCE_NOT_DECODABLE
+
+
+async def test_terminal_failure_does_not_block_reindex_acking_machine_wide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A terminal failure is a reported shortfall, not outstanding work.
+
+    Blocking completion on it means the server never learns this client
+    finished, for every source on the machine, forever. This drives the real
+    acking path rather than only observing the outbox, because the previous
+    version of this test asserted the outbox and never once called the function
+    whose behaviour it was named for.
+    """
+    acks: list[tuple[str, str | None]] = []
+
+    class AckAPI(FakeAPI):
+        async def ack_reindex(self, *, reindex_requested_at, status, reason=None):
+            acks.append((status, reason))
+
+    manager = ClientStateManager(tmp_path / "client-state.json")
+    requested_at = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+    await manager.prepare_reindex(requested_at)
+    await manager.mark_reindex_queued()
+    await manager.set_reindex_ack(status="queued")
+    await manager.record_catchup_failure(
+        CatchupInterval(
+            file_path="/history/unreadable.jsonl",
+            start_exclusive=0,
+            end_inclusive=8,
+            snapshot_digest="0" * 64,
+            generation=(await manager.get_state()).reindex_generation,
+        ),
+        "source_not_decodable",
+    )
+
+    state = await manager.get_state()
+    assert state.catchup_failures
+    assert state.pending_uploads == []
+
+    monkeypatch.setattr(watcher_module, "get_all_watchers", list)
+    await watcher_module._maybe_ack_reindex_completed(AckAPI(tmp_path / "x.jsonl"), manager)
+
+    assert acks, "a terminal failure must not suppress the completion ack"
+    status, reason = acks[-1]
+    assert status == "completed"
+    # The shortfall is reported rather than hidden.
+    assert reason is not None and "unreadable" in reason
 
 
 def test_outbox_positions_for_one_file_must_be_nondecreasing():

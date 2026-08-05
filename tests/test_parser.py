@@ -1,11 +1,13 @@
 """Tests for JSONL parser."""
 
+import builtins
 import json
 import logging
 from pathlib import Path
 
 import pytest
 
+from claude_history_rag.codex.parser import parse_codex_jsonl_file
 from claude_history_rag.parser import (
     decode_project_path,
     extract_text_content,
@@ -133,6 +135,58 @@ def test_missing_and_unreadable_sources_also_raise(tmp_path: Path):
     """The swallow shape is foreclosed for every failure, not one exception type."""
     with pytest.raises(FileNotFoundError):
         list(parse_jsonl_file(tmp_path / "absent.jsonl"))
+
+
+@pytest.mark.parametrize(
+    "reader,injected",
+    [
+        (parse_jsonl_file, PermissionError("denied")),
+        (parse_jsonl_file, OSError("device failure")),
+        (parse_codex_jsonl_file, FileNotFoundError("absent")),
+        (parse_codex_jsonl_file, PermissionError("denied")),
+        (parse_codex_jsonl_file, OSError("device failure")),
+    ],
+)
+def test_every_read_failure_propagates_from_both_parsers(
+    reader,
+    injected: OSError,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Each handler must diagnose AND re-raise.
+
+    A handler that logs and falls through lets the generator return normally
+    after reading nothing or only part of the source, which is indistinguishable
+    to the caller from a completed read - and the bounds the caller commits came
+    from the whole source. Every clause is exercised, not just the first.
+    """
+    record = json.dumps(
+        {
+            "type": "user",
+            "sessionId": "s",
+            "uuid": "u",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "hello"},
+        }
+    ).encode()
+    source = tmp_path / "session.jsonl"
+    source.write_bytes((record + b"\n") * 6)
+
+    real_open = builtins.open
+    opened = {"count": 0}
+
+    def fail_on_the_source(path, *args, **kwargs):
+        if str(path) == str(source):
+            opened["count"] += 1
+            raise injected
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_on_the_source)
+
+    with pytest.raises(type(injected)):
+        list(reader(source))
+
+    assert opened["count"] == 1
 
 
 @pytest.mark.parametrize(
