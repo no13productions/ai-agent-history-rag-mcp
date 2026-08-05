@@ -1,6 +1,7 @@
 """Status collector module for monitoring MCP server health and metrics."""
 
 import asyncio
+import hashlib
 import logging
 import os
 import platform
@@ -38,6 +39,20 @@ def _safe_error(context: str, exc: Exception) -> str:
     return f"{context}: {type(exc).__name__}"
 
 
+def _path_hash(value: Any) -> str:
+    """Return a stable identifier without disclosing a filesystem path."""
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _log_safe_failure(event: str, error: BaseException) -> None:
+    """Log only a stable reason and exception type."""
+    logger.error(
+        "%s: reason=operation_failed error_type=%s",
+        event,
+        type(error).__name__,
+    )
+
+
 def _safe_recent_error(error: dict[str, Any]) -> dict[str, Any]:
     """Return a redacted error entry suitable for status payloads."""
     details = error.get("details") or {}
@@ -52,7 +67,7 @@ def _safe_recent_error(error: dict[str, Any]) -> dict[str, Any]:
                 safe_details[key] = type(value).__name__
     return {
         "type": error.get("type"),
-        "message": error.get("message"),
+        "message": "redacted" if error.get("message") else None,
         "timestamp": error.get("timestamp"),
         "details": safe_details,
     }
@@ -183,7 +198,7 @@ class StatusCollector:
                     if file_path.is_file():
                         db_size += file_path.stat().st_size
             result["database_size_bytes"] = db_size
-            result["database_path"] = str(settings.db_path)
+            result["database_path_hash"] = _path_hash(settings.db_path)
 
         for key in (
             "backend",
@@ -231,7 +246,7 @@ class StatusCollector:
             return status
 
         except Exception as e:
-            logger.error(f"Failed to collect status: {e}", exc_info=True)
+            _log_safe_failure("Failed to collect status", e)
             return {
                 "error": "Failed to collect status",
                 "message": f"Status collection failed: {type(e).__name__}",
@@ -296,12 +311,14 @@ class StatusCollector:
                 "status": "degraded",
                 "error": _safe_error("Database check failed", e),
             }
-            db_error = str(e)
+            db_error = type(e).__name__
         else:
             db_error = stats.get("error") if stats else degraded_reason
 
-        # Data integrity check (e.g., missing Lance files)
-        if db_error and "LanceError(IO)" in str(db_error):
+        # Data integrity check (e.g., missing Lance files). The value can be a
+        # non-string when a backend reports a structured error, so it is coerced
+        # before the membership test rather than raising here.
+        if db_error and "LanceError" in str(db_error):
             checks["database_integrity"] = {
                 "status": "error",
                 "error": "LanceDB files missing or corrupted. Re-index required.",
@@ -401,7 +418,7 @@ class StatusCollector:
             )
             return self._database_stats_payload(stats, stats_source, degraded_reason)
         except Exception as e:
-            logger.error(f"Failed to get database stats: {e}")
+            _log_safe_failure("Failed to get database stats", e)
             return {
                 "status": "degraded",
                 "error": _safe_error("Database stats failed", e),
@@ -424,10 +441,10 @@ class StatusCollector:
                     "files_indexed": indexed,
                     "files_pending": queue_size,
                     "files_failed": source_watcher.failed_files_count,
-                    "failed_files": failed_files[:FAILED_FILES_STATUS_LIMIT],
+                    "failed_file_hashes": failed_files[:FAILED_FILES_STATUS_LIMIT],
                     "failed_files_truncated": len(failed_files) > FAILED_FILES_STATUS_LIMIT,
                     "is_running": source_watcher.is_running,
-                    "watch_path": str(source_watcher.projects_path),
+                    "watch_path_hash": _path_hash(source_watcher.projects_path),
                     "discovery_source": "watcher_state",
                 }
             files_discovered = sum(s["files_discovered"] for s in source_status.values())
@@ -448,7 +465,7 @@ class StatusCollector:
                 "sources": source_status,
             }
         except Exception as e:
-            logger.error(f"Failed to get indexing status: {e}")
+            _log_safe_failure("Failed to get indexing status", e)
             return {"error": _safe_error("Indexing status failed", e)}
 
     def _get_performance_metrics(self) -> dict[str, Any]:
@@ -480,7 +497,7 @@ class StatusCollector:
                 "avg_query_latency_ms": round(avg_latency, 2),
             }
         except Exception as e:
-            logger.error(f"Failed to get performance metrics: {e}")
+            _log_safe_failure("Failed to get performance metrics", e)
             return {"error": _safe_error("Performance metrics failed", e)}
 
     def _get_cache_stats(self) -> dict[str, Any]:
@@ -498,7 +515,7 @@ class StatusCollector:
                 "ttl_seconds": cache.default_ttl,
             }
         except Exception as e:
-            logger.error(f"Failed to get cache stats: {e}")
+            _log_safe_failure("Failed to get cache stats", e)
             return {"error": _safe_error("Cache stats failed", e)}
 
     def _get_embedder_stats(self) -> dict[str, Any]:
@@ -531,7 +548,7 @@ class StatusCollector:
                 "loaded": embedder is not None,
             }
         except Exception as e:
-            logger.error(f"Failed to get embedder stats: {e}")
+            _log_safe_failure("Failed to get embedder stats", e)
             return {"error": _safe_error("Embedder stats failed", e)}
 
     def _get_watcher_stats(self) -> dict[str, Any]:
@@ -544,7 +561,7 @@ class StatusCollector:
                     "queue_size": watcher.queue.qsize(),
                     "queue_max_size": watcher.queue.maxsize,
                     "failed_files_count": watcher.failed_files_count,
-                    "watch_path": str(watcher.projects_path),
+                    "watch_path_hash": _path_hash(watcher.projects_path),
                 }
                 for watcher in watchers
             }
@@ -557,12 +574,12 @@ class StatusCollector:
                 "all_sources_running": bool(watchers) and running_sources == len(watchers),
                 "running_sources": running_sources,
                 "total_sources": len(watchers),
-                "projects_path": str(settings.projects_path),
-                "codex_sessions_path": str(settings.codex_sessions_path),
-                "gemini_sessions_path": str(settings.gemini_sessions_path),
-                "antigravity_sessions_path": str(settings.antigravity_sessions_path),
-                "chatgpt_exports_path": str(settings.chatgpt_exports_path),
-                "claude_app_exports_path": str(settings.claude_app_exports_path),
+                "projects_path_hash": _path_hash(settings.projects_path),
+                "codex_sessions_path_hash": _path_hash(settings.codex_sessions_path),
+                "gemini_sessions_path_hash": _path_hash(settings.gemini_sessions_path),
+                "antigravity_sessions_path_hash": _path_hash(settings.antigravity_sessions_path),
+                "chatgpt_exports_path_hash": _path_hash(settings.chatgpt_exports_path),
+                "claude_app_exports_path_hash": _path_hash(settings.claude_app_exports_path),
                 "debounce_ms": watchers[0].debounce_ms if watchers else settings.debounce_delay,
                 "queue_size": queue_size,
                 "queue_max_size": sum(source["queue_max_size"] for source in source_stats.values()),
@@ -570,7 +587,7 @@ class StatusCollector:
                 "sources": source_stats,
             }
         except Exception as e:
-            logger.error(f"Failed to get watcher stats: {e}")
+            _log_safe_failure("Failed to get watcher stats", e)
             return {"error": _safe_error("Watcher stats failed", e)}
 
     def _get_error_stats(self) -> dict[str, Any]:
@@ -589,18 +606,18 @@ class StatusCollector:
             registry = get_client_registry()
             return registry.get_client_status()
         except Exception as e:
-            logger.error(f"Failed to get client registry stats: {e}")
+            _log_safe_failure("Failed to get client registry stats", e)
             return {"error": _safe_error("Client registry stats failed", e)}
 
     def _get_configuration(self) -> dict[str, Any]:
         """Get current configuration."""
         configuration = {
-            "projects_path": str(settings.projects_path),
-            "codex_sessions_path": str(settings.codex_sessions_path),
-            "gemini_sessions_path": str(settings.gemini_sessions_path),
-            "antigravity_sessions_path": str(settings.antigravity_sessions_path),
-            "chatgpt_exports_path": str(settings.chatgpt_exports_path),
-            "claude_app_exports_path": str(settings.claude_app_exports_path),
+            "projects_path_hash": _path_hash(settings.projects_path),
+            "codex_sessions_path_hash": _path_hash(settings.codex_sessions_path),
+            "gemini_sessions_path_hash": _path_hash(settings.gemini_sessions_path),
+            "antigravity_sessions_path_hash": _path_hash(settings.antigravity_sessions_path),
+            "chatgpt_exports_path_hash": _path_hash(settings.chatgpt_exports_path),
+            "claude_app_exports_path_hash": _path_hash(settings.claude_app_exports_path),
             "storage_backend": settings.storage_backend,
             "spanner_project": settings.spanner_project,
             "spanner_instance": settings.spanner_instance,
@@ -626,12 +643,12 @@ class StatusCollector:
             "status_server_host": settings.status_server_host,
             "status_server_port_configured": settings.status_server_port,
             "auth_enabled": settings.auth_enabled,
-            "auth_state_path": str(settings.auth_state_path),
-            "client_auth_path": str(settings.client_auth_path),
+            "auth_state_path_hash": _path_hash(settings.auth_state_path),
+            "client_auth_path_hash": _path_hash(settings.client_auth_path),
             "runtime_contract": settings.runtime_contract,
         }
         if settings.storage_backend == "lancedb":
-            configuration["db_path"] = str(settings.db_path)
+            configuration["db_path_hash"] = _path_hash(settings.db_path)
         return configuration
 
 

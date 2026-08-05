@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_history_rag.chunker import generate_chunk_id, split_content
+from claude_history_rag.chunker import source_hash as _source_hash
 from claude_history_rag.codex.parser import parse_codex_jsonl_file
 from claude_history_rag.models import Chunk
 
@@ -382,14 +383,28 @@ def _create_file_change_chunks(
     return chunks
 
 
-def chunk_codex_session_file(file_path: Path, start_line: int = 0) -> Iterator[Chunk]:
-    """Process a Codex session JSONL file and yield chunks."""
-    logger.debug(f"Starting Codex chunking: {file_path} from line {start_line}")
+def chunk_codex_session_file(
+    file_path: Path,
+    start_line: int = 0,
+    *,
+    source_path: Path | None = None,
+) -> Iterator[Chunk]:
+    """Process a Codex session JSONL file and yield chunks.
 
-    source_file = str(file_path)
+    ``file_path`` supplies the bytes and may be an immutable private snapshot;
+    ``source_path`` supplies the provenance recorded on every emitted chunk.
+    """
+    provenance = Path(source_path) if source_path is not None else file_path
+    logger.debug(
+        "Starting Codex chunking: source=%s from_line=%d",
+        _source_hash(str(provenance)),
+        start_line,
+    )
+
+    source_file = str(provenance)
     chunk_counts: dict[str, int] = defaultdict(int)
 
-    session_id = _session_id_from_filename(file_path) or "unknown"
+    session_id = _session_id_from_filename(provenance) or "unknown"
     session_cwd: str | None = None
     last_cwd: str | None = None
     model: str | None = None
@@ -615,6 +630,9 @@ def chunk_codex_session_file(file_path: Path, start_line: int = 0) -> Iterator[C
 
     total = sum(chunk_counts.values())
     logger.info(
-        f"Completed Codex chunking {file_path.name}: {total} chunks "
-        f"(turns={chunk_counts['turn']}, file_changes={chunk_counts['file_change']})"
+        "Completed Codex chunking: source=%s chunks=%d turns=%d file_changes=%d",
+        _source_hash(source_file),
+        total,
+        chunk_counts["turn"],
+        chunk_counts["file_change"],
     )

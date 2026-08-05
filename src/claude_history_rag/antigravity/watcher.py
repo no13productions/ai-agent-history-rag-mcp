@@ -32,5 +32,6 @@ def get_antigravity_watcher() -> HistoryWatcher:
                     chunker=chunk_antigravity_file,
                     source_name="Antigravity",
                     path_filter=_is_antigravity_file,
+                    cursor_semantics="unsupported_snapshot",
                 )
     return antigravity_watcher

@@ -13,7 +13,6 @@ import json
 import logging
 import re
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +23,7 @@ from claude_history_rag.auth import AuthCheckResult, get_auth_manager
 from claude_history_rag.client_registry import get_client_registry
 from claude_history_rag.config import settings
 from claude_history_rag.models import (
+    MAX_CHUNK_UPLOAD_REQUEST_BYTES,
     AuthRotateAckRequest,
     ChunkUploadRequest,
     ChunkUploadResponse,
@@ -47,6 +47,55 @@ from claude_history_rag.status import get_status_collector
 from claude_history_rag.time_filters import parse_timeframe
 
 logger = logging.getLogger(__name__)
+
+
+def _log_safe_failure(event: str, error: BaseException, *, phase: str | None = None) -> None:
+    """Emit a stable diagnostic without exception text or traceback."""
+    logger.error(
+        "%s: reason=operation_failed error_type=%s phase=%s",
+        event,
+        type(error).__name__,
+        phase or "none",
+    )
+
+
+def _validation_error_field(error: ValidationError) -> str:
+    """Return one stable field label for a rejected request.
+
+    A model-level validator reports an empty location, so indexing the location
+    directly raises inside the handler's own except block and escapes it. Any
+    missing or empty location degrades to a fixed label instead.
+    """
+    details = error.errors()
+    if not details:
+        return "request"
+    location = details[0].get("loc") or ()
+    return str(location[-1]) if location else "request"
+
+
+def _safe_content_length(request: Any) -> int | None:
+    """Return the transport-parsed request size, or None when it is unusable.
+
+    The parsed accessor coerces the header with int(), so a malformed value
+    raises. This is read before the handler's try block purely for diagnostics,
+    so it must never be the thing that fails the request.
+    """
+    try:
+        return request.content_length
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _hash_identifier(value: str) -> str:
+    """Return the stable short digest used for every logged identifier.
+
+    Client-supplied identifiers reach diagnostics verbatim otherwise, which both
+    discloses machine identity and lets an embedded newline forge a log record.
+    The digest matches the watcher's own source hashing so client and server
+    diagnostics still join on one value.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
 
 # Server-side state for tracking per-machine file positions
 # Structure: {machine_id: {file_path: line_number}}
@@ -154,7 +203,10 @@ class StatusServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         self.host = host
         self.port = port
-        self.app = web.Application()
+        # aiohttp rejects when accumulated body bytes are >= client_max_size.
+        # The application contract admits an inclusive 1 MiB request, so the
+        # transport ceiling must sit one byte above it.
+        self.app = web.Application(client_max_size=MAX_CHUNK_UPLOAD_REQUEST_BYTES + 1)
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self._setup_routes()
@@ -278,7 +330,7 @@ class StatusServer:
 
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
-            logger.error(f"Failed to serve dashboard: {e}", exc_info=True)
+            _log_safe_failure("Failed to serve dashboard", e)
             return web.Response(
                 text=f"Error loading dashboard: {type(e).__name__}",
                 status=500,
@@ -319,7 +371,7 @@ class StatusServer:
             )
             return web.json_response(status)
         except Exception as e:
-            logger.error(f"Failed to collect status: {e}", exc_info=True)
+            _log_safe_failure("Failed to collect status", e)
             return web.json_response(
                 {"error": f"Status collection failed: {type(e).__name__}"}, status=500
             )
@@ -343,7 +395,7 @@ class StatusServer:
             else:
                 return web.json_response({"status": "unhealthy"}, status=503)
         except Exception as e:
-            logger.error(f"Health check failed: {e}", exc_info=True)
+            _log_safe_failure("Health check failed", e)
             return web.json_response(
                 {"status": "error", "error": f"Health check failed: {type(e).__name__}"},
                 status=503,
@@ -362,7 +414,7 @@ class StatusServer:
             metrics = self._convert_to_prometheus(status)
             return web.Response(text=metrics, content_type="text/plain; version=0.0.4")
         except Exception as e:
-            logger.error(f"Failed to generate metrics: {e}", exc_info=True)
+            _log_safe_failure("Failed to generate metrics", e)
             return web.Response(text=f"# Error: metrics_failed:{type(e).__name__}\n", status=500)
 
     async def handle_trigger_index(self, request: web.Request) -> web.Response:
@@ -388,7 +440,7 @@ class StatusServer:
                 }
             )
         except Exception as e:
-            logger.error(f"Failed to trigger indexing: {e}", exc_info=True)
+            _log_safe_failure("Failed to trigger indexing", e)
             return web.json_response(
                 {
                     "status": "error",
@@ -399,6 +451,7 @@ class StatusServer:
 
     async def handle_trigger_reindex(self, request: web.Request) -> web.Response:
         """Force full re-index: clear positions, clear database, and re-index all files."""
+        phase = "authenticate"
         try:
             auth_result = await self._require_auth(request)
             if isinstance(auth_result, web.Response):
@@ -411,6 +464,7 @@ class StatusServer:
             registry = get_client_registry()
 
             # Clear the database first (removes all embeddings)
+            phase = "clear_store"
             chunks_deleted = await store.clear_all_async()
             logger.info(f"Cleared {chunks_deleted} chunks from database")
             _clear_machine_positions()
@@ -418,10 +472,12 @@ class StatusServer:
             # Force full re-index (resets positions and queues files)
             files_reset = 0
             files_queued = 0
+            phase = "queue_sources"
             for watcher in watchers:
                 reset_count, queued_count = await watcher.force_full_reindex()
                 files_reset += reset_count
                 files_queued += queued_count
+            phase = "mark_requested"
             reindex_requested_at = registry.mark_reindex_requested()
 
             logger.info(
@@ -440,7 +496,7 @@ class StatusServer:
                 }
             )
         except Exception as e:
-            logger.error(f"Failed to trigger re-index: {e}", exc_info=True)
+            _log_safe_failure("Failed to trigger re-index", e, phase=phase)
             return web.json_response(
                 {
                     "status": "error",
@@ -458,8 +514,9 @@ class StatusServer:
 
         Receives chunks without vectors, embeds them, and stores in LanceDB.
         """
+        global _machine_positions
         start = time.monotonic()
-        content_length = request.headers.get("Content-Length")
+        content_length = _safe_content_length(request)
         try:
             data = await request.json()
             upload_request = ChunkUploadRequest(**data)
@@ -489,14 +546,16 @@ class StatusServer:
                 return web.json_response(response.model_dump(), status=400)
 
             logger.info(
-                f"Received {len(upload_request.chunks)} chunks from machine "
-                f"'{upload_request.machine_id}' for file '{upload_request.source_file}'"
+                "Received chunk upload: machine_hash=%s chunks=%d source=%s",
+                _hash_identifier(upload_request.machine_id),
+                len(upload_request.chunks),
+                _hash_identifier(upload_request.source_file),
             )
             logger.debug(
-                "Chunk upload meta: machine_id=%s client_name=%s file=%s position=%s content_length=%s",
-                upload_request.machine_id,
-                upload_request.client_name or upload_request.machine_id,
-                upload_request.source_file,
+                "Chunk upload meta: machine_hash=%s client_hash=%s source=%s position=%s content_length=%s",
+                _hash_identifier(upload_request.machine_id),
+                _hash_identifier(upload_request.client_name or upload_request.machine_id),
+                _hash_identifier(upload_request.source_file),
                 upload_request.file_position,
                 content_length,
             )
@@ -517,7 +576,36 @@ class StatusServer:
                 embedder = get_embedder()
                 embedded_chunks = await embedder.embed_chunks(upload_request.chunks)
 
+            if len(embedded_chunks) != len(upload_request.chunks):
+                response = ChunkUploadResponse(
+                    status="error",
+                    chunks_received=len(upload_request.chunks),
+                    chunks_embedded=len(embedded_chunks),
+                    chunks_stored=0,
+                    auth=self._auth_payload(auth_result),
+                    error="incomplete_embedding_batch",
+                )
+                return web.json_response(response.model_dump(), status=503)
+
             if not embedded_chunks:
+                if upload_request.machine_id not in _machine_positions:
+                    _machine_positions[upload_request.machine_id] = {}
+                _machine_positions[upload_request.machine_id][upload_request.source_file] = max(
+                    _machine_positions[upload_request.machine_id].get(
+                        upload_request.source_file, 0
+                    ),
+                    upload_request.file_position,
+                )
+                registry.record_upload(
+                    upload_request.machine_id,
+                    client_name=upload_request.client_name or upload_request.machine_id,
+                )
+                logger.info(
+                    "Committed cursor-only upload: machine_hash=%s position=%d source=%s",
+                    _hash_identifier(upload_request.machine_id),
+                    upload_request.file_position,
+                    _hash_identifier(upload_request.source_file),
+                )
                 reindex_required, reindex_requested_at = registry.get_reindex_status(
                     upload_request.machine_id
                 )
@@ -529,7 +617,7 @@ class StatusServer:
                     reindex_required=reindex_required,
                     reindex_requested_at=reindex_requested_at,
                     auth=self._auth_payload(auth_result),
-                    message="No chunks were successfully embedded",
+                    message="Consumed cursor committed without chunk emissions",
                 )
                 return web.json_response(response.model_dump())
 
@@ -540,18 +628,19 @@ class StatusServer:
                 client_name=upload_request.client_name or upload_request.machine_id,
             )
             logger.info(
-                "Stored %d chunks for machine %s (embed_time=%.2fms)",
+                "Stored uploaded chunks: machine_hash=%s chunks=%d source=%s embed_time_ms=%.2f",
+                _hash_identifier(upload_request.machine_id),
                 len(embedded_chunks),
-                upload_request.machine_id,
+                _hash_identifier(upload_request.source_file),
                 (time.monotonic() - start) * 1000,
             )
 
             # Update the machine's file position
-            global _machine_positions
             if upload_request.machine_id not in _machine_positions:
                 _machine_positions[upload_request.machine_id] = {}
-            _machine_positions[upload_request.machine_id][upload_request.source_file] = (
-                upload_request.file_position
+            _machine_positions[upload_request.machine_id][upload_request.source_file] = max(
+                _machine_positions[upload_request.machine_id].get(upload_request.source_file, 0),
+                upload_request.file_position,
             )
 
             reindex_required, reindex_requested_at = registry.get_reindex_status(
@@ -570,15 +659,15 @@ class StatusServer:
             )
             return web.json_response(response.model_dump())
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in chunk upload: {e}")
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in chunk upload: reason=json_invalid")
             response = ChunkUploadResponse(
                 status="error",
                 chunks_received=0,
                 chunks_embedded=0,
                 chunks_stored=0,
                 auth=None,
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
@@ -588,14 +677,13 @@ class StatusServer:
                 chunks_embedded=0,
                 chunks_stored=0,
                 auth=None,
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
-        except web.HTTPRequestEntityTooLarge as e:
+        except web.HTTPRequestEntityTooLarge:
             logger.error(
-                "Chunk upload too large: content_length=%s error=%s",
+                "Chunk upload too large: content_length=%s",
                 content_length,
-                e,
             )
             response = ChunkUploadResponse(
                 status="error",
@@ -607,7 +695,7 @@ class StatusServer:
             )
             return web.json_response(response.model_dump(), status=413)
         except Exception as e:
-            logger.error(f"Chunk upload failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Chunk upload failed", e)
             response = ChunkUploadResponse(
                 status="error",
                 chunks_received=0,
@@ -672,40 +760,40 @@ class StatusServer:
             )
             return web.json_response(response.model_dump())
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in search request: {e}")
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in search request: reason=json_invalid")
             response = SearchResponse(
                 results=[],
                 count=0,
                 query="",
                 search_type="error",
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = SearchResponse(
                 results=[],
                 count=0,
-                query=data.get("query", "") if "data" in dir() else "",
+                query="",
                 search_type="error",
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
-        except ValueError as e:
+        except ValueError:
             response = SearchResponse(
                 results=[],
                 count=0,
-                query=data.get("query", "") if "data" in dir() else "",
+                query="",
                 search_type="error",
-                error=str(e),
+                error="invalid_value",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"Search failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Search failed", e)
             response = SearchResponse(
                 results=[],
                 count=0,
-                query=data.get("query", "") if "data" in dir() else "",
+                query="",
                 search_type="error",
                 error=f"Search failed: {type(e).__name__}",
             )
@@ -768,30 +856,30 @@ class StatusServer:
             )
             return web.json_response(response.model_dump())
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in file search request: {e}")
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in file search request: reason=json_invalid")
             response = FileSearchResponse(
                 results=[],
                 count=0,
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = FileSearchResponse(
                 results=[],
                 count=0,
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
-        except ValueError as e:
+        except ValueError:
             response = FileSearchResponse(
                 results=[],
                 count=0,
-                error=str(e),
+                error="invalid_value",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"File search failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("File search failed", e)
             response = FileSearchResponse(
                 results=[],
                 count=0,
@@ -853,23 +941,23 @@ class StatusServer:
             )
             return web.json_response(response.model_dump())
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in session summary request: {e}")
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in session summary request: reason=json_invalid")
             response = SessionSummaryResponse(
                 summaries=[],
                 count=0,
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = SessionSummaryResponse(
                 summaries=[],
                 count=0,
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"Session summary failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Session summary failed", e)
             response = SessionSummaryResponse(
                 summaries=[],
                 count=0,
@@ -907,20 +995,19 @@ class StatusServer:
             return web.json_response(response.model_dump())
 
         except Exception as e:
-            logger.error(f"Get positions failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Get positions failed", e)
             response = GetPositionsResponse(
-                machine_id=request.match_info.get("machine_id", "unknown"),
+                machine_id="unknown",
                 positions={},
                 error=f"Get positions failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
 
     async def handle_api_sync_position(self, request: web.Request) -> web.Response:
-        """Update file position for a machine."""
+        """Reject the retired direct cursor mutation route."""
         try:
             data = await request.json()
             sync_request = PositionSyncRequest(**data)
-            registry = get_client_registry()
             auth_result = await self._require_auth(
                 request,
                 machine_id=sync_request.machine_id,
@@ -929,52 +1016,41 @@ class StatusServer:
             )
             if isinstance(auth_result, web.Response):
                 return auth_result
-            registry.register_client(
-                sync_request.machine_id,
-                client_name=sync_request.client_name or sync_request.machine_id,
-            )
-
-            global _machine_positions
-            if sync_request.machine_id not in _machine_positions:
-                _machine_positions[sync_request.machine_id] = {}
-            _machine_positions[sync_request.machine_id][sync_request.file_path] = (
-                sync_request.position
-            )
-
             response = PositionSyncResponse(
-                status="ok",
+                status="error",
                 machine_id=sync_request.machine_id,
                 file_path=sync_request.file_path,
-                position=sync_request.position,
+                position=0,
                 auth=self._auth_payload(auth_result),
+                error="cursor_sync_forbidden",
             )
-            return web.json_response(response.model_dump())
+            return web.json_response(response.model_dump(), status=409)
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in position sync: {e}")
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in position sync: reason=json_invalid")
             response = PositionSyncResponse(
                 status="error",
                 machine_id="",
                 file_path="",
                 position=0,
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = PositionSyncResponse(
                 status="error",
-                machine_id=data.get("machine_id", "") if "data" in dir() else "",
-                file_path=data.get("file_path", "") if "data" in dir() else "",
+                machine_id="",
+                file_path="",
                 position=0,
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"Position sync failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Position sync failed", e)
             response = PositionSyncResponse(
                 status="error",
-                machine_id=data.get("machine_id", "") if "data" in dir() else "",
-                file_path=data.get("file_path", "") if "data" in dir() else "",
+                machine_id="",
+                file_path="",
                 position=0,
                 error=f"Position sync failed: {type(e).__name__}",
             )
@@ -1005,12 +1081,11 @@ class StatusServer:
                 client_name=ack_request.client_name or ack_request.machine_id,
             )
             logger.info(
-                "Reindex ack: machine_id=%s client_name=%s status=%s requested_at=%s reason=%s",
-                ack_request.machine_id,
-                ack_request.client_name or ack_request.machine_id,
+                "Reindex ack: machine_hash=%s client_hash=%s status=%s requested_at=%s",
+                _hash_identifier(ack_request.machine_id),
+                _hash_identifier(ack_request.client_name or ack_request.machine_id),
                 ack_request.status,
                 ack_request.reindex_requested_at,
-                ack_request.reason,
             )
 
             response = ReindexAckResponse(
@@ -1021,25 +1096,25 @@ class StatusServer:
                 message="Reindex acknowledgement recorded",
             )
             return web.json_response(response.model_dump())
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             response = ReindexAckResponse(
                 status="error",
                 machine_id="",
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = ReindexAckResponse(
                 status="error",
-                machine_id=data.get("machine_id", "") if "data" in dir() else "",
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                machine_id="",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"Reindex ack failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Reindex ack failed", e)
             response = ReindexAckResponse(
                 status="error",
-                machine_id=data.get("machine_id", "") if "data" in dir() else "",
+                machine_id="",
                 error=f"Reindex acknowledgement failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
@@ -1062,9 +1137,9 @@ class StatusServer:
                 return auth_result
 
             logger.warning(
-                "Purging client data: machine_id=%s reason=%s",
-                purge_request.machine_id,
-                purge_request.reason,
+                "Purging client data: machine_hash=%s reason_hash=%s",
+                _hash_identifier(purge_request.machine_id),
+                _hash_identifier(purge_request.reason or "none"),
             )
             chunks_deleted = await store.delete_by_machine_id_async(purge_request.machine_id)
             _clear_machine_positions(purge_request.machine_id)
@@ -1078,25 +1153,25 @@ class StatusServer:
                 message="Client data purged",
             )
             return web.json_response(response.model_dump())
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             response = PurgeClientResponse(
                 status="error",
                 machine_id="",
-                error=f"Invalid JSON: {e}",
+                error="invalid_json",
             )
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = PurgeClientResponse(
                 status="error",
-                machine_id=data.get("machine_id", "") if "data" in dir() else "",
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                machine_id="",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"Purge client failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Purge client failed", e)
             response = PurgeClientResponse(
                 status="error",
-                machine_id=data.get("machine_id", "") if "data" in dir() else "",
+                machine_id="",
                 error=f"Purge failed: {type(e).__name__}",
             )
             return web.json_response(response.model_dump(), status=500)
@@ -1132,17 +1207,17 @@ class StatusServer:
                 message="Heartbeat recorded",
             )
             return web.json_response(response.model_dump())
-        except json.JSONDecodeError as e:
-            response = ClientHeartbeatResponse(status="error", error=f"Invalid JSON: {e}")
+        except json.JSONDecodeError:
+            response = ClientHeartbeatResponse(status="error", error="invalid_json")
             return web.json_response(response.model_dump(), status=400)
         except ValidationError as e:
             response = ClientHeartbeatResponse(
                 status="error",
-                error=f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}",
+                error=f"Invalid request: {_validation_error_field(e)}",
             )
             return web.json_response(response.model_dump(), status=400)
         except Exception as e:
-            logger.error(f"Heartbeat failed: {type(e).__name__}: {e}", exc_info=True)
+            _log_safe_failure("Heartbeat failed", e)
             response = ClientHeartbeatResponse(
                 status="error",
                 error=f"Heartbeat failed: {type(e).__name__}",
@@ -1180,7 +1255,7 @@ class StatusServer:
             }
             return web.json_response(response)
         except Exception as e:
-            logger.error("Auth state failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Auth state failed", e)
             return web.json_response({"error": f"auth_state_failed:{type(e).__name__}"}, status=500)
 
     async def handle_api_auth_rotate(self, request: web.Request) -> web.Response:
@@ -1201,15 +1276,15 @@ class StatusServer:
             for machine_id in allowlist:
                 registry.set_rotation_awaiting(machine_id)
             return web.json_response({"status": "ok", **result})
-        except json.JSONDecodeError as e:
-            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
         except ValidationError as e:
             return web.json_response(
-                {"error": f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}"},
+                {"error": f"Invalid request: {_validation_error_field(e)}"},
                 status=400,
             )
         except Exception as e:
-            logger.error("Auth rotate failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Auth rotate failed", e)
             return web.json_response(
                 {"error": f"auth_rotate_failed:{type(e).__name__}"}, status=500
             )
@@ -1228,10 +1303,10 @@ class StatusServer:
             if not auth_manager.keep_on_allowlist(machine_id):
                 return web.json_response({"error": "allowlist_expired"}, status=400)
             return web.json_response({"status": "ok"})
-        except json.JSONDecodeError as e:
-            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
         except Exception as e:
-            logger.error("Auth allowlist keep failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Auth allowlist keep failed", e)
             return web.json_response(
                 {"error": f"auth_allowlist_keep_failed:{type(e).__name__}"}, status=500
             )
@@ -1255,10 +1330,10 @@ class StatusServer:
             registry = get_client_registry()
             registry.record_key_rotation_error(machine_id, data.get("error", "rotation_failed"))
             return web.json_response({"status": "ok"})
-        except json.JSONDecodeError as e:
-            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
         except Exception as e:
-            logger.error("Auth rotation error record failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Auth rotation error record failed", e)
             return web.json_response(
                 {"error": f"auth_rotation_error_failed:{type(e).__name__}"}, status=500
             )
@@ -1279,15 +1354,15 @@ class StatusServer:
             registry = get_client_registry()
             registry.mark_key_rotated(ack_request.machine_id, ack_request.rotate_id)
             return web.json_response({"status": "ok"})
-        except json.JSONDecodeError as e:
-            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
         except ValidationError as e:
             return web.json_response(
-                {"error": f"Invalid request: {e.errors()[0].get('loc', ['request'])[-1]}"},
+                {"error": f"Invalid request: {_validation_error_field(e)}"},
                 status=400,
             )
         except Exception as e:
-            logger.error("Auth rotation ack failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Auth rotation ack failed", e)
             return web.json_response(
                 {"error": f"auth_rotation_ack_failed:{type(e).__name__}"}, status=500
             )
@@ -1301,7 +1376,7 @@ class StatusServer:
             auth_manager = get_auth_manager()
             return web.json_response({"dashboard_hash": auth_manager.get_dashboard_hash()})
         except Exception as e:
-            logger.error("Dashboard hash failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Dashboard hash failed", e)
             return web.json_response(
                 {"error": f"dashboard_hash_failed:{type(e).__name__}"}, status=500
             )
@@ -1322,7 +1397,7 @@ class StatusServer:
                 return web.json_response({"error": "key_unavailable"}, status=404)
             return web.json_response({"key": key})
         except Exception as e:
-            logger.error("Auth key reveal failed: %s", type(e).__name__, exc_info=True)
+            _log_safe_failure("Auth key reveal failed", e)
             return web.json_response({"error": f"auth_key_failed:{type(e).__name__}"}, status=500)
 
     def _convert_to_prometheus(self, status: dict[str, Any]) -> str:
@@ -1441,7 +1516,7 @@ class StatusServer:
                 )
             raise
         except Exception as e:
-            logger.error(f"Failed to start status server: {e}", exc_info=True)
+            _log_safe_failure("Failed to start status server", e)
             raise
 
     async def stop(self):
@@ -1458,7 +1533,7 @@ class StatusServer:
                 logger.info("[STATUS_SERVER] AppRunner cleaned up")
             logger.info("Status server stopped")
         except Exception as e:
-            logger.error(f"[STATUS_SERVER] Error stopping status server: {e}", exc_info=True)
+            _log_safe_failure("Status server stop failed", e)
 
 
 # Global server instance
@@ -1478,9 +1553,9 @@ def create_status_server() -> StatusServer:
     """Create and return the global status server instance."""
     global _status_server
     logger.info(
-        f"[STATUS_SERVER] create_status_server() called. Current instance: {_status_server}"
+        "[STATUS_SERVER] create_status_server called: existing=%s",
+        _status_server is not None,
     )
-    logger.info(f"[STATUS_SERVER] Call stack:\n{''.join(traceback.format_stack()[-5:-1])}")
     if _status_server is None:
         logger.info("[STATUS_SERVER] Creating new StatusServer instance")
         _status_server = StatusServer(

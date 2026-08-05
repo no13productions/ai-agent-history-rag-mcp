@@ -32,5 +32,6 @@ def get_gemini_watcher() -> HistoryWatcher:
                     chunker=chunk_gemini_session_file,
                     source_name="Gemini",
                     path_filter=_is_gemini_history_file,
+                    cursor_semantics="unsupported_snapshot",
                 )
     return gemini_watcher

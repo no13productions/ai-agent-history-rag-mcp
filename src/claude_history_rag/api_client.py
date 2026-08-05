@@ -31,6 +31,7 @@ from claude_history_rag.models import (
     SearchResponse,
     SessionSummaryRequest,
     SessionSummaryResponse,
+    chunk_upload_request_body,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,7 @@ class APIClient:
         method: str,
         endpoint: str,
         json_data: dict[str, Any] | None = None,
+        content_data: bytes | None = None,
         params: dict[str, Any] | None = None,
         allow_rotate: bool = True,
     ) -> dict[str, Any]:
@@ -216,6 +218,8 @@ class APIClient:
         """
         client = await self._ensure_client()
         url = f"{self.server_url}{endpoint}"
+        if json_data is not None and content_data is not None:
+            raise ValueError("request cannot carry both JSON data and canonical content")
 
         last_error: Exception | None = None
 
@@ -225,7 +229,11 @@ class APIClient:
                 if method.upper() == "GET":
                     response = await client.get(url, params=params, headers=headers)
                 elif method.upper() == "POST":
-                    response = await client.post(url, json=json_data, headers=headers)
+                    if content_data is not None:
+                        headers = {**headers, "Content-Type": "application/json"}
+                        response = await client.post(url, content=content_data, headers=headers)
+                    else:
+                        response = await client.post(url, json=json_data, headers=headers)
                 else:
                     raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -259,7 +267,10 @@ class APIClient:
 
             except httpx.HTTPStatusError as e:
                 last_error = e
-                logger.error(f"HTTP error from server: {e.response.status_code}")
+                logger.error(
+                    "Request failed: reason=http_status_error status=%d",
+                    e.response.status_code,
+                )
                 # Don't retry on HTTP errors (server is reachable but request failed)
                 self._connected = True
                 raise ServerConnectionError(
@@ -267,8 +278,15 @@ class APIClient:
                 ) from e
 
             except Exception as e:
+                # Transport exception text is attacker-influenced: it can carry
+                # request content and embedded newlines that forge log records.
+                # Only the fixed reason and the exception type are ever emitted.
                 last_error = e
-                logger.error(f"Unexpected error: {type(e).__name__}: {e}")
+                logger.error(
+                    "Request failed: reason=unexpected_transport_error error_type=%s attempt=%d",
+                    type(e).__name__,
+                    attempt + 1,
+                )
                 if attempt < self.retry_count - 1:
                     await asyncio.sleep(self.retry_delay_seconds)
 
@@ -315,17 +333,24 @@ class APIClient:
             source_file=source_file,
             file_position=file_position,
         )
+        canonical_body = chunk_upload_request_body(
+            chunks,
+            machine_id=request.machine_id,
+            client_name=request.client_name,
+            source_file=request.source_file,
+            file_position=request.file_position,
+        )
         logger.debug(
-            "POST /api/chunks machine_id=%s client_name=%s file=%s position=%s chunks=%d",
-            self.machine_id,
-            self.client_name,
-            source_file,
+            "POST /api/chunks machine=%s client=%s source=%s position=%s chunks=%d",
+            hashlib.sha256(self.machine_id.encode()).hexdigest()[:12],
+            hashlib.sha256(self.client_name.encode()).hexdigest()[:12],
+            hashlib.sha256(source_file.encode()).hexdigest()[:12],
             file_position,
             len(chunks),
         )
 
         response_data = await self._request_with_retry(
-            "POST", "/api/chunks", request.model_dump(mode="json")
+            "POST", "/api/chunks", content_data=canonical_body
         )
 
         return ChunkUploadResponse(**response_data)

@@ -29,5 +29,6 @@ def get_chatgpt_watcher() -> HistoryWatcher:
                     chunker=chunk_chatgpt_export_file,
                     source_name="ChatGPT",
                     path_filter=_is_chatgpt_export_file,
+                    cursor_semantics="unsupported_snapshot",
                 )
     return chatgpt_watcher

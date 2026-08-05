@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_history_rag.chunker import generate_chunk_id, split_content
+from claude_history_rag.chunker import source_hash as _source_hash
 from claude_history_rag.models import Chunk
 
 logger = logging.getLogger(__name__)
@@ -106,20 +107,41 @@ def _create_turn_chunks(
     return chunks
 
 
-def chunk_claude_app_export_file(file_path: Path, start_line: int = 0) -> Iterator[Chunk]:
-    """Yield chunks from a Claude web/Desktop export `conversations.json` file."""
+def chunk_claude_app_export_file(
+    file_path: Path,
+    start_line: int = 0,
+    *,
+    source_path: Path | None = None,
+) -> Iterator[Chunk]:
+    """Yield chunks from a Claude web/Desktop export `conversations.json` file.
+
+    ``file_path`` supplies the bytes and may be an immutable private snapshot;
+    ``source_path`` supplies the provenance recorded on every emitted chunk.
+    """
     del start_line
+    provenance = Path(source_path) if source_path is not None else file_path
     try:
         data = json.loads(file_path.read_text())
     except (OSError, json.JSONDecodeError) as e:
-        logger.warning("Failed to parse Claude app export %s: %s", file_path.name, type(e).__name__)
+        logger.warning(
+            "Failed to parse Claude app export: source=%s error_type=%s",
+            _source_hash(str(provenance)),
+            type(e).__name__,
+        )
         return
 
-    conversations = data if isinstance(data, list) else data.get("conversations", [])
+    # A top-level bare scalar has neither .get nor list semantics, so an
+    # unguarded lookup raises AttributeError and loses the whole export.
+    if isinstance(data, list):
+        conversations = data
+    elif isinstance(data, dict):
+        conversations = data.get("conversations", [])
+    else:
+        return
     if not isinstance(conversations, list):
         return
 
-    source_file = str(file_path)
+    source_file = str(provenance)
     for conv_index, conversation in enumerate(conversations, start=1):
         if not isinstance(conversation, dict):
             continue

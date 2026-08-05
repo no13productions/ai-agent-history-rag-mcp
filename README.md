@@ -682,7 +682,7 @@ When running in server mode, additional API endpoints are available for client m
 | `/api/search/files` | POST | File change search |
 | `/api/sessions` | POST | Session summaries |
 | `/api/positions/{machine_id}` | GET | Get file positions for a machine |
-| `/api/positions` | POST | Update file position |
+| `/api/positions` | POST | Retired direct cursor mutation route; returns `409 cursor_sync_forbidden` |
 | `/api/reindex-ack` | POST | Client acknowledgement for server reindex |
 | `/api/purge-client` | POST | Purge all chunks for a single client |
 
@@ -852,9 +852,9 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 When the server is unavailable:
 
 1. **Chunking continues locally** - Files are still processed into chunks
-2. **Uploads are queued** - Chunks are stored in `~/.claude-history-rag/client_state.json`
+2. **Uploads are queued durably** - A versioned outbox index is stored in `~/.claude-history-rag/client_state.json`; bounded payload records are stored alongside it using exclusive randomized atomic writes. Every pending upload binds the canonical request body—including machine, client, chunks, source, and cursor—to a SHA-256 digest, and cursor progress is committed only after complete server acceptance
 3. **Retry logic** - 3 retries with 30s delay, then waits for next sync interval
-4. **Catch-up on reconnect** - Compares local vs server positions, re-uploads gaps
+4. **Catch-up on reconnect** - Compares durable local vs server positions and replays generation-bound gaps without using the retired direct position-sync route
 5. **Search degrades gracefully** - Returns "server unavailable" error
 
 ### Chunk Types

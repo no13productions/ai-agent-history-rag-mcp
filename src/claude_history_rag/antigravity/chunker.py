@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_history_rag.chunker import generate_chunk_id, split_content
+from claude_history_rag.chunker import source_hash as _source_hash
 from claude_history_rag.models import Chunk
 
 logger = logging.getLogger(__name__)
@@ -205,10 +206,20 @@ def _create_file_change_chunks(
     return chunks
 
 
-def _chunk_antigravity_jsonl_file(file_path: Path, start_line: int = 0) -> Iterator[Chunk]:
+def _chunk_antigravity_jsonl_file(
+    file_path: Path,
+    start_line: int = 0,
+    *,
+    source_path: Path | None = None,
+) -> Iterator[Chunk]:
     """Process a modern Antigravity JSONL transcript and yield chunks."""
+    # Bytes and modification time come from file_path, which may be an immutable
+    # snapshot carrying the source's preserved mtime; identity comes from the
+    # provenance path the caller declares.
+    provenance = Path(source_path) if source_path is not None else file_path
+    source_file = str(provenance)
     fallback_timestamp = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
-    session_id = _session_id_from_path(file_path)
+    session_id = _session_id_from_path(provenance)
     project_path = f"/antigravity/{session_id}"
     project_name = "Antigravity Session"
     chunk_counts: dict[str, int] = defaultdict(int)
@@ -222,11 +233,11 @@ def _chunk_antigravity_jsonl_file(file_path: Path, start_line: int = 0) -> Itera
                     event = json.loads(line)
                 except json.JSONDecodeError as e:
                     logger.warning(
-                        "Skipping malformed Antigravity JSONL line %s in session=%s file=%s: %s",
+                        "Skipped line: reason=malformed_jsonl source=%s line=%d session=%s error_type=%s",
+                        _source_hash(source_file),
                         line_num,
-                        session_id,
-                        file_path.name,
-                        e,
+                        _source_hash(session_id),
+                        type(e).__name__,
                     )
                     continue
                 if not isinstance(event, dict):
@@ -259,7 +270,7 @@ def _chunk_antigravity_jsonl_file(file_path: Path, start_line: int = 0) -> Itera
                         project_name=project_name,
                         timestamp=timestamp,
                         model="gemini-unknown",
-                        source_file=str(file_path),
+                        source_file=source_file,
                         source_line=line_num,
                         parent_chunk_id=base_id if part_num > 1 else None,
                     )
@@ -270,26 +281,44 @@ def _chunk_antigravity_jsonl_file(file_path: Path, start_line: int = 0) -> Itera
                     project_name=project_name,
                     session_id=session_id,
                     timestamp=timestamp,
-                    source_file=str(file_path),
+                    source_file=source_file,
                     source_line=line_num,
                     parent_chunk_id=base_id,
                 ):
                     chunk_counts["file_change"] += 1
                     yield file_chunk
     except OSError as e:
-        logger.error("Error reading %s: %s", file_path, e)
+        logger.error(
+            "Error reading source: source=%s error_type=%s",
+            _source_hash(source_file),
+            type(e).__name__,
+        )
         return
 
     total = sum(chunk_counts.values())
-    logger.info("Completed Antigravity JSONL chunking %s: %s chunks", file_path.name, total)
+    logger.info(
+        "Completed Antigravity JSONL chunking: source=%s chunks=%d",
+        _source_hash(source_file),
+        total,
+    )
 
 
-def chunk_antigravity_file(file_path: Path, start_line: int = 0) -> Iterator[Chunk]:
+def chunk_antigravity_file(
+    file_path: Path,
+    start_line: int = 0,
+    *,
+    source_path: Path | None = None,
+) -> Iterator[Chunk]:
     """Process an Antigravity history file and yield chunks."""
-    logger.debug(f"Starting Antigravity chunking: {file_path}")
+    provenance = Path(source_path) if source_path is not None else file_path
+    logger.debug("Starting Antigravity chunking: source=%s", _source_hash(str(provenance)))
 
-    if file_path.suffix == ".jsonl":
-        yield from _chunk_antigravity_jsonl_file(file_path, start_line=start_line)
+    if provenance.suffix == ".jsonl":
+        yield from _chunk_antigravity_jsonl_file(
+            file_path,
+            start_line=start_line,
+            source_path=provenance,
+        )
         return
 
     # We can't really support start_line efficiently on binary files without a proper parser
@@ -302,7 +331,11 @@ def chunk_antigravity_file(file_path: Path, start_line: int = 0) -> Iterator[Chu
     try:
         data = file_path.read_bytes()
     except OSError as e:
-        logger.error(f"Error reading {file_path}: {e}")
+        logger.error(
+            "Error reading source: source=%s error_type=%s",
+            _source_hash(str(provenance)),
+            type(e).__name__,
+        )
         return iter(())
 
     # Extract text (best effort)
@@ -312,14 +345,14 @@ def chunk_antigravity_file(file_path: Path, start_line: int = 0) -> Iterator[Chu
     if not content.strip():
         return iter(())
 
-    session_id = file_path.stem  # e.g. "uuid"
+    session_id = provenance.stem  # e.g. "uuid"
     timestamp = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
 
     # We treat it as one "assistant" chunk for now, or just generic info
     # differentiating user/assistant is hard without proto definition.
     # We label it as "history" with the filename.
 
-    header = f"Google Antigravity History from {file_path.name}\n\n"
+    header = f"Google Antigravity History from {provenance.name}\n\n"
     full_content = header + content
 
     content_parts = split_content(full_content, MAX_CHUNK_CONTENT_LENGTH)
@@ -348,7 +381,7 @@ def chunk_antigravity_file(file_path: Path, start_line: int = 0) -> Iterator[Chu
             project_name="Antigravity Session",
             timestamp=timestamp,
             model="gemini-unknown",
-            source_file=str(file_path),
+            source_file=str(provenance),
             source_line=0,  # Binary file
             parent_chunk_id=base_id if total_parts > 1 and part_num > 1 else None,
         )
@@ -357,4 +390,8 @@ def chunk_antigravity_file(file_path: Path, start_line: int = 0) -> Iterator[Chu
         yield chunk
 
     total = sum(chunk_counts.values())
-    logger.info(f"Completed Antigravity chunking {file_path.name}: {total} chunks")
+    logger.info(
+        "Completed Antigravity chunking: source=%s chunks=%d",
+        _source_hash(str(provenance)),
+        total,
+    )

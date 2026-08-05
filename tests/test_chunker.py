@@ -1,6 +1,11 @@
 """Tests for chunking engine."""
 
+import hashlib
+import json
+import logging
 from pathlib import Path
+
+import pytest
 
 from claude_history_rag.antigravity.chunker import chunk_antigravity_file
 from claude_history_rag.antigravity.watcher import _is_antigravity_file
@@ -9,6 +14,7 @@ from claude_history_rag.chatgpt.watcher import _is_chatgpt_export_file
 from claude_history_rag.chunker import chunk_session_file
 from claude_history_rag.claude_app.chunker import chunk_claude_app_export_file
 from claude_history_rag.claude_app.watcher import _is_claude_app_export_file
+from claude_history_rag.codex.parser import parse_codex_jsonl_file
 
 
 def test_chunk_session_file(sample_session_path: Path, tmp_path: Path):
@@ -221,3 +227,194 @@ def test_antigravity_watcher_prefers_full_transcript(tmp_path: Path):
     assert _is_antigravity_file(full_transcript)
     assert not _is_antigravity_file(transcript)
     assert _is_antigravity_file(legacy_pb)
+
+
+@pytest.mark.parametrize("payload", [42, "text", None, True, 3.5])
+def test_export_chunkers_survive_a_bare_scalar_document(payload, tmp_path: Path):
+    """A top-level bare scalar has neither .get nor list semantics.
+
+    An unguarded lookup raises AttributeError and costs the entire export.
+    """
+    export = tmp_path / "conversations.json"
+    export.write_text(json.dumps(payload))
+
+    assert list(chunk_chatgpt_export_file(export)) == []
+    assert list(chunk_claude_app_export_file(export)) == []
+
+
+@pytest.mark.parametrize("terminator,expected", [(b"\n", 3), (b"\r\n", 3), (b"\r", 1)])
+def test_codex_parser_numbers_lines_the_way_bytes_are_counted(
+    terminator: bytes,
+    expected: int,
+    tmp_path: Path,
+):
+    """The Codex parser shares the byte-counted definition of a line.
+
+    Universal newline translation would split on a bare carriage return that
+    byte counting does not, numbering lines past the counted bound.
+    """
+    record = json.dumps({"type": "message", "role": "user", "content": "hello"}).encode()
+    source = tmp_path / "session.jsonl"
+    source.write_bytes(terminator.join([record] * 3) + terminator)
+
+    with open(source, "rb") as raw:
+        counted = sum(1 for _ in raw)
+    parsed = [line for _, line in parse_codex_jsonl_file(source)]
+
+    assert counted == expected
+    assert not parsed or max(parsed) <= counted
+
+
+def test_codex_parser_aborted_read_raises(tmp_path: Path):
+    """A partial Codex read must not look like a completed one."""
+    record = json.dumps({"type": "message", "role": "user", "content": "hello"}).encode()
+    source = tmp_path / "session.jsonl"
+    source.write_bytes((record + b"\n") * 3 + b"caf\xe9 undecodable\n" + (record + b"\n") * 2)
+
+    with pytest.raises(UnicodeDecodeError):
+        list(parse_codex_jsonl_file(source))
+
+
+@pytest.mark.parametrize("payload", [42, "text", None, True, 3.5, [1, 2], {"a": 1}])
+def test_codex_parser_survives_a_bare_scalar_line(payload, tmp_path: Path):
+    """One unusable Codex line must not cost every remaining line in the file."""
+    good = {"type": "message", "role": "user", "content": "hello"}
+    source = tmp_path / "session.jsonl"
+    source.write_text("\n".join([json.dumps(good), json.dumps(payload), json.dumps(good)]) + "\n")
+
+    assert [line for _, line in parse_codex_jsonl_file(source)] == [1, 3]
+
+
+def test_chunker_diagnostics_disclose_no_source_session_or_conversation_text(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Every diagnostic in the chunking pipeline is a code plus digests.
+
+    The file below deliberately triggers each warning path: an empty turn, an
+    unpaired assistant, a trailing unpaired user, a MALFORMED entry that fails
+    model validation, and completion. None of them may disclose the path,
+    filename, session id, entry uuid, or any conversation text - not even
+    truncated.
+
+    The malformed entry matters: a pydantic ValidationError renders the rejected
+    input inside its own message, so a parser that formats the exception
+    republishes the conversation content the entry carried.
+    """
+    project_dir = tmp_path / "-Users-test-PRIVATEPROJECT"
+    project_dir.mkdir()
+    session_file = project_dir / "PRIVATE_SESSION_FILENAME.jsonl"
+    session_id = "SESSION_IDENTIFIER_SENTINEL"
+    unpaired_uuid = "UUID_IDENTIFIER_SENTINEL"
+    conversation_text = "CONVERSATION_CONTENT_SENTINEL"
+
+    session_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": session_id,
+                        "uuid": unpaired_uuid,
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "m",
+                            "content": [{"type": "text", "text": conversation_text}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": session_id,
+                        "uuid": unpaired_uuid,
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "message": {"role": "user", "content": ""},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": session_id,
+                        "uuid": unpaired_uuid,
+                        "timestamp": "2026-01-01T00:00:02Z",
+                        "message": {"role": "assistant", "model": "m", "content": []},
+                    }
+                ),
+                # Malformed: content must be a string or a list, never a dict.
+                # Model validation rejects it and the rejected input carries
+                # the conversation text.
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": session_id,
+                        "uuid": unpaired_uuid,
+                        "timestamp": "2026-01-01T00:00:03Z",
+                        "message": {"role": "user", "content": {"text": conversation_text}},
+                    }
+                ),
+                # Not valid JSON at all: the decoder quotes the document.
+                '{"type": "user", "message": {"role": "user", "content": "'
+                + conversation_text
+                + '"',
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": session_id,
+                        "uuid": unpaired_uuid,
+                        "timestamp": "2026-01-01T00:00:04Z",
+                        "message": {"role": "user", "content": conversation_text},
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    expected_source = hashlib.sha256(str(session_file).encode("utf-8")).hexdigest()[:12]
+
+    with caplog.at_level(logging.DEBUG):
+        list(chunk_session_file(session_file))
+
+    assert str(session_file) not in caplog.text
+    assert "PRIVATE_SESSION_FILENAME" not in caplog.text
+    assert "PRIVATEPROJECT" not in caplog.text
+    assert session_id not in caplog.text
+    assert unpaired_uuid not in caplog.text
+    assert conversation_text not in caplog.text
+
+    assert f"source={expected_source}" in caplog.text
+    assert "reason=empty_turn" in caplog.text
+    assert "reason=assistant_without_user" in caplog.text
+    assert "reason=trailing_user_without_assistant" in caplog.text
+    assert "Completed chunking:" in caplog.text
+    # The malformed-entry paths really did run, so the absence assertions above
+    # are proving sanitization rather than the absence of a diagnostic.
+    assert "reason=message_validation_failed" in caplog.text
+    assert "reason=json_invalid" in caplog.text
+
+
+def test_chunker_records_declared_provenance_for_a_relocated_snapshot(
+    sample_session_path: Path,
+    tmp_path: Path,
+):
+    """Reading a relocated snapshot must not change provenance or project identity."""
+    project_dir = tmp_path / "-Users-test-myproject"
+    project_dir.mkdir()
+    original = project_dir / "session.jsonl"
+    original.write_text(sample_session_path.read_text())
+
+    snapshot_dir = tmp_path / "snapshot-elsewhere"
+    snapshot_dir.mkdir()
+    snapshot = snapshot_dir / "session.jsonl"
+    snapshot.write_text(original.read_text())
+
+    direct = list(chunk_session_file(original))
+    relocated = list(chunk_session_file(snapshot, source_path=original))
+
+    assert relocated
+    assert [chunk.id for chunk in relocated] == [chunk.id for chunk in direct]
+    assert all(chunk.source_file == str(original) for chunk in relocated)
+    assert all(chunk.project_path == "/Users/test/myproject" for chunk in relocated)
+    assert all(str(snapshot) not in chunk.source_file for chunk in relocated)

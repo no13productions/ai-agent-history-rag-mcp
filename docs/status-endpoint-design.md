@@ -97,7 +97,7 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
     "files_pending": 557,
     "files_failed": 0,
     "chunks_processed": 22,
-    "last_indexed_file": "agent-a24ba2c.jsonl",
+    "last_indexed_file_hash": "1a2b3c4d5e6f",
     "last_indexed_at": "2025-12-16T09:22:30Z",
     "current_file": null,
     "current_progress": null
@@ -131,11 +131,11 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
   },
   "file_watcher": {
     "is_running": true,
-    "projects_path": "/Users/youruser/.claude/projects",
+    "projects_path_hash": "1a2b3c4d5e6f",
     "debounce_ms": 5000,
     "queue_size": 0,
     "queue_max_size": 1000,
-    "failed_files": []
+    "failed_file_hashes": []
   },
   "errors": {
     "total": 0,
@@ -147,10 +147,12 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
     "spanner_project": "jeeves-486102",
     "spanner_instance": "jeeves-rg-spanner-prod-4d0e4c43",
     "spanner_database": "ai-agent-history-rag",
-    "projects_path": "/Users/youruser/.claude/projects",
-    "codex_sessions_path": "/Users/youruser/.codex/sessions",
-    "gemini_sessions_path": "/Users/youruser/.gemini/tmp",
-    "antigravity_sessions_path": "/Users/youruser/.gemini/antigravity",
+    "projects_path_hash": "1a2b3c4d5e6f",
+    "codex_sessions_path_hash": "2b3c4d5e6f7a",
+    "gemini_sessions_path_hash": "3c4d5e6f7a8b",
+    "antigravity_sessions_path_hash": "4d5e6f7a8b9c",
+    "chatgpt_exports_path_hash": "5e6f7a8b9c0d",
+    "claude_app_exports_path_hash": "6f7a8b9c0d1e",
     "embedding_model": "nomic-ai/nomic-embed-text-v1.5",
     "log_level": "INFO",
     "batch_size": 32
