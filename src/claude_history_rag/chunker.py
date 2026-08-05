@@ -4,7 +4,7 @@ import hashlib
 import logging
 from collections import defaultdict
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from claude_history_rag.models import AssistantMessage, Chunk, HistoryEntry, UserMessage
@@ -14,9 +14,25 @@ from claude_history_rag.parser import (
     extract_text_content,
     get_project_name,
     parse_jsonl_file,
+    source_hash,
 )
 
 logger = logging.getLogger(__name__)
+
+MISSING_SOURCE_TIMESTAMP_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def missing_source_timestamp(source_line: int) -> datetime:
+    """Return an ordered synthetic timestamp for source rows missing wall time."""
+    return MISSING_SOURCE_TIMESTAMP_EPOCH + timedelta(microseconds=source_line)
+
+
+# Re-exported so every chunker keeps importing the digest from one place.
+# Paths, filenames, session ids and entry uuids are conversation-identifying and
+# must never reach diagnostics verbatim; this digest matches the watcher's own
+# source hashing so chunker, parser and watcher diagnostics join on one value.
+source_hash = source_hash
+
 
 # Maximum length for truncated user content in file change chunks
 USER_CONTENT_TRUNCATE_LENGTH = 200
@@ -106,6 +122,7 @@ def create_turn_chunks(
     project_path: str,
     source_file: str,
     source_line: int,
+    consumed_line: int,
 ) -> list[Chunk]:
     """Create turn chunk(s) from user + assistant message pair.
 
@@ -128,7 +145,9 @@ def create_turn_chunks(
     # Validate that we have actual content
     if not user_content and not assistant_content:
         logger.warning(
-            f"Skipping empty turn chunk at line {source_line} in {source_file} - both user and assistant content are empty"
+            "Skipped chunk: reason=empty_turn type=turn source=%s line=%d",
+            source_hash(source_file),
+            source_line,
         )
         return []
 
@@ -136,8 +155,12 @@ def create_turn_chunks(
     project_name = get_project_name(project_path)
     timestamp = assistant_entry.timestamp or user_entry.timestamp
     if not timestamp:
-        logger.warning(f"Missing timestamp for turn at line {source_line}, using current UTC time")
-        timestamp = datetime.now(timezone.utc)
+        logger.warning(
+            "Substituted timestamp: reason=missing_source_timestamp type=turn source=%s line=%d",
+            source_hash(source_file),
+            source_line,
+        )
+        timestamp = missing_source_timestamp(consumed_line)
 
     # Build content based on what's available
     if user_content and assistant_content:
@@ -157,8 +180,11 @@ def create_turn_chunks(
 
     if total_parts > 1:
         logger.info(
-            f"Split large turn chunk into {total_parts} parts at line {source_line} "
-            f"(original size: {len(content)} chars)"
+            "Split chunk: reason=content_exceeds_embedding_limit type=turn source=%s line=%d parts=%d characters=%d",
+            source_hash(source_file),
+            source_line,
+            total_parts,
+            len(content),
         )
 
     chunks = []
@@ -193,6 +219,7 @@ def create_turn_chunks(
                 model=model,
                 source_file=source_file,
                 source_line=source_line,
+                consumed_line=consumed_line,
                 # Link split chunks together
                 parent_chunk_id=base_id if total_parts > 1 and part_num > 1 else None,
             )
@@ -226,7 +253,9 @@ def create_summary_chunk(
     # Validate summary content
     if not summary_text or not summary_text.strip():
         logger.warning(
-            f"Skipping empty summary chunk at line {source_line} in {source_file} - summary content is empty"
+            "Skipped chunk: reason=empty_summary type=summary source=%s line=%d",
+            source_hash(source_file),
+            source_line,
         )
         return None
     summary_text = summary_text.strip()
@@ -235,9 +264,11 @@ def create_summary_chunk(
     timestamp = entry.timestamp
     if not timestamp:
         logger.warning(
-            f"Missing timestamp for summary at line {source_line}, using current UTC time"
+            "Substituted timestamp: reason=missing_source_timestamp type=summary source=%s line=%d",
+            source_hash(source_file),
+            source_line,
         )
-        timestamp = datetime.now(timezone.utc)
+        timestamp = missing_source_timestamp(source_line)
     session_id = entry.sessionId or "unknown"
 
     content = f"Session summary for {project_name}:\n{summary_text}"
@@ -253,6 +284,7 @@ def create_summary_chunk(
         timestamp=timestamp,
         source_file=source_file,
         source_line=source_line,
+        consumed_line=source_line,
     )
 
 
@@ -275,9 +307,11 @@ def create_file_change_chunks(
     timestamp = assistant_entry.timestamp
     if not timestamp:
         logger.warning(
-            f"Missing timestamp for file change at line {source_line}, using current UTC time"
+            "Substituted timestamp: reason=missing_source_timestamp type=file_change source=%s line=%d",
+            source_hash(source_file),
+            source_line,
         )
-        timestamp = datetime.now(timezone.utc)
+        timestamp = missing_source_timestamp(source_line)
     session_id = assistant_entry.sessionId or "unknown"
 
     for idx, op in enumerate(operations):
@@ -313,6 +347,7 @@ def create_file_change_chunks(
                 model=assistant_entry.message.model,
                 source_file=source_file,
                 source_line=source_line,
+                consumed_line=source_line,
                 parent_chunk_id=parent_chunk_id,
             )
         )
@@ -320,25 +355,86 @@ def create_file_change_chunks(
     return chunks
 
 
+def resolve_safe_session_interval(
+    file_path: Path,
+    start_exclusive: int,
+    end_inclusive: int,
+) -> tuple[int, int]:
+    """Return parser bounds that preserve user/assistant semantic units.
+
+    A committed cursor can originate from older clients that acknowledged a
+    user line even though its assistant had not yet been consumed. Replaying
+    from that cursor would lose the pair context and change chunk identity.
+    Catch-up therefore reconstructs parser context from the beginning, widens
+    the parser start to before any pair crossing ``start_exclusive``, and stops
+    before any pair crossing ``end_inclusive``. Emission still filters against
+    the requested start, so widening never re-uploads unrelated prior units.
+    """
+    if start_exclusive < 0 or end_inclusive < start_exclusive:
+        raise ValueError("invalid session interval")
+
+    safe_start = start_exclusive
+    safe_end = end_inclusive
+    pending_user_line: int | None = None
+
+    for entry, line_number in parse_jsonl_file(file_path, 0):
+        if entry.isCompactSummary:
+            continue
+
+        if entry.type == "user":
+            pending_user_line = line_number
+            continue
+
+        if entry.type == "assistant" and pending_user_line is not None:
+            user_line = pending_user_line
+            if user_line <= start_exclusive < line_number:
+                safe_start = min(safe_start, max(0, user_line - 1))
+            if user_line <= end_inclusive < line_number:
+                safe_end = min(safe_end, max(0, user_line - 1))
+            pending_user_line = None
+
+        if line_number > end_inclusive and pending_user_line is None:
+            break
+
+    if pending_user_line is not None and pending_user_line <= end_inclusive:
+        safe_end = min(safe_end, max(0, pending_user_line - 1))
+
+    return safe_start, max(safe_start, safe_end)
+
+
 def chunk_session_file(
     file_path: Path,
     start_line: int = 0,
+    end_line: int | None = None,
+    *,
+    source_path: Path | None = None,
 ) -> Iterator[Chunk]:
     """Process a session JSONL file and yield chunks.
 
     Args:
-        file_path: Path to the JSONL file
+        file_path: Path whose bytes are read. This may be an immutable private
+            snapshot rather than the live history file.
         start_line: Line number to start from (for incremental processing)
+        end_line: Inclusive physical line snapshot to stop at
+        source_path: Provenance path recorded on every emitted chunk and used
+            for project decoding. Defaults to ``file_path`` when the bytes read
+            are themselves the original source.
 
     Yields:
         Chunk objects ready for embedding
     """
-    logger.debug(f"Starting chunking: {file_path} from line {start_line}")
+    # Provenance is decided by the caller, never by where the bytes happen to
+    # live: a snapshot is relocated, so project identity and source_file must
+    # still be derived from the original history path.
+    provenance = Path(source_path) if source_path is not None else file_path
 
     # Decode project path from directory name
-    project_dir = file_path.parent.name
+    project_dir = provenance.parent.name
     project_path = decode_project_path(project_dir)
-    source_file = str(file_path)
+    source_file = str(provenance)
+    logged_source = source_hash(source_file)
+
+    logger.debug("Started chunking: source=%s from_line=%d", logged_source, start_line)
 
     chunk_counts: dict[str, int] = defaultdict(int)
 
@@ -346,6 +442,8 @@ def chunk_session_file(
     pending_user: tuple[HistoryEntry, int] | None = None
 
     for entry, line_number in parse_jsonl_file(file_path, start_line):
+        if end_line is not None and line_number > end_line:
+            break
         # Current Claude Code (>=2.1) marks compaction summaries as ordinary
         # user/assistant entries with isCompactSummary=True rather than a
         # dedicated "summary" type. Route these to a summary chunk and skip
@@ -380,6 +478,7 @@ def chunk_session_file(
                 project_path=project_path,
                 source_file=source_file,
                 source_line=user_line,
+                consumed_line=line_number,
             )
 
             # Only process if we have valid turn chunks
@@ -401,6 +500,7 @@ def chunk_session_file(
                 if file_chunks:
                     turn_chunks[0] = Chunk(
                         **first_turn_chunk.model_dump(exclude={"child_chunk_ids"}),
+                        consumed_line=first_turn_chunk.consumed_line,
                         child_chunk_ids=[c.id for c in file_chunks],
                     )
 
@@ -416,11 +516,14 @@ def chunk_session_file(
             pending_user = None
 
         elif entry.type == "assistant" and pending_user is None:
-            # Log warning for unpaired assistant messages
-            session_id = entry.sessionId or "unknown"
+            # Log warning for unpaired assistant messages. Session ids and entry
+            # uuids are conversation-identifying, so only their digests appear.
             logger.warning(
-                f"Unpaired assistant message at line {line_number} in {source_file} "
-                f"(session_id={session_id}, uuid={entry.uuid})"
+                "Unpaired entry: reason=assistant_without_user source=%s line=%d session=%s entry=%s",
+                logged_source,
+                line_number,
+                source_hash(entry.sessionId or "unknown"),
+                source_hash(entry.uuid or "unknown"),
             )
             # Still extract file operations from unpaired assistant messages
             if entry.message and isinstance(entry.message, AssistantMessage):
@@ -451,28 +554,24 @@ def chunk_session_file(
             # System entries (init) don't need chunking
             pass
 
-    # Log warning if file ends with unpaired user message
+    # Log warning if file ends with unpaired user message. Conversation text is
+    # never emitted, not even truncated, so no content is extracted here at all.
     if pending_user is not None:
         user_entry, user_line = pending_user
-        session_id = user_entry.sessionId or "unknown"
-
-        # Extract and truncate user content for debugging
-        user_content = ""
-        if user_entry.message and isinstance(user_entry.message, UserMessage):
-            user_content = extract_text_content(user_entry.message)
-        truncated_content = user_content[:USER_CONTENT_TRUNCATE_LENGTH] + (
-            "..." if len(user_content) > USER_CONTENT_TRUNCATE_LENGTH else ""
-        )
-
         logger.warning(
-            f"File {source_file} ends with unpaired user message at line {user_line} "
-            f"(session_id={session_id}, uuid={user_entry.uuid}). "
-            f"Message: {truncated_content}"
+            "Unpaired entry: reason=trailing_user_without_assistant source=%s line=%d session=%s entry=%s",
+            logged_source,
+            user_line,
+            source_hash(user_entry.sessionId or "unknown"),
+            source_hash(user_entry.uuid or "unknown"),
         )
 
     total = sum(chunk_counts.values())
     logger.info(
-        f"Completed chunking {file_path.name}: {total} chunks "
-        f"(turns={chunk_counts['turn']}, file_changes={chunk_counts['file_change']}, "
-        f"summaries={chunk_counts['summary']})"
+        "Completed chunking: source=%s chunks=%d turns=%d file_changes=%d summaries=%d",
+        logged_source,
+        total,
+        chunk_counts["turn"],
+        chunk_counts["file_change"],
+        chunk_counts["summary"],
     )

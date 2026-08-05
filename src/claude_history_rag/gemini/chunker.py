@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_history_rag.chunker import generate_chunk_id, split_content
+from claude_history_rag.chunker import source_hash as _source_hash
 from claude_history_rag.gemini.parser import load_gemini_json_file
 from claude_history_rag.models import Chunk
 
@@ -320,18 +321,30 @@ def _extract_tool_ops_from_call(tool_call: dict) -> list[dict]:
     return ops
 
 
-def chunk_gemini_session_file(file_path: Path, start_line: int = 0) -> Iterator[Chunk]:
+def chunk_gemini_session_file(
+    file_path: Path,
+    start_line: int = 0,
+    *,
+    source_path: Path | None = None,
+) -> Iterator[Chunk]:
     """Process a Gemini CLI session/log JSON file and yield chunks."""
-    logger.debug(f"Starting Gemini chunking: {file_path} from line {start_line}")
+    # Gemini derives project identity from components of the *original* absolute
+    # path, so provenance can never be inferred from where the bytes are read.
+    provenance = Path(source_path) if source_path is not None else file_path
+    logger.debug(
+        "Starting Gemini chunking: source=%s from_line=%d",
+        _source_hash(str(provenance)),
+        start_line,
+    )
 
-    source_file = str(file_path)
+    source_file = str(provenance)
     chunk_counts: dict[str, int] = defaultdict(int)
 
     data = load_gemini_json_file(file_path)
     if data is None:
         return iter(())
 
-    project_path, project_name = _project_from_path(file_path)
+    project_path, project_name = _project_from_path(provenance)
 
     # logs.json (list of events)
     if isinstance(data, list):
@@ -363,8 +376,10 @@ def chunk_gemini_session_file(file_path: Path, start_line: int = 0) -> Iterator[
 
         total = sum(chunk_counts.values())
         logger.info(
-            f"Completed Gemini chunking {file_path.name}: {total} chunks "
-            f"(turns={chunk_counts['turn']})"
+            "Completed Gemini chunking: source=%s chunks=%d turns=%d",
+            _source_hash(source_file),
+            total,
+            chunk_counts["turn"],
         )
         return
 
@@ -555,5 +570,8 @@ def chunk_gemini_session_file(file_path: Path, start_line: int = 0) -> Iterator[
 
     total = sum(chunk_counts.values())
     logger.info(
-        f"Completed Gemini chunking {file_path.name}: {total} chunks (turns={chunk_counts['turn']})"
+        "Completed Gemini chunking: source=%s chunks=%d turns=%d",
+        _source_hash(source_file),
+        total,
+        chunk_counts["turn"],
     )

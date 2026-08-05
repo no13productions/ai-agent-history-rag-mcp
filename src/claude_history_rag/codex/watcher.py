@@ -22,5 +22,6 @@ def get_codex_watcher() -> HistoryWatcher:
                     state_path=settings.codex_state_path,
                     chunker=chunk_codex_session_file,
                     source_name="Codex",
+                    cursor_semantics="unsupported_snapshot",
                 )
     return codex_watcher

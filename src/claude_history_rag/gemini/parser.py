@@ -4,6 +4,8 @@ import json
 import logging
 from pathlib import Path
 
+from claude_history_rag.parser import source_hash
+
 logger = logging.getLogger(__name__)
 
 # Resource limits to prevent exhaustion attacks
@@ -40,14 +42,30 @@ def load_gemini_json_file(file_path: Path) -> dict | list | None:
             data = json.load(f)
 
         if not _check_json_depth(data):
-            logger.warning(f"JSON in {file_path} exceeds maximum depth of {MAX_JSON_DEPTH}")
+            logger.warning(
+                "Rejected source: reason=json_exceeds_max_depth source=%s max_depth=%d",
+                source_hash(str(file_path)),
+                MAX_JSON_DEPTH,
+            )
             return None
 
         return data
     except FileNotFoundError:
-        logger.error(f"File not found: {file_path}")
+        logger.error(
+            "Failed reading source: reason=file_not_found source=%s",
+            source_hash(str(file_path)),
+        )
     except PermissionError:
-        logger.error(f"Permission denied: {file_path}")
+        logger.error(
+            "Failed reading source: reason=permission_denied source=%s",
+            source_hash(str(file_path)),
+        )
     except (OSError, ValueError, json.JSONDecodeError) as e:
-        logger.exception(f"Error reading file {file_path}: {e}")
+        # Neither the exception text nor a traceback may be emitted: a decode
+        # error quotes the document and a traceback can republish frame locals.
+        logger.error(
+            "Failed reading source: reason=read_failed source=%s error_type=%s",
+            source_hash(str(file_path)),
+            type(e).__name__,
+        )
     return None

@@ -8,9 +8,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from claude_history_rag import durable_io
 from claude_history_rag.config import settings
 
 logger = logging.getLogger(__name__)
+MAX_CLIENT_REGISTRY_BYTES = 8 * 1024 * 1024
 
 
 def _sanitize_reason(value: str, default: str = "error") -> str:
@@ -28,6 +30,17 @@ def _safe_scalar(value: Any) -> Any:
     if isinstance(value, str):
         return _sanitize_reason(value, "value")
     return type(value).__name__
+
+
+def _safe_client_name(value: object) -> str:
+    """Preserve display names while removing log/control injection characters.
+
+    The value arrives from request JSON, so it is coerced before substitution. A
+    sanitizer that raises on an unexpected type turns a rejectable request into
+    a server error, and leaves the partially applied identity writes above it
+    committed while the writes below it never run.
+    """
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()[:256]
 
 
 def _safe_heartbeat_section(value: Any) -> dict[str, Any] | None:
@@ -50,13 +63,51 @@ def _safe_heartbeat_section(value: Any) -> dict[str, Any] | None:
         "count",
         "memory_mb",
         "cpu_percent",
+        "pending_uploads",
+        "pending_uploads_oldest_age_sec",
+        "active_claims",
+        "blocked_records",
+        "retry_total",
+        "failed_files_count",
+        "debounce_ms",
+        "generation",
+        "catchup_failure_count",
+        "catchup_failure_oldest_age_sec",
+        "reindex_generation",
     ):
         raw = value.get(key)
         if isinstance(raw, int | float | bool):
             summary[key] = raw
-    status = value.get("status")
-    if isinstance(status, str):
-        summary["status"] = _sanitize_reason(status, "unknown")
+    for key in (
+        "status",
+        "last_indexed_file_hash",
+        "required_at",
+        "ack_at",
+        "reindex_status",
+        "source_name",
+        "projects_path_hash",
+        "storage_backend",
+        "embedding_mode",
+    ):
+        raw = value.get(key)
+        if isinstance(raw, str):
+            summary[key] = (
+                raw
+                if re.fullmatch(r"[A-Za-z0-9_.:+-]{1,256}", raw)
+                else _sanitize_reason(raw, "unknown")
+            )
+    reasons = value.get("catchup_failure_reasons")
+    if isinstance(reasons, dict):
+        summary["catchup_failure_reasons"] = {
+            _sanitize_reason(reason, "unknown"): count
+            for reason, count in reasons.items()
+            if isinstance(reason, str) and isinstance(count, int) and count >= 0
+        }
+    client_state = value.get("client_state")
+    if isinstance(client_state, dict):
+        safe_client_state = _safe_heartbeat_section(client_state)
+        if safe_client_state:
+            summary["client_state"] = safe_client_state
     return summary or None
 
 
@@ -72,22 +123,64 @@ class ClientRegistry:
         }
         self._loaded = False
 
+    @staticmethod
+    def _empty_state() -> dict[str, Any]:
+        return {"reindex_requested_at": None, "clients": {}}
+
+    @classmethod
+    def _parse_state(cls, raw: str) -> dict[str, Any]:
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("clients", {}), dict):
+            raise ValueError("client registry state must contain a clients object")
+        return loaded
+
     def _load(self) -> None:
         if self._loaded:
             return
-        if self.path.exists():
-            try:
-                self._state = json.loads(self.path.read_text())
-            except Exception as e:
-                logger.warning(f"Failed to load client registry: {e}")
+        try:
+            if durable_io.durable_file_exists(self.path, durable_root=self.path.parent):
+                self._state = self._parse_state(
+                    durable_io.read_text(
+                        self.path,
+                        durable_root=self.path.parent,
+                        max_bytes=MAX_CLIENT_REGISTRY_BYTES,
+                    )
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to load client registry: reason=load_failed error_type=%s",
+                type(e).__name__,
+            )
+            raise RuntimeError("durable client registry could not be loaded") from e
         self._loaded = True
 
     def _save(self) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._state, indent=2, default=str))
+            durable_io.atomic_write_text(
+                self.path,
+                json.dumps(self._state, indent=2, default=str),
+                durable_root=self.path.parent,
+            )
         except Exception as e:
-            logger.error(f"Failed to save client registry: {e}")
+            try:
+                self._state = (
+                    self._parse_state(
+                        durable_io.read_text(
+                            self.path,
+                            durable_root=self.path.parent,
+                            max_bytes=MAX_CLIENT_REGISTRY_BYTES,
+                        )
+                    )
+                    if durable_io.durable_file_exists(self.path, durable_root=self.path.parent)
+                    else self._empty_state()
+                )
+            except Exception:
+                self._state = self._empty_state()
+            logger.error(
+                "Failed to save client registry: reason=save_failed error_type=%s",
+                type(e).__name__,
+            )
+            raise RuntimeError("durable client registry could not be saved") from e
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -100,7 +193,7 @@ class ClientRegistry:
             if "first_seen" not in entry:
                 entry["first_seen"] = self._now()
             if client_name:
-                entry["client_name"] = client_name
+                entry["client_name"] = _safe_client_name(client_name)
             entry["last_seen"] = self._now()
             clients[machine_id] = entry
             self._save()
@@ -208,7 +301,7 @@ class ClientRegistry:
             if "first_seen" not in entry:
                 entry["first_seen"] = self._now()
             if client_name:
-                entry["client_name"] = client_name
+                entry["client_name"] = _safe_client_name(client_name)
             entry["last_seen"] = self._now()
             entry["last_upload_at"] = self._now()
             clients[machine_id] = entry
@@ -254,7 +347,7 @@ class ClientRegistry:
             if "first_seen" not in entry:
                 entry["first_seen"] = self._now()
             if client_name:
-                entry["client_name"] = client_name
+                entry["client_name"] = _safe_client_name(client_name)
             entry["last_seen"] = self._now()
             entry["last_purged_at"] = self._now()
             clients[machine_id] = entry
@@ -273,7 +366,7 @@ class ClientRegistry:
             if "first_seen" not in entry:
                 entry["first_seen"] = self._now()
             if client_name:
-                entry["client_name"] = client_name
+                entry["client_name"] = _safe_client_name(client_name)
             entry["last_seen"] = self._now()
             entry["last_heartbeat_at"] = self._now()
 
@@ -366,7 +459,7 @@ class ClientRegistry:
                 elif heartbeat_status == "ok":
                     status_label = "Healthy"
                 else:
-                    status_label = "Healthy"
+                    status_label = "Unknown"
 
                 reindex_pending, _ = self.get_reindex_status(machine_id)
 

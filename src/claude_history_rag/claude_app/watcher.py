@@ -29,5 +29,6 @@ def get_claude_app_watcher() -> HistoryWatcher:
                     chunker=chunk_claude_app_export_file,
                     source_name="Claude App",
                     path_filter=_is_claude_app_export_file,
+                    cursor_semantics="unsupported_snapshot",
                 )
     return claude_app_watcher

@@ -5,6 +5,8 @@ import logging
 from collections.abc import Iterator
 from pathlib import Path
 
+from claude_history_rag.parser import source_hash
+
 logger = logging.getLogger(__name__)
 
 # Resource limits to prevent exhaustion attacks
@@ -41,15 +43,18 @@ def parse_codex_jsonl_file(
                 f"({MAX_FILE_SIZE} bytes): {file_path}"
             )
 
-        with open(file_path, encoding="utf-8", errors="strict") as f:
+        # newline="\n" so a line here means what byte counting means.
+        with open(file_path, encoding="utf-8", errors="strict", newline="\n") as f:
             for line_number, line in enumerate(f, start=1):
                 if line_number <= start_line:
                     continue
 
                 if len(line) > MAX_LINE_LENGTH:
                     logger.warning(
-                        f"Line {line_number} exceeds maximum length "
-                        f"({len(line)} > {MAX_LINE_LENGTH}), skipping"
+                        "Skipped line: reason=line_exceeds_max_length line=%d bytes=%d max_bytes=%d",
+                        line_number,
+                        len(line),
+                        MAX_LINE_LENGTH,
                     )
                     continue
 
@@ -60,23 +65,57 @@ def parse_codex_jsonl_file(
                 try:
                     data = json.loads(line)
                 except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON at line {line_number}: {e}")
+                    # A JSONDecodeError message quotes the offending document.
+                    logger.warning(
+                        "Skipped line: reason=json_invalid line=%d position=%d",
+                        line_number,
+                        e.pos,
+                    )
                     continue
 
                 if not _check_json_depth(data):
                     logger.warning(
-                        f"JSON at line {line_number} exceeds maximum depth of {MAX_JSON_DEPTH}"
+                        "Skipped line: reason=json_exceeds_max_depth line=%d max_depth=%d",
+                        line_number,
+                        MAX_JSON_DEPTH,
                     )
                     continue
 
-                if "type" not in data:
-                    logger.warning(f"Missing 'type' field at line {line_number}")
+                # A JSONL line may decode to any JSON value, not just an object.
+                # Testing membership against a bare scalar raises TypeError out
+                # of this generator and loses every remaining line in the file,
+                # and a non-mapping that happens to support `in` reaches the
+                # chunker and fails there instead.
+                if not isinstance(data, dict) or "type" not in data:
+                    logger.warning("Skipped line: reason=missing_type_field line=%d", line_number)
                     continue
 
                 yield data, line_number
+    # Diagnosed and re-raised, never swallowed: a generator that returns
+    # normally after a partial read is indistinguishable from one that consumed
+    # the whole source, and the cursor commits the whole-source bound.
+    except UnicodeDecodeError:
+        logger.error(
+            "Failed reading source: reason=utf8_decode_error source=%s",
+            source_hash(str(file_path)),
+        )
+        raise
     except FileNotFoundError:
-        logger.error(f"File not found: {file_path}")
+        logger.error(
+            "Failed reading source: reason=file_not_found source=%s",
+            source_hash(str(file_path)),
+        )
+        raise
     except PermissionError:
-        logger.error(f"Permission denied: {file_path}")
+        logger.error(
+            "Failed reading source: reason=permission_denied source=%s",
+            source_hash(str(file_path)),
+        )
+        raise
     except (OSError, ValueError) as e:
-        logger.exception(f"Error reading file {file_path}: {e}")
+        logger.error(
+            "Failed reading source: reason=read_failed source=%s error_type=%s",
+            source_hash(str(file_path)),
+            type(e).__name__,
+        )
+        raise

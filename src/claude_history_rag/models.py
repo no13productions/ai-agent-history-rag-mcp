@@ -1,14 +1,17 @@
 """Pydantic models for parsing and chunking."""
 
+import hashlib
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MachineId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")]
 ShortText = Annotated[str, Field(min_length=1, max_length=512)]
 PathText = Annotated[str, Field(min_length=1, max_length=4096)]
 DiagnosticMap = Annotated[dict[str, Any], Field(max_length=64)]
+NonNegativeInt = Annotated[int, Field(ge=0, strict=True)]
+StrictBool = Annotated[bool, Field(strict=True)]
 
 
 class UserMessage(BaseModel):
@@ -95,6 +98,10 @@ class Chunk(BaseModel):
     model: str | None = None
     source_file: str
     source_line: int
+    # Internal parser progress metadata. This is deliberately excluded from the
+    # stored chunk contract: source_line remains provenance, while consumed_line
+    # is the inclusive physical input boundary completed by this semantic unit.
+    consumed_line: int | None = Field(default=None, ge=0, exclude=True)
     parent_chunk_id: str | None = None
     child_chunk_ids: list[str] | None = None
     machine_id: str | None = None  # For multi-machine support
@@ -103,6 +110,11 @@ class Chunk(BaseModel):
 # ============================================================
 # API Request/Response Models (Client/Server Communication)
 # ============================================================
+
+# aiohttp's request-body ceiling is 1 MiB by default. The client and server
+# share this explicit authority so an upload is bounded by serialized bytes,
+# including its envelope, before it is persisted or transmitted.
+MAX_CHUNK_UPLOAD_REQUEST_BYTES = 1024 * 1024
 
 
 class ChunkUploadRequest(BaseModel):
@@ -115,18 +127,103 @@ class ChunkUploadRequest(BaseModel):
     file_position: int = Field(ge=0)  # Line number reached in file
 
 
+def chunk_upload_request_body(
+    chunks: list[dict[str, Any]],
+    *,
+    machine_id: str,
+    client_name: str | None,
+    source_file: str,
+    file_position: int,
+) -> bytes:
+    """Serialize the one canonical UTF-8 JSON body for a chunk upload."""
+    request = ChunkUploadRequest(
+        machine_id=machine_id,
+        client_name=client_name,
+        chunks=chunks,
+        source_file=source_file,
+        file_position=file_position,
+    )
+    return request.model_dump_json().encode("utf-8")
+
+
+def chunk_upload_request_bytes(
+    chunks: list[dict[str, Any]],
+    *,
+    machine_id: str,
+    client_name: str | None,
+    source_file: str,
+    file_position: int,
+) -> int:
+    """Return the exact byte size of the canonical chunk upload body."""
+    return len(
+        chunk_upload_request_body(
+            chunks,
+            machine_id=machine_id,
+            client_name=client_name,
+            source_file=source_file,
+            file_position=file_position,
+        )
+    )
+
+
+def chunk_upload_request_sha256(
+    chunks: list[dict[str, Any]],
+    *,
+    machine_id: str,
+    client_name: str | None,
+    source_file: str,
+    file_position: int,
+) -> str:
+    """Bind every transmitted semantic field to the canonical request body."""
+    return hashlib.sha256(
+        chunk_upload_request_body(
+            chunks,
+            machine_id=machine_id,
+            client_name=client_name,
+            source_file=source_file,
+            file_position=file_position,
+        )
+    ).hexdigest()
+
+
 class ChunkUploadResponse(BaseModel):
     """Response after uploading chunks."""
 
-    status: str  # "ok" or "error"
-    chunks_received: int
-    chunks_embedded: int
-    chunks_stored: int
-    reindex_required: bool | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "error"]
+    chunks_received: NonNegativeInt
+    chunks_embedded: NonNegativeInt
+    chunks_stored: NonNegativeInt
+    reindex_required: StrictBool = False
     reindex_requested_at: str | None = None
     auth: dict[str, Any] | None = None
     message: str | None = None
     error: str | None = None
+
+    @field_validator("reindex_requested_at")
+    @classmethod
+    def validate_reindex_requested_at(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError("reindex_requested_at must include a timezone")
+        return parsed.isoformat()
+
+    @model_validator(mode="after")
+    def validate_response_contract(self) -> "ChunkUploadResponse":
+        # One-directional: a demanded reindex must say which request it is.
+        # The converse is a legitimate registry state, not an error - once a
+        # client acknowledges a request the server still reports that request's
+        # identity so the client can recognize it as already handled.
+        if self.reindex_required and self.reindex_requested_at is None:
+            raise ValueError("reindex_required responses must carry reindex_requested_at")
+        if self.status == "ok" and self.error is not None:
+            raise ValueError("successful responses cannot include an error")
+        if self.status == "error" and not self.error:
+            raise ValueError("error responses must include an error")
+        return self
 
 
 class SearchRequest(BaseModel):
@@ -228,7 +325,7 @@ class ClientHeartbeatRequest(BaseModel):
     hostname: str | None = Field(default=None, max_length=256)
     timezone: str | None = Field(default=None, max_length=128)
     heartbeat_interval_s: int | None = None
-    status: str | None = Field(default=None, max_length=64)
+    status: Literal["ok", "degraded"] | None = None
     last_upload_at: datetime | None = None
     last_indexed_at: datetime | None = None
     queue: DiagnosticMap | None = None
@@ -259,12 +356,32 @@ class GetPositionsRequest(BaseModel):
 class GetPositionsResponse(BaseModel):
     """Response with all positions for a machine."""
 
-    machine_id: str
-    positions: dict[str, int]  # file_path -> line_number
-    reindex_required: bool | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    machine_id: MachineId
+    positions: dict[str, NonNegativeInt]  # file_path -> line_number
+    reindex_required: StrictBool = False
     reindex_requested_at: str | None = None
     auth: dict[str, Any] | None = None
     error: str | None = None
+
+    @field_validator("reindex_requested_at")
+    @classmethod
+    def validate_reindex_requested_at(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError("reindex_requested_at must include a timezone")
+        return parsed.isoformat()
+
+    @model_validator(mode="after")
+    def validate_response_contract(self) -> "GetPositionsResponse":
+        # One-directional for the same reason as the upload response: an
+        # acknowledged request keeps reporting its identity with required=False.
+        if self.reindex_required and self.reindex_requested_at is None:
+            raise ValueError("reindex_required responses must carry reindex_requested_at")
+        return self
 
 
 class ReindexAckRequest(BaseModel):
@@ -272,9 +389,17 @@ class ReindexAckRequest(BaseModel):
 
     machine_id: MachineId
     client_name: str | None = Field(default=None, max_length=256)
-    reindex_requested_at: str | None = None
-    status: str = Field(default="queued", max_length=64)
+    reindex_requested_at: str
+    status: Literal["queued", "completed"] = "queued"
     reason: str | None = Field(default=None, max_length=512)
+
+    @field_validator("reindex_requested_at")
+    @classmethod
+    def validate_reindex_requested_at(cls, value: str) -> str:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError("reindex_requested_at must include a timezone")
+        return parsed.isoformat()
 
 
 class AuthRotateAckRequest(BaseModel):

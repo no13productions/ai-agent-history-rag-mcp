@@ -381,8 +381,10 @@ def test_status_configuration_hides_lancedb_path_for_spanner(monkeypatch):
     assert configuration["storage_backend"] == "spanner"
     assert configuration["spanner_database"] == "ai-agent-history-rag"
     assert "db_path" not in configuration
-    assert configuration["chatgpt_exports_path"].endswith("/imports/chatgpt")
-    assert configuration["claude_app_exports_path"].endswith("/imports/claude-app")
+    assert "chatgpt_exports_path" not in configuration
+    assert len(configuration["chatgpt_exports_path_hash"]) == 12
+    assert "claude_app_exports_path" not in configuration
+    assert len(configuration["claude_app_exports_path_hash"]) == 12
 
 
 @pytest.mark.asyncio
@@ -725,11 +727,20 @@ def test_api_client_url_redaction_removes_userinfo():
 
 
 def test_binary_history_line_count_does_not_raise(tmp_path):
-    """Legacy Antigravity protobuf files may contain invalid UTF-8."""
+    """Legacy Antigravity protobuf files may contain invalid UTF-8.
+
+    Counted as bytes, so the result is the real physical-line count rather than
+    the zero an undecodable source used to report. Zero is not a safe answer
+    here: it is indistinguishable from an empty file to every cursor decision
+    that consumes it.
+    """
     pb_file = tmp_path / "conversation.pb"
     pb_file.write_bytes(b"\xff\xfe\x00\x80")
 
-    assert _count_file_lines(pb_file) == 0
+    assert _count_file_lines(pb_file) == 1
+
+    pb_file.write_bytes(b"\xff\xfe\n\x00\x80\n")
+    assert _count_file_lines(pb_file) == 2
 
 
 def test_machine_position_clear_helpers_remove_stale_positions():
