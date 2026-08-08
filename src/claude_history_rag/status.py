@@ -121,11 +121,7 @@ class StatusCollector:
     def _get_cached_store_stats(self) -> dict[str, Any] | None:
         """Return the store's last stats snapshot when the backend exposes one."""
         cached = getattr(store, "_stats_cache", None)
-        if (
-            isinstance(cached, tuple)
-            and len(cached) == 2
-            and isinstance(cached[1], dict)
-        ):
+        if isinstance(cached, tuple) and len(cached) == 2 and isinstance(cached[1], dict):
             return cached[1]
         return None
 
