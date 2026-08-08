@@ -746,7 +746,7 @@ def hold_existing_directory(path: Path) -> Iterator[_HeldDirectory]:
     descriptors: list[int] = [os.open(anchor, flags)]
     try:
         for component in absolute.parts[1:]:
-            descriptors.append(os.open(component, flags, dir_fd=descriptors[-1]))
+            descriptors.append(_posix_open_relative_directory(descriptors[-1], component, flags))
         yield _HeldDirectory(path=absolute, descriptor=descriptors[-1])
     finally:
         _close_handles(descriptors)
@@ -781,7 +781,12 @@ def hold_descendant_directory(
         if descriptor is None:
             raise OSError("POSIX held directory authority is unavailable")
         for component in components:
-            child = os.open(component, flags, dir_fd=descriptor)
+            try:
+                child = _posix_open_relative_directory(descriptor, component, flags)
+            except NotADirectoryError as error:
+                raise UnsafeDurablePathError(
+                    f"durable descendant is not traversable: {component}"
+                ) from error
             opened.append(child)
             descriptor = child
             current = current / component
@@ -1009,6 +1014,13 @@ class PinnedRoot:
                 "durable watch root is missing",
                 reason=ROOT_UNBOUND,
             ) from error
+        except NotADirectoryError as error:
+            if entered:
+                raise
+            raise DurableRootUnavailableError(
+                "durable watch root is not a directory",
+                reason=ROOT_NOT_A_DIRECTORY,
+            ) from error
 
     @contextmanager
     def snapshot(self, candidate: Path, *, max_bytes: int) -> Iterator[Path]:
@@ -1055,6 +1067,61 @@ def _posix_directory_flags() -> int:
     return os.O_RDONLY | required
 
 
+def _posix_open_relative_directory(
+    descriptor: int,
+    component: str,
+    flags: int,
+) -> int:
+    """Open one directory component and normalize POSIX link refusal.
+
+    Linux reports an ``O_NOFOLLOW | O_DIRECTORY`` open of a directory symlink
+    as ``ENOTDIR`` rather than ``ELOOP``.  Classify the entry through the same
+    held parent descriptor after either result so links have one stable public
+    failure while ordinary non-directories retain their distinct classification.
+    """
+    try:
+        return os.open(component, flags, dir_fd=descriptor)
+    except OSError as error:
+        if error.errno not in {errno.ELOOP, errno.ENOTDIR}:
+            raise
+        try:
+            metadata = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError as missing:
+            # The entry changed while it was being classified. Refuse the
+            # original open result; importantly, never retry with link following.
+            raise missing from error
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+            raise UnsafeDurablePathError(
+                f"durable directory is a link or reparse point: {component}"
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(
+                errno.ENOTDIR,
+                "durable path component is not a directory",
+                component,
+            ) from error
+        # A directory that failed a no-follow directory open changed or became
+        # otherwise unsafe between observations. Preserve fail-closed behavior
+        # with a bounded error instead of exposing a platform-specific errno.
+        raise UnsafeDurablePathError(
+            f"durable directory could not be safely traversed: {component}"
+        ) from error
+
+
+def _posix_replace_relative(
+    descriptor: int,
+    source: str,
+    target: str,
+) -> None:
+    """Atomically replace one name relative to a held directory authority."""
+    os.replace(
+        source,
+        target,
+        src_dir_fd=descriptor,
+        dst_dir_fd=descriptor,
+    )
+
+
 @contextmanager
 def _hold_posix_directory(path: Path) -> Iterator[_HeldDirectory]:
     absolute = _absolute(path)
@@ -1068,7 +1135,11 @@ def _hold_posix_directory(path: Path) -> Iterator[_HeldDirectory]:
         for component in absolute.parts[1:]:
             current = current / component
             try:
-                child = os.open(component, flags, dir_fd=descriptor)
+                child = _posix_open_relative_directory(descriptor, component, flags)
+            except NotADirectoryError as error:
+                raise UnsafeDurablePathError(
+                    f"durable directory is not a directory: {component}"
+                ) from error
             except FileNotFoundError:
                 created_identity: tuple[int, int] | None = None
                 try:
@@ -1094,7 +1165,7 @@ def _hold_posix_directory(path: Path) -> Iterator[_HeldDirectory]:
                         "durable directory creation committed without confirmation",
                         committed=True,
                     ) from error
-                child = os.open(component, flags, dir_fd=descriptor)
+                child = _posix_open_relative_directory(descriptor, component, flags)
                 if created_identity is not None:
                     try:
                         opened = os.fstat(child)
@@ -1395,11 +1466,10 @@ def atomic_write_bytes(path: Path, payload: bytes, *, durable_root: Path) -> Non
                     )
                 else:
                     assert held.descriptor is not None
-                    os.replace(
+                    _posix_replace_relative(
+                        held.descriptor,
                         temporary_name,
                         target_name,
-                        src_dir_fd=held.descriptor,
-                        dst_dir_fd=held.descriptor,
                     )
                     try:
                         os.fsync(held.descriptor)

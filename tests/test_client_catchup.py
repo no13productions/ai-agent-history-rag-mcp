@@ -72,14 +72,14 @@ def inject_durable_replace_failure(
 
         monkeypatch.setattr(durable_io, "_windows_rename_relative", reject)
     else:
-        original = durable_io.os.replace
+        original = durable_io._posix_replace_relative
 
-        def reject(source, destination, **kwargs):
+        def reject(descriptor, source, destination):
             if destination == target.name:
                 raise OSError(message)
-            return original(source, destination, **kwargs)
+            return original(descriptor, source, destination)
 
-        monkeypatch.setattr(durable_io.os, "replace", reject)
+        monkeypatch.setattr(durable_io, "_posix_replace_relative", reject)
 
 
 OUTSIDE_SENTINEL = "OUTSIDE_HISTORY_CONTENT_SENTINEL"
