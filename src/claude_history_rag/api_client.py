@@ -7,11 +7,13 @@ with retry logic and offline resilience.
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import logging
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -38,18 +40,48 @@ logger = logging.getLogger(__name__)
 
 # HTTP client configuration
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0)
+MAX_LOGGED_ORIGIN_LENGTH = 320
 
 
 def _redact_url(url: str) -> str:
-    """Remove userinfo from URLs before logging."""
+    """Return a bounded origin that is safe to include in diagnostics."""
     try:
+        # urlsplit normalizes CR/LF/TAB before exposing components. Reject the
+        # raw authority first so control-bearing input cannot become a different,
+        # apparently-valid hostname in logs.
+        if re.search(r"[\x00-\x1f\x7f]", url):
+            return "<invalid-url>"
         parts = urlsplit(url)
-        hostname = parts.hostname or ""
-        netloc = hostname
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname
+        if scheme not in {"http", "https"} or not hostname or "%" in hostname:
+            return "<invalid-url>"
+
+        try:
+            parsed_address = ipaddress.ip_address(hostname)
+        except ValueError:
+            hostname = hostname.encode("idna").decode("ascii").rstrip(".").lower()
+            if (
+                len(hostname) > 253
+                or not re.fullmatch(r"[a-z0-9.-]+", hostname)
+                or any(
+                    not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+                    for label in hostname.split(".")
+                )
+            ):
+                return "<invalid-url>"
+            netloc = hostname
+        else:
+            hostname = parsed_address.compressed
+            netloc = f"[{hostname}]" if parsed_address.version == 6 else hostname
+
         if parts.port is not None:
             netloc = f"{netloc}:{parts.port}"
-        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    except Exception:
+        origin = f"{scheme}://{netloc}"
+        if len(origin) > MAX_LOGGED_ORIGIN_LENGTH:
+            return "<invalid-url>"
+        return origin
+    except (UnicodeError, ValueError):
         return "<invalid-url>"
 
 

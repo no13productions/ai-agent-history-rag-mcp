@@ -15,6 +15,21 @@ logger = logging.getLogger(__name__)
 MAX_CLIENT_REGISTRY_BYTES = 8 * 1024 * 1024
 
 
+def _is_canonical_reindex_identity(value: object) -> bool:
+    """Return whether value is an exact server-issued UTC request identity."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() == timedelta(0)
+        and parsed.astimezone(timezone.utc).isoformat() == value
+    )
+
+
 def _sanitize_reason(value: str, default: str = "error") -> str:
     """Return a bounded status reason suitable for dashboard/API payloads."""
     reason = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or default)).strip("_")
@@ -311,7 +326,21 @@ class ClientRegistry:
         with self._lock:
             self._load()
             timestamp = self._now()
+            previous = self._state.get("reindex_requested_at")
+            if _is_canonical_reindex_identity(previous):
+                previous_time = datetime.fromisoformat(previous)
+                timestamp_time = datetime.fromisoformat(timestamp)
+                if timestamp_time <= previous_time:
+                    timestamp = (previous_time + timedelta(microseconds=1)).isoformat()
             self._state["reindex_requested_at"] = timestamp
+            clients = self._state.setdefault("clients", {})
+            for entry in clients.values():
+                if not isinstance(entry, dict):
+                    continue
+                entry.pop("reindex_ack_for", None)
+                entry.pop("reindex_ack_status", None)
+                entry.pop("reindex_ack_reason", None)
+                entry.pop("last_reindex_ack", None)
             self._save()
             return timestamp
 
@@ -322,6 +351,16 @@ class ClientRegistry:
         status: str | None = None,
         reason: str | None = None,
     ) -> None:
+        ack_status = "queued" if status is None else status
+        if not isinstance(ack_status, str) or ack_status not in {"queued", "completed"}:
+            raise ValueError("reindex acknowledgement status must be queued or completed")
+        if reindex_requested_at is not None and not _is_canonical_reindex_identity(
+            reindex_requested_at
+        ):
+            raise ValueError("reindex acknowledgement must carry a canonical request identity")
+        if ack_status == "completed" and reindex_requested_at is None:
+            raise ValueError("completed reindex acknowledgement must carry a request identity")
+
         with self._lock:
             self._load()
             clients = self._state.setdefault("clients", {})
@@ -332,8 +371,7 @@ class ClientRegistry:
             entry["last_reindex_ack"] = self._now()
             if reindex_requested_at:
                 entry["reindex_ack_for"] = reindex_requested_at
-            if status:
-                entry["reindex_ack_status"] = _sanitize_reason(status, "queued")
+            entry["reindex_ack_status"] = ack_status
             if reason:
                 entry["reindex_ack_reason"] = _sanitize_reason(reason, "reason")
             clients[machine_id] = entry
@@ -406,17 +444,40 @@ class ClientRegistry:
     def get_reindex_status(self, machine_id: str) -> tuple[bool, str | None]:
         with self._lock:
             self._load()
-            reindex_requested_at = self._state.get("reindex_requested_at")
-            if not reindex_requested_at:
+            request_is_absent = (
+                "reindex_requested_at" not in self._state
+                or self._state["reindex_requested_at"] is None
+            )
+            if request_is_absent:
                 return False, None
+            reindex_requested_at = self._state["reindex_requested_at"]
+            if not _is_canonical_reindex_identity(reindex_requested_at):
+                # A malformed persisted request must never become an implicit
+                # completion authority. Replace it with a fresh server-issued
+                # identity and durably require every client to replay it.
+                reindex_requested_at = self._now()
+                self._state["reindex_requested_at"] = reindex_requested_at
+                clients = self._state.get("clients", {})
+                if isinstance(clients, dict):
+                    for entry in clients.values():
+                        if isinstance(entry, dict):
+                            entry.pop("reindex_ack_for", None)
+                            entry.pop("reindex_ack_status", None)
+                self._save()
+                return True, reindex_requested_at
 
-            entry = self._state.get("clients", {}).get(machine_id, {})
+            clients = self._state.get("clients", {})
+            entry = clients.get(machine_id, {}) if isinstance(clients, dict) else {}
+            if not isinstance(entry, dict):
+                return True, reindex_requested_at
             ack_for = entry.get("reindex_ack_for")
-            last_ack = entry.get("last_reindex_ack")
+            ack_status = entry.get("reindex_ack_status")
 
-            if ack_for == reindex_requested_at:
-                return False, reindex_requested_at
-            if last_ack and reindex_requested_at and last_ack > reindex_requested_at:
+            if (
+                _is_canonical_reindex_identity(ack_for)
+                and ack_for == reindex_requested_at
+                and ack_status == "completed"
+            ):
                 return False, reindex_requested_at
             return True, reindex_requested_at
 

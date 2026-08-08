@@ -721,9 +721,29 @@ def test_request_models_bound_limits_and_positions():
         )
 
 
-def test_api_client_url_redaction_removes_userinfo():
-    """Client mode connection logs should not expose URL credentials."""
-    assert _redact_url("https://user:pass@example.com:8443/api") == "https://example.com:8443/api"
+def test_api_client_url_redaction_returns_only_bounded_safe_origin():
+    """Client mode connection logs expose no credential or request-target data."""
+    assert (
+        _redact_url("https://user:pass@example.com:8443/api?token=secret#private")
+        == "https://example.com:8443"
+    )
+    assert _redact_url("https://[2001:db8::1]:8443/private") == "https://[2001:db8::1]:8443"
+    assert _redact_url("https://[fe80::1%25private-interface]/") == "<invalid-url>"
+    assert _redact_url("https://bad_host.example/private") == "<invalid-url>"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "htt\np://example.com",
+        "https://user\rname@example.com",
+        "https://top\tsecret.example/private",
+        "https://example.com:\x008443/private",
+        "https://example.com\x7f/private",
+    ],
+)
+def test_api_client_url_redaction_rejects_raw_controls_before_parsing(url: str):
+    assert _redact_url(url) == "<invalid-url>"
 
 
 def test_binary_history_line_count_does_not_raise(tmp_path):
