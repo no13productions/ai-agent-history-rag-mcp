@@ -3064,14 +3064,264 @@ async def test_api_retry_never_logs_transport_exception_text(
     assert "error_type=RuntimeError" in caplog.text
 
 
+async def test_api_connection_failure_log_emits_only_safe_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Exercise the emitted connection log with every URL secret-bearing component."""
+    client = api_client_module.APIClient(
+        server_url=(
+            "https://URL_USER:URL_PASSWORD@example.com:8443/SECRET_PATH\nFORGED_LOG_LINE"
+            "?access_token=QUERY_SECRET#FRAGMENT_SECRET"
+        ),
+        machine_id="machine-a",
+        client_name="machine-a",
+        retry_count=1,
+        retry_delay_seconds=0,
+    )
+
+    class FailingTransport:
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectError("provider text must not be logged")
+
+    async def fake_ensure_client():
+        return FailingTransport()
+
+    monkeypatch.setattr(client, "_ensure_client", fake_ensure_client)
+    monkeypatch.setattr(client, "_auth_headers", lambda: {})
+
+    with caplog.at_level("ERROR"), pytest.raises(api_client_module.ServerConnectionError):
+        await client._request_with_retry("GET", "/health")
+
+    assert "Connection to <invalid-url> failed after 1 attempts" in caplog.text
+    for secret in (
+        "URL_USER",
+        "URL_PASSWORD",
+        "SECRET_PATH",
+        "FORGED_LOG_LINE",
+        "QUERY_SECRET",
+        "FRAGMENT_SECRET",
+        "provider text",
+    ):
+        assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("server_url", "forbidden"),
+    [
+        ("ht\rtps://SCHEME_SECRET.example", "SCHEME_SECRET"),
+        ("https://USER\nINFO_SECRET@example.com", "INFO_SECRET"),
+        ("https://HOST\tSECRET.example/private", "hostsecret.example"),
+        ("https://example.com:\x008443/PORT_SECRET", "PORT_SECRET"),
+        ("https://DEL_SECRET.example\x7f/private", "DEL_SECRET"),
+    ],
+)
+async def test_api_connection_failure_log_rejects_control_bearing_url_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    server_url: str,
+    forbidden: str,
+):
+    client = api_client_module.APIClient(
+        server_url=server_url,
+        machine_id="machine-a",
+        client_name="machine-a",
+        retry_count=1,
+        retry_delay_seconds=0,
+    )
+
+    class FailingTransport:
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectError("provider text must not be logged")
+
+    async def fake_ensure_client():
+        return FailingTransport()
+
+    monkeypatch.setattr(client, "_ensure_client", fake_ensure_client)
+    monkeypatch.setattr(client, "_auth_headers", lambda: {})
+
+    with caplog.at_level("ERROR"), pytest.raises(api_client_module.ServerConnectionError):
+        await client._request_with_retry("GET", "/health")
+
+    assert "Connection to <invalid-url> failed after 1 attempts" in caplog.text
+    assert forbidden.lower() not in caplog.text.lower()
+    assert "provider text" not in caplog.text
+
+
+def test_reindex_ack_requires_exact_terminal_completion_across_restart(tmp_path: Path):
+    registry_path = tmp_path / "client-registry.json"
+    machine_id = "machine-a"
+    registry = ClientRegistry(registry_path)
+    requested_at = registry.mark_reindex_requested()
+
+    registry.ack_reindex(machine_id, reindex_requested_at=requested_at, status="queued")
+    assert registry.get_reindex_status(machine_id) == (True, requested_at)
+    assert ClientRegistry(registry_path).get_reindex_status(machine_id) == (True, requested_at)
+
+    with pytest.raises(ValueError, match="must carry a request identity"):
+        registry.ack_reindex(machine_id, reindex_requested_at=None, status="completed")
+    assert registry.get_reindex_status(machine_id) == (True, requested_at)
+
+    registry.ack_reindex(
+        machine_id,
+        reindex_requested_at="2026-08-01T00:00:00+00:00",
+        status="completed",
+    )
+    assert registry.get_reindex_status(machine_id) == (True, requested_at)
+
+    registry.ack_reindex(machine_id, reindex_requested_at=requested_at, status="completed")
+    assert registry.get_reindex_status(machine_id) == (False, requested_at)
+    assert ClientRegistry(registry_path).get_reindex_status(machine_id) == (False, requested_at)
+
+    registry.ack_reindex(machine_id, reindex_requested_at=requested_at, status="completed")
+    assert registry.get_reindex_status(machine_id) == (False, requested_at)
+
+
+def test_new_reindex_request_invalidates_ack_and_stays_fresh_on_clock_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    registry_path = tmp_path / "client-registry.json"
+    registry = ClientRegistry(registry_path)
+    fixed_time = "2026-08-07T12:00:00+00:00"
+    monkeypatch.setattr(registry, "_now", lambda: fixed_time)
+
+    first_request = registry.mark_reindex_requested()
+    registry.ack_reindex("machine-a", reindex_requested_at=first_request, status="completed")
+    assert registry.get_reindex_status("machine-a") == (False, first_request)
+
+    second_request = registry.mark_reindex_requested()
+
+    assert second_request == "2026-08-07T12:00:00.000001+00:00"
+    assert second_request != first_request
+    assert registry.get_reindex_status("machine-a") == (True, second_request)
+    assert ClientRegistry(registry_path).get_reindex_status("machine-a") == (
+        True,
+        second_request,
+    )
+
+    registry.ack_reindex("machine-a", reindex_requested_at=first_request, status="completed")
+    assert registry.get_reindex_status("machine-a") == (True, second_request)
+
+    registry.ack_reindex("machine-a", reindex_requested_at=second_request, status="completed")
+    assert registry.get_reindex_status("machine-a") == (False, second_request)
+
+
+@pytest.mark.parametrize(
+    "malformed_identity",
+    [
+        "",
+        0,
+        False,
+        [],
+        {},
+        "not-a-timestamp",
+        "2026-08-07T12:00:00",
+        "2026-08-07T08:00:00-04:00",
+        {"timestamp": "2026-08-07T12:00:00+00:00"},
+    ],
+)
+def test_malformed_persisted_reindex_identity_rotates_to_required_request(
+    tmp_path: Path, malformed_identity: object
+):
+    registry_path = tmp_path / "client-registry.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "reindex_requested_at": malformed_identity,
+                "clients": {
+                    "machine-a": {
+                        "reindex_ack_for": malformed_identity,
+                        "reindex_ack_status": "completed",
+                    }
+                },
+            }
+        )
+    )
+
+    required, recovered_identity = ClientRegistry(registry_path).get_reindex_status("machine-a")
+
+    assert required is True
+    assert isinstance(recovered_identity, str)
+    recovered = datetime.fromisoformat(recovered_identity)
+    assert recovered.tzinfo is not None
+    persisted = json.loads(registry_path.read_text())
+    assert persisted["reindex_requested_at"] == recovered_identity
+    assert "reindex_ack_for" not in persisted["clients"]["machine-a"]
+    assert "reindex_ack_status" not in persisted["clients"]["machine-a"]
+
+
+@pytest.mark.parametrize(
+    "malformed_ack",
+    ["not-a-timestamp", "2026-08-07T12:00:00", {"timestamp": "forged"}],
+)
+def test_malformed_persisted_completion_ack_remains_required(tmp_path: Path, malformed_ack: object):
+    registry_path = tmp_path / "client-registry.json"
+    requested_at = "2026-08-07T12:00:00+00:00"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "reindex_requested_at": requested_at,
+                "clients": {
+                    "machine-a": {
+                        "reindex_ack_for": malformed_ack,
+                        "reindex_ack_status": "completed",
+                    }
+                },
+            }
+        )
+    )
+
+    assert ClientRegistry(registry_path).get_reindex_status("machine-a") == (
+        True,
+        requested_at,
+    )
+
+
+def test_reindex_ack_unknown_status_fails_closed_without_mutation(tmp_path: Path):
+    registry_path = tmp_path / "client-registry.json"
+    registry = ClientRegistry(registry_path)
+    requested_at = registry.mark_reindex_requested()
+
+    with pytest.raises(ValueError, match="must be queued or completed"):
+        registry.ack_reindex(
+            "machine-a",
+            reindex_requested_at=requested_at,
+            status="completed-but-not-really",
+        )
+
+    assert registry.get_reindex_status("machine-a") == (True, requested_at)
+    status = ClientRegistry(registry_path).get_client_status()
+    assert status["clients"] == []
+
+    registry_path.write_text(
+        json.dumps(
+            {
+                "reindex_requested_at": requested_at,
+                "clients": {
+                    "machine-a": {
+                        "reindex_ack_for": requested_at,
+                        "reindex_ack_status": "completed\nFORGED_STATUS",
+                        "last_reindex_ack": "9999-12-31T23:59:59+00:00",
+                    }
+                },
+            }
+        )
+    )
+    assert ClientRegistry(registry_path).get_reindex_status("machine-a") == (
+        True,
+        requested_at,
+    )
+
+
 async def test_acknowledged_reindex_state_does_not_break_upload_or_position_sync(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """A client that has acknowledged a reindex must keep uploading normally.
 
-    The real registry reports ``(False, requested_at)`` once a client acks: the
-    request identity is still returned so the client can recognize it as handled.
+    The real registry reports ``(False, requested_at)`` once a client sends an
+    exact completed ack: the request identity is still returned so the client can
+    recognize it as handled.
     Treating that legitimate pair as a contract violation rejected the response
     AFTER the chunks were stored and the position advanced, so the client never
     completed its outbox record and re-uploaded the same chunks forever.
