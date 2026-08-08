@@ -82,14 +82,14 @@ def test_atomic_replace_failure_preserves_old_state(
 
         monkeypatch.setattr(durable_io, "_windows_rename_relative", fail_target_replace)
     else:
-        original_replace = durable_io.os.replace
+        original_replace = durable_io._posix_replace_relative
 
-        def fail_target_replace(source, destination, **kwargs):
-            if Path(destination) == target.name:
+        def fail_target_replace(descriptor, source, destination):
+            if destination == target.name:
                 raise OSError("injected replace failure")
-            return original_replace(source, destination, **kwargs)
+            return original_replace(descriptor, source, destination)
 
-        monkeypatch.setattr(durable_io.os, "replace", fail_target_replace)
+        monkeypatch.setattr(durable_io, "_posix_replace_relative", fail_target_replace)
     with pytest.raises(OSError, match="replace failure"):
         durable_io.atomic_write_bytes(target, b"new-state", durable_root=tmp_path)
 
@@ -149,6 +149,34 @@ def test_durable_directory_rejects_symlink_or_reparse_point(tmp_path: Path):
         )
 
     assert list(outside.iterdir()) == []
+
+
+def test_pinned_root_keeps_missing_and_non_directory_classifications_distinct(tmp_path: Path):
+    missing = durable_io.PinnedRoot(tmp_path / "missing")
+    assert missing.bind() is False
+    assert missing.classify(tmp_path / "missing" / "session.jsonl") == durable_io.ROOT_UNBOUND
+
+    regular = tmp_path / "regular-file"
+    regular.write_bytes(b"not-a-directory")
+    pinned = durable_io.PinnedRoot(regular)
+    with pytest.raises(durable_io.DurableRootUnavailableError) as refused:
+        pinned.bind()
+    assert refused.value.reason == durable_io.ROOT_NOT_A_DIRECTORY
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX errno normalization proof")
+def test_posix_nested_non_directory_is_bounded_without_link_misclassification(tmp_path: Path):
+    root = tmp_path / "history"
+    root.mkdir()
+    (root / "ordinary-file").write_bytes(b"not-a-link")
+    pinned = durable_io.PinnedRoot(root)
+    assert pinned.bind() is True
+
+    with (
+        pytest.raises(durable_io.UnsafeDurablePathError, match="not traversable"),
+        pinned.snapshot(root / "ordinary-file" / "session.jsonl", max_bytes=128),
+    ):
+        pass
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle-pinning proof")

@@ -779,9 +779,7 @@ def test_local_status_auth_headers_uses_shared_psk(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "server_psk", "")
     monkeypatch.setattr(settings, "auth_state_path", auth_file)
 
-    assert server_module._local_status_auth_headers() == {
-        "Authorization": "Bearer shared-psk-123"
-    }
+    assert server_module._local_status_auth_headers() == {"Authorization": "Bearer shared-psk-123"}
 
 
 def test_local_status_auth_headers_prefers_env_override(monkeypatch, tmp_path):

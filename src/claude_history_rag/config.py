@@ -26,9 +26,7 @@ PRODUCTION_EMBEDDING_MODEL = "gemini-embedding-001"
 PRODUCTION_EMBEDDING_DIMENSION = 3072
 PRODUCTION_STATUS_SERVER_HOST = "127.0.0.1"
 PRODUCTION_STATUS_SERVER_PORT = 4680
-PREFERRED_GOOGLE_APPLICATION_CREDENTIALS = Path(
-    "/Users/brandon/Meridian/alfred-sa-key.json"
-)
+PREFERRED_GOOGLE_APPLICATION_CREDENTIALS = Path("/Users/brandon/Meridian/alfred-sa-key.json")
 
 PRODUCTION_SOURCE_PATHS = {
     "projects_path": Path.home() / ".claude" / "projects",
@@ -36,10 +34,7 @@ PRODUCTION_SOURCE_PATHS = {
     "gemini_sessions_path": Path.home() / ".gemini" / "tmp",
     "antigravity_sessions_path": Path.home() / ".gemini" / "antigravity",
     "chatgpt_exports_path": Path.home() / ".claude-history-rag" / "imports" / "chatgpt",
-    "claude_app_exports_path": Path.home()
-    / ".claude-history-rag"
-    / "imports"
-    / "claude-app",
+    "claude_app_exports_path": Path.home() / ".claude-history-rag" / "imports" / "claude-app",
 }
 
 
@@ -544,9 +539,7 @@ class Settings(BaseSettings):
                 if not value
             ]
             if missing:
-                raise ValueError(
-                    "Spanner storage requires explicit config: " + ", ".join(missing)
-                )
+                raise ValueError("Spanner storage requires explicit config: " + ", ".join(missing))
         if self.embedding_provider == "vertex":
             if self.embedding_model == "nomic-embed-text":
                 self.embedding_model = "gemini-embedding-001"
@@ -646,16 +639,13 @@ def validate_production_runtime_contract(
     credential = env.get("GOOGLE_APPLICATION_CREDENTIALS")
     if credential != str(credential_path):
         errors.append(
-            "GOOGLE_APPLICATION_CREDENTIALS="
-            f"{credential!r} expected {str(credential_path)!r}"
+            f"GOOGLE_APPLICATION_CREDENTIALS={credential!r} expected {str(credential_path)!r}"
         )
     if not credential_path.exists():
         errors.append(f"credential file missing: {credential_path}")
 
     if env.get("CLAUDE_HISTORY_RAG_DB_PATH"):
-        errors.append(
-            "CLAUDE_HISTORY_RAG_DB_PATH must be unset in production Spanner runtime"
-        )
+        errors.append("CLAUDE_HISTORY_RAG_DB_PATH must be unset in production Spanner runtime")
 
     if errors:
         raise RuntimeError("Production runtime contract invalid: " + "; ".join(errors))
