@@ -245,9 +245,9 @@ uv run ai-agent-history-rag-daemon start
 
 3. **Configure Claude Code** to use the MCP server (see Configuration section)
 
-#### Meridian Production Spanner Runtime
+#### Velenza Production Spanner Runtime
 
-The Meridian production daemon runs in server mode against the shared Spanner DB. It must be explicit: do not rely on the local LanceDB default for production status or search.
+The Velenza production daemon runs in server mode against the shared Spanner DB. It must be explicit: do not rely on the local LanceDB default for production status or search.
 
 ```bash
 export CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT=production
@@ -357,7 +357,7 @@ Add to `~/.config/Claude/claude_desktop_config.json`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT` | `""` | Set to `production` for the Meridian launchd runtime; exact Spanner coordinates, status port, watch roots, and credential path are validated at daemon startup |
+| `CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT` | `""` | Set to `production` for the Velenza launchd runtime; exact Spanner coordinates, status port, watch roots, and credential path are validated at daemon startup |
 | `CLAUDE_HISTORY_RAG_DB_PATH` | `~/.claude-history-rag/lancedb` | LanceDB database location |
 | `CLAUDE_HISTORY_RAG_STATE_PATH` | `~/.claude-history-rag/state.json` | File position state |
 | `CLAUDE_HISTORY_RAG_PROJECTS_PATH` | `~/.claude/projects` | Claude Code projects directory |
@@ -420,7 +420,7 @@ export CLAUDE_HISTORY_RAG_VERTEX_LOCATION=us-central1
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_HISTORY_RAG_STORAGE_BACKEND` | `lancedb` | `lancedb` for local development or `spanner`; Meridian production must set `spanner` |
+| `CLAUDE_HISTORY_RAG_STORAGE_BACKEND` | `lancedb` | `lancedb` for local development or `spanner`; Velenza production must set `spanner` |
 | `CLAUDE_HISTORY_RAG_SPANNER_PROJECT` | `""` | Cloud Spanner project; required when `storage_backend=spanner` |
 | `CLAUDE_HISTORY_RAG_SPANNER_INSTANCE` | `""` | Cloud Spanner instance ID; required when `storage_backend=spanner` |
 | `CLAUDE_HISTORY_RAG_SPANNER_DATABASE` | `""` | Cloud Spanner database ID; required when `storage_backend=spanner` |
