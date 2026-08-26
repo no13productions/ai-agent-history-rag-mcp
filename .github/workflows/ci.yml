@@ -16,7 +16,21 @@ concurrency:
 jobs:
   test:
     name: lint and test
-    runs-on: ubuntu-24.04
+    # arc-runner-set — the DOCKER2 ARC pool every other Velenza fleet repository
+    # builds on. This repo was the last one still consuming GitHub-hosted minutes.
+    #
+    # The pool's runner image supplies Node, pnpm, gcloud and build-essential, but
+    # NOT Python or uv — both steps below fetch their own toolchain
+    # (actions/setup-python honours .python-version, astral-sh/setup-uv pins
+    # 0.11.32), so nothing here depends on the image carrying them. arc-runner-set
+    # has unrestricted egress, unlike meridian-copilot's Squid allowlist, so those
+    # downloads and the uv cache reach upstream normally.
+    #
+    # This label requires the repository to hold the "Meridian Docker2" runner
+    # group. Granted in no13-infra ops/github-runners/docker2/runner-groups.json
+    # and applied by reconcile-runner-groups.sh on DOCKER2 — a label change that
+    # lands before the grant is applied cannot obtain a runner and queues forever.
+    runs-on: arc-runner-set
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

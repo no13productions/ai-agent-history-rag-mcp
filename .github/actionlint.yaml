@@ -1,0 +1,17 @@
+# actionlint configuration — see https://github.com/rhysd/actionlint
+#
+# self-hosted-runner.labels: actionlint hard-errors on a `runs-on:` label it does not
+# recognize as a GitHub-hosted runner. This repository builds on the DOCKER2 ARC pool,
+# so without this file `runs-on: arc-runner-set` lints as an unknown label.
+#
+# This is a runner-inventory DECLARATION, not a suppressed finding — it excludes no file
+# from any check and changes no rule. Same content and same reasoning as
+# no13-infra/.github/actionlint.yaml; all four fleet scale-set labels are listed rather
+# than only the one used here, so the inventory stays copy-identical across the fleet and
+# a later move to another scale set needs no edit.
+self-hosted-runner:
+  labels:
+    - arc-runner-set
+    - meridian-control
+    - meridian-copilot
+    - meridian-lite
