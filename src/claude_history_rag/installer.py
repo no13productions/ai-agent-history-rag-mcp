@@ -26,8 +26,8 @@ MCP_SAFE_ENV_KEYS = frozenset(
         "HOME",
         "PATH",
         "CLOUDSDK_CONFIG",
-        "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_CLOUD_PROJECT",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE",
         "CLAUDE_HISTORY_RAG_SERVER_URL",
         "CLAUDE_HISTORY_RAG_MACHINE_ID",
         "CLAUDE_HISTORY_RAG_CLIENT_NAME",
@@ -79,6 +79,13 @@ MCP_SAFE_ENV_KEYS = frozenset(
         "CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_BATCH_SIZE",
         "CLAUDE_HISTORY_RAG_SPANNER_BACKFILL_INTERVAL_SECONDS",
     }
+)
+
+PRODUCTION_RUNTIME_CONTRACT = "production"
+PRODUCTION_CREDENTIALS_SOURCE = "application_default"
+FORBIDDEN_PRODUCTION_CREDENTIAL_ENV = (
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
 )
 
 try:
@@ -691,7 +698,7 @@ def build_mcp_server_config(
         "args": ["--directory", str(project_dir), "run", "ai-agent-history-rag"],
     }
 
-    env = project_mcp_env(env_vars or {})
+    env = project_mcp_env(normalize_production_credentials_env(env_vars or {}))
 
     # Client mode
     if server_url:
@@ -720,6 +727,17 @@ def project_mcp_env(env_vars: dict[str, str]) -> dict[str, str]:
         for key, value in env_vars.items()
         if key in MCP_SAFE_ENV_KEYS and value not in {"", None}
     }
+
+
+def normalize_production_credentials_env(env_vars: dict[str, str]) -> dict[str, str]:
+    """Replace any production credential-file selector with explicit keyless ADC."""
+    normalized = dict(env_vars)
+    if normalized.get("CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT") != PRODUCTION_RUNTIME_CONTRACT:
+        return normalized
+    for key in FORBIDDEN_PRODUCTION_CREDENTIAL_ENV:
+        normalized.pop(key, None)
+    normalized["CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE"] = PRODUCTION_CREDENTIALS_SOURCE
+    return normalized
 
 
 def add_mcp_to_target(
@@ -1300,6 +1318,7 @@ def install_daemon(
     env_vars: dict[str, str],
 ) -> bool:
     """Install daemon service for current platform."""
+    env_vars = normalize_production_credentials_env(env_vars)
     system = platform.system()
 
     if system == "Darwin":
@@ -1395,7 +1414,7 @@ def run_wizard() -> int:
             print_error("Re-run the full installer to configure this machine first.")
             return 1
 
-        env_vars.update(daemon_env)
+        env_vars.update(normalize_production_credentials_env(daemon_env))
         server_url = env_vars.get("CLAUDE_HISTORY_RAG_SERVER_URL")
         machine_id = env_vars.get("CLAUDE_HISTORY_RAG_MACHINE_ID")
         client_name = env_vars.get("CLAUDE_HISTORY_RAG_CLIENT_NAME")

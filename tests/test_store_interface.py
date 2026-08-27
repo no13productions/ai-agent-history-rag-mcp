@@ -181,10 +181,29 @@ def test_spanner_storage_requires_explicit_coordinates():
         Settings(storage_backend="spanner")
 
 
-def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path):
-    """The production contract pins Spanner, 3072d embeddings, status port, and key path."""
-    key_path = tmp_path / "service-account.json"
-    key_path.write_text("{}")
+def test_production_runtime_contract_accepts_keyless_adc():
+    """The production contract pins Spanner and keyless Application Default Credentials."""
+    configured = Settings(
+        runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
+        credentials_source="application_default",
+        storage_backend="spanner",
+        spanner_project=FAKE_SPANNER_PROJECT,
+        spanner_instance=FAKE_SPANNER_INSTANCE,
+        spanner_database=FAKE_SPANNER_DATABASE,
+        spanner_embedding_mode="spanner",
+        spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+        embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
+        embedding_model=PRODUCTION_EMBEDDING_MODEL,
+        embedding_dimension=PRODUCTION_EMBEDDING_DIMENSION,
+        status_server_host=PRODUCTION_STATUS_SERVER_HOST,
+        status_server_port=PRODUCTION_STATUS_SERVER_PORT,
+    )
+
+    validate_production_runtime_contract(configured, {})
+
+
+def test_production_runtime_contract_rejects_missing_adc_selector():
+    """Production refuses an implicit credential fallback."""
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
         storage_backend="spanner",
@@ -200,19 +219,41 @@ def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path):
         status_server_port=PRODUCTION_STATUS_SERVER_PORT,
     )
 
-    validate_production_runtime_contract(
-        configured,
-        {"GOOGLE_APPLICATION_CREDENTIALS": str(key_path)},
-        credential_path=key_path,
+    with pytest.raises(RuntimeError, match="credentials_source='' expected 'application_default'"):
+        validate_production_runtime_contract(configured, {})
+
+
+@pytest.mark.parametrize(
+    "forbidden_env",
+    ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"],
+)
+def test_production_runtime_contract_rejects_explicit_credential_files(forbidden_env):
+    """Production must not select an exportable service-account credential file."""
+    configured = Settings(
+        runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
+        credentials_source="application_default",
+        storage_backend="spanner",
+        spanner_project=FAKE_SPANNER_PROJECT,
+        spanner_instance=FAKE_SPANNER_INSTANCE,
+        spanner_database=FAKE_SPANNER_DATABASE,
+        spanner_embedding_mode="spanner",
+        spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+        embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
+        embedding_model=PRODUCTION_EMBEDDING_MODEL,
+        embedding_dimension=PRODUCTION_EMBEDDING_DIMENSION,
+        status_server_host=PRODUCTION_STATUS_SERVER_HOST,
+        status_server_port=PRODUCTION_STATUS_SERVER_PORT,
     )
+
+    with pytest.raises(RuntimeError, match=forbidden_env):
+        validate_production_runtime_contract(configured, {forbidden_env: "/tmp/key.json"})
 
 
 def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
     """A production Spanner daemon must not carry a local LanceDB fallback path."""
-    key_path = tmp_path / "service-account.json"
-    key_path.write_text("{}")
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
+        credentials_source="application_default",
         storage_backend="spanner",
         spanner_project=FAKE_SPANNER_PROJECT,
         spanner_instance=FAKE_SPANNER_INSTANCE,
@@ -230,10 +271,8 @@ def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
         validate_production_runtime_contract(
             configured,
             {
-                "GOOGLE_APPLICATION_CREDENTIALS": str(key_path),
                 "CLAUDE_HISTORY_RAG_DB_PATH": str(tmp_path / "lancedb"),
             },
-            credential_path=key_path,
         )
 
 

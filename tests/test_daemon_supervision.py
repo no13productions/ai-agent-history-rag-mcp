@@ -205,15 +205,11 @@ def test_launchd_plists_pin_production_spanner_contract():
         assert "ai-agent-history-rag" in content
         assert "gemini-embedding-001" in content
         assert "3072" in content
-        assert "GOOGLE_APPLICATION_CREDENTIALS" in content
+        assert "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE" in content
+        assert "application_default" in content
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in content
+        assert "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" not in content
         assert "CLAUDE_RAG_" not in content
-
-        # The credential path is deployment-specific and is substituted at install time.
-        # This asserts the SHAPE of the contract — that the key is wired to a
-        # substitution placeholder — rather than pinning one operator's path. The
-        # previous assertion required the literal "Meridian/alfred-sa-key.json", which
-        # is what kept a real account path published in this public repository.
-        assert "__GOOGLE_APPLICATION_CREDENTIALS__" in content
         assert "__GCP_PROJECT__" in content
         assert "__SPANNER_INSTANCE__" in content
 

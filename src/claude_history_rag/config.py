@@ -24,22 +24,18 @@ OPTIMIZE_INTERVAL = 900
 # LanceDB/Ollama defaults is the failure this contract exists to catch, so these are still
 # exact equality checks against the constants below.
 #
-# IDENTITY fields — which GCP project, which Spanner instance, which key file — are
-# deployment-specific. They are checked for PRESENCE, not against a fixed value. There is
+# IDENTITY fields — which GCP project and which Spanner instance — are deployment-specific.
+# They are checked for PRESENCE, not against a fixed value. There is
 # no correct literal for them in a general-purpose tool, and hardcoding one is what
 # published this operator's project id, instance id and account name from a public
 # repository.
 #
 # Presence-checking keeps the whole point of the contract: a production daemon still
 # cannot start pointed at LanceDB, still cannot start with an unconfigured Spanner target,
-# and still cannot start without credentials. It just no longer asserts WHICH target,
-# which was never this file's business.
-#
-# Practical consequence, and the reason it is done this way: an operator whose launch
-# agent already sets CLAUDE_HISTORY_RAG_SPANNER_PROJECT / _INSTANCE / _DATABASE and
-# GOOGLE_APPLICATION_CREDENTIALS needs to change NOTHING. No new variables, no parallel
-# set of expectations to keep in sync with the real ones.
+# and still cannot start with an implicit or file-selected credential path. It just no
+# longer asserts WHICH target, which was never this file's business.
 PRODUCTION_RUNTIME_CONTRACT = "production"
+PRODUCTION_CREDENTIALS_SOURCE = "application_default"
 PRODUCTION_SPANNER_EMBEDDING_MODEL_ID = "ConversationEmbeddingModel"
 PRODUCTION_EMBEDDING_PROVIDER = "vertex"
 PRODUCTION_EMBEDDING_MODEL = "gemini-embedding-001"
@@ -157,6 +153,7 @@ class Settings(BaseSettings):
     # General Settings
     # ============================================================
     runtime_contract: str = ""
+    credentials_source: str = ""
     log_level: str = "INFO"
     debounce_delay: int = 5000  # Debounce delay in milliseconds
     batch_size: int = 32  # Embedding batch size
@@ -295,6 +292,15 @@ class Settings(BaseSettings):
         if contract not in {"", PRODUCTION_RUNTIME_CONTRACT}:
             raise ValueError("runtime_contract must be empty or production")
         return contract
+
+    @field_validator("credentials_source")
+    @classmethod
+    def validate_credentials_source(cls, v: str) -> str:
+        """Keep the credential selector closed; production narrows it to keyless ADC."""
+        source = v.strip()
+        if source not in {"", PRODUCTION_CREDENTIALS_SOURCE}:
+            raise ValueError("credentials_source must be empty or application_default")
+        return source
 
     @field_validator("embedding_dimension")
     @classmethod
@@ -630,9 +636,8 @@ settings = Settings()
 def validate_production_runtime_contract(
     settings_obj: Settings | None = None,
     environ: dict[str, str] | None = None,
-    credential_path: Path | None = None,
 ) -> None:
-    """Fail loudly when the production launch contract drifts or omits credentials."""
+    """Fail loudly when production drifts from keyless Application Default Credentials."""
     current = settings_obj or settings
     if current.runtime_contract != PRODUCTION_RUNTIME_CONTRACT:
         return
@@ -662,6 +667,7 @@ def validate_production_runtime_contract(
         "embedding_dimension": (PRODUCTION_EMBEDDING_DIMENSION, current.embedding_dimension),
         "status_server_host": (PRODUCTION_STATUS_SERVER_HOST, current.status_server_host),
         "status_server_port": (PRODUCTION_STATUS_SERVER_PORT, current.status_server_port),
+        "credentials_source": (PRODUCTION_CREDENTIALS_SOURCE, current.credentials_source),
     }
     for field_name, expected_path in PRODUCTION_SOURCE_PATHS.items():
         expected_values[field_name] = (str(expected_path), str(getattr(current, field_name)))
@@ -670,18 +676,15 @@ def validate_production_runtime_contract(
         if actual != expected:
             errors.append(f"{field_name}={actual!r} expected {expected!r}")
 
-    # Credentials: require that a key is configured and that the file is really there.
-    # Which path it is remains the deployment's business. `credential_path` is still an
-    # explicit override so tests can point at a temp file.
-    credential = (
-        str(credential_path) if credential_path else env.get("GOOGLE_APPLICATION_CREDENTIALS")
-    )
-    if not credential:
-        errors.append(
-            "GOOGLE_APPLICATION_CREDENTIALS must be set for runtime_contract='production'"
-        )
-    elif not Path(credential).exists():
-        errors.append(f"credential file missing: {credential}")
+    # Production selects ADC at its well-known source. Explicit credential-file
+    # overrides can silently reintroduce a long-lived exportable private key, so the
+    # contract rejects both Google selectors before any client is constructed.
+    for env_name in (
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    ):
+        if env.get(env_name):
+            errors.append(f"{env_name} must be unset for runtime_contract='production'")
 
     if env.get("CLAUDE_HISTORY_RAG_DB_PATH"):
         errors.append("CLAUDE_HISTORY_RAG_DB_PATH must be unset in production Spanner runtime")

@@ -262,20 +262,21 @@ export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
 export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=127.0.0.1
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT=4680
-export GOOGLE_APPLICATION_CREDENTIALS=<path-to-your-service-account-key.json>
+export CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE=application_default
 export GOOGLE_CLOUD_PROJECT=<your-gcp-project>
 uv run ai-agent-history-rag-daemon start
 ```
 
 These are deployment-specific and this repository is public, so it ships placeholders
-rather than any real project, instance or key path. `scripts/install-launchd.sh` reads
+rather than any real project or instance. `scripts/install-launchd.sh` reads
 the same variables from your environment and fails with a readable message if they are
 unset, instead of generating a launch agent pointed at somebody else's project.
 
 The launchd source at `scripts/com.ai-agent-history-rag.daemon.plist.template` pins the same contract, including:
 - watch roots: `~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`, `~/.gemini/antigravity`, `~/.claude-history-rag/imports/chatgpt`, and `~/.claude-history-rag/imports/claude-app`
 - state/auth roots: `~/.claude-history-rag/*.json`
-- credential path: substituted from `GOOGLE_APPLICATION_CREDENTIALS` at install time
+- credentials: keyless Application Default Credentials from the attached workload identity
+  in production, or a short-lived impersonated ADC profile for a local operator
 
 On another workstation, point at that server and use a stable machine id:
 

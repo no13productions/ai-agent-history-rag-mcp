@@ -2,7 +2,11 @@
 
 from pathlib import Path
 
-from claude_history_rag.installer import build_mcp_server_config, project_mcp_env
+from claude_history_rag.installer import (
+    build_mcp_server_config,
+    normalize_production_credentials_env,
+    project_mcp_env,
+)
 
 
 def test_mcp_config_preserves_spanner_vertex_env_for_update_mode():
@@ -11,8 +15,8 @@ def test_mcp_config_preserves_spanner_vertex_env_for_update_mode():
         "HOME": "/Users/testuser",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         "CLOUDSDK_CONFIG": "/Users/testuser/.config/gcloud",
-        "GOOGLE_APPLICATION_CREDENTIALS": "/Users/testuser/.config/gcloud/adc.json",
         "GOOGLE_CLOUD_PROJECT": "example-project",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
         "CLAUDE_HISTORY_RAG_MACHINE_ID": "mac-mini",
         "CLAUDE_HISTORY_RAG_CLIENT_NAME": "Brandon Mac Mini",
         "CLAUDE_HISTORY_RAG_STORAGE_BACKEND": "spanner",
@@ -52,11 +56,28 @@ def test_mcp_config_filters_secret_daemon_env():
             "CLAUDE_HISTORY_RAG_SERVER_PSK": "server-secret",
             "CLAUDE_HISTORY_RAG_CLIENT_PSK": "client-secret",
             "CLAUDE_HISTORY_RAG_EMBEDDING_API_KEY": "embedding-secret",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/exportable-key.json",
             "UNRELATED_TOKEN": "token-secret",
         },
     )
 
     assert config["env"] == {"CLAUDE_HISTORY_RAG_STORAGE_BACKEND": "spanner"}
+
+
+def test_production_update_replaces_credential_file_with_keyless_adc():
+    """Updating an existing service must not carry its retired key selector forward."""
+    normalized = normalize_production_credentials_env(
+        {
+            "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/exportable-key.json",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE": "/tmp/exportable-key.json",
+        }
+    )
+
+    assert normalized == {
+        "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
+    }
 
 
 def test_mcp_config_overlays_explicit_client_values_on_env():

@@ -24,7 +24,6 @@ fi
 # somebody else's project.
 : "${CLAUDE_HISTORY_RAG_SPANNER_PROJECT:?set CLAUDE_HISTORY_RAG_SPANNER_PROJECT to your GCP project id}"
 : "${CLAUDE_HISTORY_RAG_SPANNER_INSTANCE:?set CLAUDE_HISTORY_RAG_SPANNER_INSTANCE to your Spanner instance id}"
-: "${GOOGLE_APPLICATION_CREDENTIALS:?set GOOGLE_APPLICATION_CREDENTIALS to your service-account key path}"
 CLAUDE_HISTORY_RAG_SPANNER_DATABASE="${CLAUDE_HISTORY_RAG_SPANNER_DATABASE:-ai-agent-history-rag}"
 
 echo "Using uv at: $UV_PATH"
@@ -51,7 +50,6 @@ if [ -f "$PLIST_TEMPLATE" ]; then
         -e "s|__GCP_PROJECT__|$CLAUDE_HISTORY_RAG_SPANNER_PROJECT|g" \
         -e "s|__SPANNER_INSTANCE__|$CLAUDE_HISTORY_RAG_SPANNER_INSTANCE|g" \
         -e "s|__SPANNER_DATABASE__|$CLAUDE_HISTORY_RAG_SPANNER_DATABASE|g" \
-        -e "s|__GOOGLE_APPLICATION_CREDENTIALS__|$GOOGLE_APPLICATION_CREDENTIALS|g" \
         "$PLIST_TEMPLATE" > "$PLIST_DEST"
 else
     # Fallback: generate plist directly
@@ -77,6 +75,8 @@ else
     <dict>
         <key>CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT</key>
         <string>production</string>
+        <key>CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE</key>
+        <string>application_default</string>
         <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
         <string>spanner</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
@@ -99,8 +99,6 @@ else
         <string>127.0.0.1</string>
         <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT</key>
         <string>4680</string>
-        <key>GOOGLE_APPLICATION_CREDENTIALS</key>
-        <string>$GOOGLE_APPLICATION_CREDENTIALS</string>
         <key>GOOGLE_CLOUD_PROJECT</key>
         <string>$CLAUDE_HISTORY_RAG_SPANNER_PROJECT</string>
     </dict>
