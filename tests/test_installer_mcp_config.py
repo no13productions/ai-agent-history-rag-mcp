@@ -8,16 +8,16 @@ from claude_history_rag.installer import build_mcp_server_config, project_mcp_en
 def test_mcp_config_preserves_spanner_vertex_env_for_update_mode():
     """MCP registrations inherit the storage/embedding env needed for direct Spanner."""
     daemon_env = {
-        "HOME": "/Users/brandon",
+        "HOME": "/Users/testuser",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        "CLOUDSDK_CONFIG": "/Users/brandon/.config/gcloud",
-        "GOOGLE_APPLICATION_CREDENTIALS": "/Users/brandon/.config/gcloud/adc.json",
-        "GOOGLE_CLOUD_PROJECT": "jeeves-486102",
+        "CLOUDSDK_CONFIG": "/Users/testuser/.config/gcloud",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/Users/testuser/.config/gcloud/adc.json",
+        "GOOGLE_CLOUD_PROJECT": "example-project",
         "CLAUDE_HISTORY_RAG_MACHINE_ID": "mac-mini",
         "CLAUDE_HISTORY_RAG_CLIENT_NAME": "Brandon Mac Mini",
         "CLAUDE_HISTORY_RAG_STORAGE_BACKEND": "spanner",
-        "CLAUDE_HISTORY_RAG_SPANNER_PROJECT": "jeeves-486102",
-        "CLAUDE_HISTORY_RAG_SPANNER_INSTANCE": "jeeves-rg-spanner-prod-4d0e4c43",
+        "CLAUDE_HISTORY_RAG_SPANNER_PROJECT": "example-project",
+        "CLAUDE_HISTORY_RAG_SPANNER_INSTANCE": "example-instance",
         "CLAUDE_HISTORY_RAG_SPANNER_DATABASE": "ai-agent-history-rag",
         "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE": "spanner",
         "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID": "ConversationEmbeddingModel",

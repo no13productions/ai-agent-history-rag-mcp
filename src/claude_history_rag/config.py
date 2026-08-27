@@ -16,17 +16,42 @@ GCP_LOCATION_PATTERN = re.compile(r"^[a-z]+-[a-z]+[0-9](-[a-z])?$")
 # Optimization interval in seconds (15 minutes)
 OPTIMIZE_INTERVAL = 900
 
+
+# The production runtime contract is DEPLOYMENT-SPECIFIC and is therefore supplied by
+# the environment, never baked in here.
+#
+# It used to be hardcoded to one operator's GCP project, Spanner instance and
+# service-account key path. This is a public repository, so those literals published
+# exactly which project and instance to aim at, plus the local account name of whoever
+# ran it. No credential was ever committed and none is now, but a project id and an
+# instance id are free reconnaissance and there is no reason for a general-purpose tool
+# to carry one deployment's identity in source.
+#
+# Behaviour is unchanged for an operator who sets these: the contract is still an exact
+# fail-loud equality check against the running settings. What changes is that the
+# expected values come from CLAUDE_HISTORY_RAG_PRODUCTION_* rather than from this file,
+# and that selecting runtime_contract="production" WITHOUT configuring them is itself a
+# contract error rather than a silent comparison against somebody else's coordinates.
+def _production_expectation(name: str, default: str | None = None) -> str | None:
+    """Read one deployment-specific production expectation from the environment."""
+    return os.environ.get(f"CLAUDE_HISTORY_RAG_PRODUCTION_{name}") or default
+
+
 PRODUCTION_RUNTIME_CONTRACT = "production"
-PRODUCTION_SPANNER_PROJECT = "jeeves-486102"
-PRODUCTION_SPANNER_INSTANCE = "jeeves-rg-spanner-prod-4d0e4c43"
-PRODUCTION_SPANNER_DATABASE = "ai-agent-history-rag"
+PRODUCTION_SPANNER_PROJECT = _production_expectation("SPANNER_PROJECT")
+PRODUCTION_SPANNER_INSTANCE = _production_expectation("SPANNER_INSTANCE")
+PRODUCTION_SPANNER_DATABASE = _production_expectation("SPANNER_DATABASE", "ai-agent-history-rag")
 PRODUCTION_SPANNER_EMBEDDING_MODEL_ID = "ConversationEmbeddingModel"
 PRODUCTION_EMBEDDING_PROVIDER = "vertex"
 PRODUCTION_EMBEDDING_MODEL = "gemini-embedding-001"
 PRODUCTION_EMBEDDING_DIMENSION = 3072
 PRODUCTION_STATUS_SERVER_HOST = "127.0.0.1"
 PRODUCTION_STATUS_SERVER_PORT = 4680
-PREFERRED_GOOGLE_APPLICATION_CREDENTIALS = Path("/Users/brandon/Meridian/alfred-sa-key.json")
+
+_PREFERRED_CREDENTIALS = _production_expectation("GOOGLE_APPLICATION_CREDENTIALS")
+PREFERRED_GOOGLE_APPLICATION_CREDENTIALS: Path | None = (
+    Path(_PREFERRED_CREDENTIALS) if _PREFERRED_CREDENTIALS else None
+)
 
 PRODUCTION_SOURCE_PATHS = {
     "projects_path": Path.home() / ".claude" / "projects",
@@ -604,7 +629,7 @@ settings = Settings()
 def validate_production_runtime_contract(
     settings_obj: Settings | None = None,
     environ: dict[str, str] | None = None,
-    credential_path: Path = PREFERRED_GOOGLE_APPLICATION_CREDENTIALS,
+    credential_path: Path | None = None,
 ) -> None:
     """Fail loudly when the production launch contract drifts or omits credentials."""
     current = settings_obj or settings
@@ -612,6 +637,32 @@ def validate_production_runtime_contract(
         return
 
     env = environ if environ is not None else os.environ
+    if credential_path is None:
+        credential_path = PREFERRED_GOOGLE_APPLICATION_CREDENTIALS
+
+    # The deployment-specific half of the contract must be configured before it can be
+    # enforced. Failing here is the point: silently skipping these comparisons would turn
+    # a drift detector into a no-op exactly when production is selected.
+    unconfigured = [
+        name
+        for name, value in (
+            ("CLAUDE_HISTORY_RAG_PRODUCTION_SPANNER_PROJECT", PRODUCTION_SPANNER_PROJECT),
+            ("CLAUDE_HISTORY_RAG_PRODUCTION_SPANNER_INSTANCE", PRODUCTION_SPANNER_INSTANCE),
+            ("CLAUDE_HISTORY_RAG_PRODUCTION_SPANNER_DATABASE", PRODUCTION_SPANNER_DATABASE),
+            (
+                "CLAUDE_HISTORY_RAG_PRODUCTION_GOOGLE_APPLICATION_CREDENTIALS",
+                credential_path,
+            ),
+        )
+        if not value
+    ]
+    if unconfigured:
+        raise RuntimeError(
+            "Production runtime contract invalid: runtime_contract='production' requires "
+            "the deployment-specific expectations to be set, but these are unset: "
+            + ", ".join(unconfigured)
+        )
+
     expected_values = {
         "storage_backend": ("spanner", current.storage_backend),
         "spanner_project": (PRODUCTION_SPANNER_PROJECT, current.spanner_project),

@@ -144,8 +144,8 @@ Design for a comprehensive status/monitoring system for the Claude History RAG M
   },
   "configuration": {
     "storage_backend": "spanner",
-    "spanner_project": "jeeves-486102",
-    "spanner_instance": "jeeves-rg-spanner-prod-4d0e4c43",
+    "spanner_project": "example-project",
+    "spanner_instance": "example-instance",
     "spanner_database": "ai-agent-history-rag",
     "projects_path_hash": "1a2b3c4d5e6f",
     "codex_sessions_path_hash": "2b3c4d5e6f7a",

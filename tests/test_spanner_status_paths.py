@@ -215,8 +215,8 @@ def _daemon_status_snapshot() -> dict:
         "database": {
             "total_chunks": 703496,
             "backend": "spanner",
-            "project": "jeeves-486102",
-            "instance": "jeeves-rg-spanner-prod-4d0e4c43",
+            "project": "example-project",
+            "instance": "example-instance",
             "database": "ai-agent-history-rag",
             "dimension": 3072,
             "fts_index_available": True,
@@ -235,14 +235,14 @@ def _daemon_status_snapshot() -> dict:
                     "files_pending": 0,
                     "files_failed": 0,
                     "is_running": True,
-                    "watch_path": "/Users/brandon/.codex/sessions",
+                    "watch_path": "/Users/testuser/.codex/sessions",
                 },
                 "Claude Code": {
                     "files_indexed": 4532,
                     "files_pending": 0,
                     "files_failed": 0,
                     "is_running": True,
-                    "watch_path": "/Users/brandon/.claude/projects",
+                    "watch_path": "/Users/testuser/.claude/projects",
                 },
             }
         },
@@ -372,8 +372,8 @@ async def test_status_collector_spanner_database_stats_are_backend_specific(monk
 def test_status_configuration_hides_lancedb_path_for_spanner(monkeypatch):
     """Production status must not present local LanceDB as the active Spanner data store."""
     monkeypatch.setattr(settings, "storage_backend", "spanner")
-    monkeypatch.setattr(settings, "spanner_project", "jeeves-486102")
-    monkeypatch.setattr(settings, "spanner_instance", "jeeves-rg-spanner-prod-4d0e4c43")
+    monkeypatch.setattr(settings, "spanner_project", "example-project")
+    monkeypatch.setattr(settings, "spanner_instance", "example-instance")
     monkeypatch.setattr(settings, "spanner_database", "ai-agent-history-rag")
 
     configuration = StatusCollector()._get_configuration()

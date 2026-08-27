@@ -16,6 +16,17 @@ if [ ! -x "$UV_PATH" ]; then
     exit 1
 fi
 
+# Deployment-specific coordinates come from the environment. They are NOT baked into
+# this repository: it is public, and a hardcoded project/instance id publishes exactly
+# which GCP project and Spanner instance to aim at, plus the local account name of
+# whoever ran the installer. Required rather than defaulted, so a missing value fails
+# here with a readable message instead of silently generating a plist pointing at
+# somebody else's project.
+: "${CLAUDE_HISTORY_RAG_SPANNER_PROJECT:?set CLAUDE_HISTORY_RAG_SPANNER_PROJECT to your GCP project id}"
+: "${CLAUDE_HISTORY_RAG_SPANNER_INSTANCE:?set CLAUDE_HISTORY_RAG_SPANNER_INSTANCE to your Spanner instance id}"
+: "${GOOGLE_APPLICATION_CREDENTIALS:?set GOOGLE_APPLICATION_CREDENTIALS to your service-account key path}"
+CLAUDE_HISTORY_RAG_SPANNER_DATABASE="${CLAUDE_HISTORY_RAG_SPANNER_DATABASE:-ai-agent-history-rag}"
+
 echo "Using uv at: $UV_PATH"
 echo "Project directory: $PROJECT_DIR"
 
@@ -37,6 +48,10 @@ if [ -f "$PLIST_TEMPLATE" ]; then
     sed -e "s|__UV_PATH__|$UV_PATH|g" \
         -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
         -e "s|__HOME__|$HOME|g" \
+        -e "s|__GCP_PROJECT__|$CLAUDE_HISTORY_RAG_SPANNER_PROJECT|g" \
+        -e "s|__SPANNER_INSTANCE__|$CLAUDE_HISTORY_RAG_SPANNER_INSTANCE|g" \
+        -e "s|__SPANNER_DATABASE__|$CLAUDE_HISTORY_RAG_SPANNER_DATABASE|g" \
+        -e "s|__GOOGLE_APPLICATION_CREDENTIALS__|$GOOGLE_APPLICATION_CREDENTIALS|g" \
         "$PLIST_TEMPLATE" > "$PLIST_DEST"
 else
     # Fallback: generate plist directly
@@ -65,11 +80,11 @@ else
         <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
         <string>spanner</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
-        <string>jeeves-486102</string>
+        <string>$CLAUDE_HISTORY_RAG_SPANNER_PROJECT</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_INSTANCE</key>
-        <string>jeeves-rg-spanner-prod-4d0e4c43</string>
+        <string>$CLAUDE_HISTORY_RAG_SPANNER_INSTANCE</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_DATABASE</key>
-        <string>ai-agent-history-rag</string>
+        <string>$CLAUDE_HISTORY_RAG_SPANNER_DATABASE</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE</key>
         <string>spanner</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID</key>
@@ -85,9 +100,9 @@ else
         <key>CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT</key>
         <string>4680</string>
         <key>GOOGLE_APPLICATION_CREDENTIALS</key>
-        <string>$HOME/Meridian/alfred-sa-key.json</string>
+        <string>$GOOGLE_APPLICATION_CREDENTIALS</string>
         <key>GOOGLE_CLOUD_PROJECT</key>
-        <string>jeeves-486102</string>
+        <string>$CLAUDE_HISTORY_RAG_SPANNER_PROJECT</string>
     </dict>
 
     <key>RunAtLoad</key>
