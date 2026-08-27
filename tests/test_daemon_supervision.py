@@ -122,7 +122,7 @@ def test_find_history_mcp_worker_pids_excludes_daemon_and_other_checkouts(monkey
                 FakeProcess(
                     102,
                     [
-                        "/Users/brandon/.local/bin/uv",
+                        "/Users/testuser/.local/bin/uv",
                         "--directory",
                         str(project_root),
                         "run",
@@ -132,7 +132,7 @@ def test_find_history_mcp_worker_pids_excludes_daemon_and_other_checkouts(monkey
                 FakeProcess(
                     103,
                     [
-                        "/Users/brandon/.local/bin/uv",
+                        "/Users/testuser/.local/bin/uv",
                         "--directory",
                         str(project_root),
                         "run",
@@ -171,7 +171,9 @@ def test_service_manager_configs_use_supervise():
     """Generated service files must not invoke the human idempotent start wrapper."""
     root = daemon.Path(__file__).resolve().parents[1]
     files = [
-        root / "scripts/com.ai-agent-history-rag.daemon.plist",
+        # The generated com.ai-agent-history-rag.daemon.plist is no longer tracked — it
+        # is machine-specific output. The template it is generated from is the source of
+        # truth and is what this contract check covers.
         root / "scripts/com.ai-agent-history-rag.daemon.plist.template",
         root / "scripts/install-launchd.sh",
         root / "scripts/install-systemd.sh",
@@ -191,7 +193,6 @@ def test_launchd_plists_pin_production_spanner_contract():
     """launchd source must not regress to local LanceDB/Ollama production defaults."""
     root = daemon.Path(__file__).resolve().parents[1]
     files = [
-        root / "scripts/com.ai-agent-history-rag.daemon.plist",
         root / "scripts/com.ai-agent-history-rag.daemon.plist.template",
     ]
 
@@ -205,5 +206,28 @@ def test_launchd_plists_pin_production_spanner_contract():
         assert "gemini-embedding-001" in content
         assert "3072" in content
         assert "GOOGLE_APPLICATION_CREDENTIALS" in content
-        assert "Meridian/alfred-sa-key.json" in content
         assert "CLAUDE_RAG_" not in content
+
+        # The credential path is deployment-specific and is substituted at install time.
+        # This asserts the SHAPE of the contract — that the key is wired to a
+        # substitution placeholder — rather than pinning one operator's path. The
+        # previous assertion required the literal "Meridian/alfred-sa-key.json", which
+        # is what kept a real account path published in this public repository.
+        assert "__GOOGLE_APPLICATION_CREDENTIALS__" in content
+        assert "__GCP_PROJECT__" in content
+        assert "__SPANNER_INSTANCE__" in content
+
+
+def test_launchd_template_carries_no_real_deployment_coordinates():
+    """The public template must not name a real GCP project, Spanner instance or key path."""
+    root = daemon.Path(__file__).resolve().parents[1]
+    tracked = [
+        root / "scripts/com.ai-agent-history-rag.daemon.plist.template",
+        root / "scripts/install-launchd.sh",
+    ]
+    # Regressions here republish infrastructure identity to anyone who clones the repo.
+    forbidden = ("jeeves-", "alfred-sa-key", "/Users/brandon")
+    for path in tracked:
+        content = path.read_text()
+        for needle in forbidden:
+            assert needle not in content, f"{path.name} leaks {needle!r}"

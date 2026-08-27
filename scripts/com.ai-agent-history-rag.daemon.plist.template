@@ -22,9 +22,9 @@
         <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
         <string>spanner</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
-        <string>jeeves-486102</string>
+        <string>__GCP_PROJECT__</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_INSTANCE</key>
-        <string>jeeves-rg-spanner-prod-4d0e4c43</string>
+        <string>__SPANNER_INSTANCE__</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_DATABASE</key>
         <string>ai-agent-history-rag</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE</key>
@@ -88,11 +88,11 @@
         <key>CLOUDSDK_CONFIG</key>
         <string>__HOME__/.config/gcloud</string>
         <key>CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE</key>
-        <string>__HOME__/Meridian/alfred-sa-key.json</string>
+        <string>__GOOGLE_APPLICATION_CREDENTIALS__</string>
         <key>GOOGLE_APPLICATION_CREDENTIALS</key>
-        <string>__HOME__/Meridian/alfred-sa-key.json</string>
+        <string>__GOOGLE_APPLICATION_CREDENTIALS__</string>
         <key>GOOGLE_CLOUD_PROJECT</key>
-        <string>jeeves-486102</string>
+        <string>__GCP_PROJECT__</string>
         <key>HOME</key>
         <string>__HOME__</string>
         <key>PATH</key>

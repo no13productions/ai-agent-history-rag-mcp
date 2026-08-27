@@ -7,3 +7,7 @@ docker-data/
 .vscode/
 .DS_Store
 AGENTS.md
+
+# Generated launch agent — machine-specific paths and deployment coordinates.
+# The committed template (com.ai-agent-history-rag.daemon.plist.template) is the source; this artifact is not tracked.
+scripts/com.ai-agent-history-rag.daemon.plist

@@ -252,8 +252,8 @@ The Velenza production daemon runs in server mode against the shared Spanner DB.
 ```bash
 export CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT=production
 export CLAUDE_HISTORY_RAG_STORAGE_BACKEND=spanner
-export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=jeeves-486102
-export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=jeeves-rg-spanner-prod-4d0e4c43
+export CLAUDE_HISTORY_RAG_SPANNER_PROJECT=<your-gcp-project>
+export CLAUDE_HISTORY_RAG_SPANNER_INSTANCE=<your-spanner-instance>
 export CLAUDE_HISTORY_RAG_SPANNER_DATABASE=ai-agent-history-rag
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE=spanner
 export CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID=ConversationEmbeddingModel
@@ -262,15 +262,20 @@ export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
 export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=127.0.0.1
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT=4680
-export GOOGLE_APPLICATION_CREDENTIALS=/Users/brandon/Meridian/alfred-sa-key.json
-export GOOGLE_CLOUD_PROJECT=jeeves-486102
+export GOOGLE_APPLICATION_CREDENTIALS=<path-to-your-service-account-key.json>
+export GOOGLE_CLOUD_PROJECT=<your-gcp-project>
 uv run ai-agent-history-rag-daemon start
 ```
 
-The launchd source at `scripts/com.ai-agent-history-rag.daemon.plist` pins the same contract, including:
+These are deployment-specific and this repository is public, so it ships placeholders
+rather than any real project, instance or key path. `scripts/install-launchd.sh` reads
+the same variables from your environment and fails with a readable message if they are
+unset, instead of generating a launch agent pointed at somebody else's project.
+
+The launchd source at `scripts/com.ai-agent-history-rag.daemon.plist.template` pins the same contract, including:
 - watch roots: `~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`, `~/.gemini/antigravity`, `~/.claude-history-rag/imports/chatgpt`, and `~/.claude-history-rag/imports/claude-app`
 - state/auth roots: `~/.claude-history-rag/*.json`
-- credential path: `/Users/brandon/Meridian/alfred-sa-key.json`
+- credential path: substituted from `GOOGLE_APPLICATION_CREDENTIALS` at install time
 
 On another workstation, point at that server and use a stable machine id:
 

@@ -5,16 +5,14 @@ from datetime import UTC, datetime
 
 import pytest
 
+from claude_history_rag import config as config_module
 from claude_history_rag import store as store_module
 from claude_history_rag.config import (
     PRODUCTION_EMBEDDING_DIMENSION,
     PRODUCTION_EMBEDDING_MODEL,
     PRODUCTION_EMBEDDING_PROVIDER,
     PRODUCTION_RUNTIME_CONTRACT,
-    PRODUCTION_SPANNER_DATABASE,
     PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
-    PRODUCTION_SPANNER_INSTANCE,
-    PRODUCTION_SPANNER_PROJECT,
     PRODUCTION_STATUS_SERVER_HOST,
     PRODUCTION_STATUS_SERVER_PORT,
     Settings,
@@ -35,6 +33,23 @@ from claude_history_rag.store import (
     get_spanner_vector_index_ddl,
     get_vector_dim,
 )
+
+# The deployment-specific half of the production contract is supplied by the
+# environment, so it is None unless an operator configures it. These tests exercise the
+# contract MECHANISM, which must not depend on any real deployment's coordinates — so
+# they inject their own fake ones. Deliberately not real values: this is a public
+# repository and a project/instance id in a fixture is still a published project id.
+FAKE_SPANNER_PROJECT = "example-project"
+FAKE_SPANNER_INSTANCE = "example-instance"
+FAKE_SPANNER_DATABASE = "example-database"
+
+
+@pytest.fixture
+def production_contract(monkeypatch):
+    """Configure the deployment-specific production expectations with fake values."""
+    monkeypatch.setattr(config_module, "PRODUCTION_SPANNER_PROJECT", FAKE_SPANNER_PROJECT)
+    monkeypatch.setattr(config_module, "PRODUCTION_SPANNER_INSTANCE", FAKE_SPANNER_INSTANCE)
+    monkeypatch.setattr(config_module, "PRODUCTION_SPANNER_DATABASE", FAKE_SPANNER_DATABASE)
 
 
 class FakeBatch:
@@ -177,16 +192,16 @@ def test_spanner_storage_requires_explicit_coordinates():
         Settings(storage_backend="spanner")
 
 
-def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path):
+def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path, production_contract):
     """The production contract pins Spanner, 3072d embeddings, status port, and key path."""
-    key_path = tmp_path / "alfred-sa-key.json"
+    key_path = tmp_path / "service-account.json"
     key_path.write_text("{}")
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
         storage_backend="spanner",
-        spanner_project=PRODUCTION_SPANNER_PROJECT,
-        spanner_instance=PRODUCTION_SPANNER_INSTANCE,
-        spanner_database=PRODUCTION_SPANNER_DATABASE,
+        spanner_project=FAKE_SPANNER_PROJECT,
+        spanner_instance=FAKE_SPANNER_INSTANCE,
+        spanner_database=FAKE_SPANNER_DATABASE,
         spanner_embedding_mode="spanner",
         spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
         embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
@@ -203,16 +218,16 @@ def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path):
     )
 
 
-def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
+def test_production_runtime_contract_rejects_local_fallback_path(tmp_path, production_contract):
     """A production Spanner daemon must not carry a local LanceDB fallback path."""
-    key_path = tmp_path / "alfred-sa-key.json"
+    key_path = tmp_path / "service-account.json"
     key_path.write_text("{}")
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
         storage_backend="spanner",
-        spanner_project=PRODUCTION_SPANNER_PROJECT,
-        spanner_instance=PRODUCTION_SPANNER_INSTANCE,
-        spanner_database=PRODUCTION_SPANNER_DATABASE,
+        spanner_project=FAKE_SPANNER_PROJECT,
+        spanner_instance=FAKE_SPANNER_INSTANCE,
+        spanner_database=FAKE_SPANNER_DATABASE,
         spanner_embedding_mode="spanner",
         spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
         embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
