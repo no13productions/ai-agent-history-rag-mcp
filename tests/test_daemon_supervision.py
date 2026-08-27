@@ -207,7 +207,10 @@ def test_launchd_plists_pin_production_spanner_contract():
         assert "3072" in content
         assert "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE" in content
         assert "application_default" in content
-        assert "GOOGLE_APPLICATION_CREDENTIALS" not in content
+        assert "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE" in content
+        assert "impersonated_service_account" in content
+        assert "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY" in content
+        assert "GOOGLE_APPLICATION_CREDENTIALS" in content
         assert "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" not in content
         assert "CLAUDE_RAG_" not in content
         assert "__GCP_PROJECT__" in content

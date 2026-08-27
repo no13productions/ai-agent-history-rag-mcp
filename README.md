@@ -263,6 +263,9 @@ export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=127.0.0.1
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT=4680
 export CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE=application_default
+export CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE=impersonated_service_account
+export CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY=<dedicated-runtime-service-account>
+export GOOGLE_APPLICATION_CREDENTIALS=<path-to-keyless-impersonated-adc-profile.json>
 export GOOGLE_CLOUD_PROJECT=<your-gcp-project>
 uv run ai-agent-history-rag-daemon start
 ```
@@ -275,8 +278,9 @@ unset, instead of generating a launch agent pointed at somebody else's project.
 The launchd source at `scripts/com.ai-agent-history-rag.daemon.plist.template` pins the same contract, including:
 - watch roots: `~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`, `~/.gemini/antigravity`, `~/.claude-history-rag/imports/chatgpt`, and `~/.claude-history-rag/imports/claude-app`
 - state/auth roots: `~/.claude-history-rag/*.json`
-- credentials: keyless Application Default Credentials from the attached workload identity
-  in production, or a short-lived impersonated ADC profile for a local operator
+- credentials: a short-lived, exact-target impersonated ADC profile for the local daemon;
+  `GOOGLE_APPLICATION_CREDENTIALS` is only the standard ADC carrier and the runtime rejects
+  service-account-key JSON, private-key fields, target drift, and broad gcloud-user fallback
 
 On another workstation, point at that server and use a stable machine id:
 

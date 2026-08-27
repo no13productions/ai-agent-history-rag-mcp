@@ -15,8 +15,13 @@ def test_mcp_config_preserves_spanner_vertex_env_for_update_mode():
         "HOME": "/Users/testuser",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         "CLOUDSDK_CONFIG": "/Users/testuser/.config/gcloud",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/Users/testuser/.config/gcloud/history-rag-adc.json",
         "GOOGLE_CLOUD_PROJECT": "example-project",
         "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE": "impersonated_service_account",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY": (
+            "history-rag-runtime@example-project.iam.gserviceaccount.com"
+        ),
         "CLAUDE_HISTORY_RAG_MACHINE_ID": "mac-mini",
         "CLAUDE_HISTORY_RAG_CLIENT_NAME": "Brandon Mac Mini",
         "CLAUDE_HISTORY_RAG_STORAGE_BACKEND": "spanner",
@@ -77,6 +82,30 @@ def test_production_update_replaces_credential_file_with_keyless_adc():
     assert normalized == {
         "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
         "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
+    }
+
+
+def test_production_update_retains_exact_keyless_impersonated_adc_carrier():
+    normalized = normalize_production_credentials_env(
+        {
+            "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
+            "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE": "impersonated_service_account",
+            "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY": (
+                "history-rag-runtime@example-project.iam.gserviceaccount.com"
+            ),
+            "GOOGLE_APPLICATION_CREDENTIALS": "/secure/history-rag-adc.json",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE": "/retired/key.json",
+        }
+    )
+
+    assert normalized == {
+        "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE": "impersonated_service_account",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY": (
+            "history-rag-runtime@example-project.iam.gserviceaccount.com"
+        ),
+        "GOOGLE_APPLICATION_CREDENTIALS": "/secure/history-rag-adc.json",
     }
 
 

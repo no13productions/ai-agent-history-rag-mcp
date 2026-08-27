@@ -24,6 +24,13 @@ fi
 # somebody else's project.
 : "${CLAUDE_HISTORY_RAG_SPANNER_PROJECT:?set CLAUDE_HISTORY_RAG_SPANNER_PROJECT to your GCP project id}"
 : "${CLAUDE_HISTORY_RAG_SPANNER_INSTANCE:?set CLAUDE_HISTORY_RAG_SPANNER_INSTANCE to your Spanner instance id}"
+: "${CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE:?set CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE to impersonated_service_account}"
+: "${CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY:?set CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY to the exact runtime service account}"
+: "${GOOGLE_APPLICATION_CREDENTIALS:?set GOOGLE_APPLICATION_CREDENTIALS to the keyless impersonated ADC profile}"
+if [ "$CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE" != "impersonated_service_account" ]; then
+    echo "Error: launchd requires CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE=impersonated_service_account"
+    exit 1
+fi
 CLAUDE_HISTORY_RAG_SPANNER_DATABASE="${CLAUDE_HISTORY_RAG_SPANNER_DATABASE:-ai-agent-history-rag}"
 
 echo "Using uv at: $UV_PATH"
@@ -50,6 +57,8 @@ if [ -f "$PLIST_TEMPLATE" ]; then
         -e "s|__GCP_PROJECT__|$CLAUDE_HISTORY_RAG_SPANNER_PROJECT|g" \
         -e "s|__SPANNER_INSTANCE__|$CLAUDE_HISTORY_RAG_SPANNER_INSTANCE|g" \
         -e "s|__SPANNER_DATABASE__|$CLAUDE_HISTORY_RAG_SPANNER_DATABASE|g" \
+        -e "s|__CREDENTIALS_IDENTITY__|$CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY|g" \
+        -e "s|__GOOGLE_APPLICATION_CREDENTIALS__|$GOOGLE_APPLICATION_CREDENTIALS|g" \
         "$PLIST_TEMPLATE" > "$PLIST_DEST"
 else
     # Fallback: generate plist directly
@@ -77,6 +86,10 @@ else
         <string>production</string>
         <key>CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE</key>
         <string>application_default</string>
+        <key>CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE</key>
+        <string>$CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE</string>
+        <key>CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY</key>
+        <string>$CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY</string>
         <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
         <string>spanner</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
@@ -101,6 +114,8 @@ else
         <string>4680</string>
         <key>GOOGLE_CLOUD_PROJECT</key>
         <string>$CLAUDE_HISTORY_RAG_SPANNER_PROJECT</string>
+        <key>GOOGLE_APPLICATION_CREDENTIALS</key>
+        <string>$GOOGLE_APPLICATION_CREDENTIALS</string>
     </dict>
 
     <key>RunAtLoad</key>

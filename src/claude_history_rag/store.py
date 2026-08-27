@@ -1159,7 +1159,10 @@ class SpannerStore:
                 "Install with: uv sync --extra server"
             ) from e
         project, _ = default_project_and_credentials(
-            ["https://www.googleapis.com/auth/cloud-platform"]
+            ["https://www.googleapis.com/auth/cloud-platform"],
+            production=settings.runtime_contract == "production",
+            credential_profile=settings.credentials_profile,
+            expected_service_account=settings.credentials_identity,
         )
         if not project:
             raise RuntimeError(
@@ -1245,7 +1248,10 @@ class SpannerStore:
         from claude_history_rag.gcp_auth import default_project_and_credentials
 
         resolved_project, credentials = default_project_and_credentials(
-            ["https://www.googleapis.com/auth/cloud-platform"]
+            ["https://www.googleapis.com/auth/cloud-platform"],
+            production=settings.runtime_contract == "production",
+            credential_profile=settings.credentials_profile,
+            expected_service_account=settings.credentials_identity,
         )
         if credentials is not None and not credentials.valid:
             from google.auth.transport.requests import Request

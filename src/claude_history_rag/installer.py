@@ -26,8 +26,11 @@ MCP_SAFE_ENV_KEYS = frozenset(
         "HOME",
         "PATH",
         "CLOUDSDK_CONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_CLOUD_PROJECT",
         "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY",
         "CLAUDE_HISTORY_RAG_SERVER_URL",
         "CLAUDE_HISTORY_RAG_MACHINE_ID",
         "CLAUDE_HISTORY_RAG_CLIENT_NAME",
@@ -83,10 +86,7 @@ MCP_SAFE_ENV_KEYS = frozenset(
 
 PRODUCTION_RUNTIME_CONTRACT = "production"
 PRODUCTION_CREDENTIALS_SOURCE = "application_default"
-FORBIDDEN_PRODUCTION_CREDENTIAL_ENV = (
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
-)
+FORBIDDEN_PRODUCTION_CREDENTIAL_ENV = ("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",)
 
 try:
     import httpx
@@ -722,20 +722,25 @@ def build_mcp_server_config(
 
 def project_mcp_env(env_vars: dict[str, str]) -> dict[str, str]:
     """Project daemon env into the subset that is safe and useful for MCP apps."""
-    return {
+    projected = {
         key: value
         for key, value in env_vars.items()
         if key in MCP_SAFE_ENV_KEYS and value not in {"", None}
     }
+    if projected.get("CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE") != "impersonated_service_account":
+        projected.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+    return projected
 
 
 def normalize_production_credentials_env(env_vars: dict[str, str]) -> dict[str, str]:
-    """Replace any production credential-file selector with explicit keyless ADC."""
+    """Retire legacy overrides while retaining an explicit keyless ADC carrier."""
     normalized = dict(env_vars)
     if normalized.get("CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT") != PRODUCTION_RUNTIME_CONTRACT:
         return normalized
     for key in FORBIDDEN_PRODUCTION_CREDENTIAL_ENV:
         normalized.pop(key, None)
+    if normalized.get("CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE") != "impersonated_service_account":
+        normalized.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
     normalized["CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE"] = PRODUCTION_CREDENTIALS_SOURCE
     return normalized
 

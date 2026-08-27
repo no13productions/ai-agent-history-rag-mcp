@@ -302,7 +302,12 @@ class VertexAIEmbeddingProvider:
         project = self.project
         from claude_history_rag.gcp_auth import default_project_and_credentials
 
-        resolved_project, credentials = default_project_and_credentials([VERTEX_SCOPE])
+        resolved_project, credentials = default_project_and_credentials(
+            [VERTEX_SCOPE],
+            production=settings.runtime_contract == "production",
+            credential_profile=settings.credentials_profile,
+            expected_service_account=settings.credentials_identity,
+        )
         if not project:
             project = resolved_project
         if not project:

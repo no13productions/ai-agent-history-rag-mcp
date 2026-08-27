@@ -1,5 +1,6 @@
 """Tests for storage backend configuration seams."""
 
+import json
 import threading
 from datetime import UTC, datetime
 
@@ -181,11 +182,38 @@ def test_spanner_storage_requires_explicit_coordinates():
         Settings(storage_backend="spanner")
 
 
-def test_production_runtime_contract_accepts_keyless_adc():
-    """The production contract pins Spanner and keyless Application Default Credentials."""
+def _impersonated_adc_file(tmp_path, target="history-rag-runtime@example.iam.gserviceaccount.com"):
+    credential_path = tmp_path / "impersonated-adc.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "type": "impersonated_service_account",
+                "service_account_impersonation_url": (
+                    "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+                    f"{target}:generateAccessToken"
+                ),
+                "source_credentials": {
+                    "type": "authorized_user",
+                    "client_id": "test-client-id",
+                    "client_secret": "test-client-secret",
+                    "refresh_token": "test-refresh-token",
+                },
+            }
+        )
+    )
+    credential_path.chmod(0o600)
+    return credential_path
+
+
+def test_production_runtime_contract_accepts_keyless_impersonated_adc(tmp_path):
+    """Production accepts an exact-target impersonated ADC profile with no private key."""
+    target = "history-rag-runtime@example.iam.gserviceaccount.com"
+    credential_path = _impersonated_adc_file(tmp_path, target)
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
         credentials_source="application_default",
+        credentials_profile="impersonated_service_account",
+        credentials_identity=target,
         storage_backend="spanner",
         spanner_project=FAKE_SPANNER_PROJECT,
         spanner_instance=FAKE_SPANNER_INSTANCE,
@@ -199,7 +227,9 @@ def test_production_runtime_contract_accepts_keyless_adc():
         status_server_port=PRODUCTION_STATUS_SERVER_PORT,
     )
 
-    validate_production_runtime_contract(configured, {})
+    validate_production_runtime_contract(
+        configured, {"GOOGLE_APPLICATION_CREDENTIALS": str(credential_path)}
+    )
 
 
 def test_production_runtime_contract_rejects_missing_adc_selector():
@@ -223,15 +253,26 @@ def test_production_runtime_contract_rejects_missing_adc_selector():
         validate_production_runtime_contract(configured, {})
 
 
-@pytest.mark.parametrize(
-    "forbidden_env",
-    ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"],
-)
-def test_production_runtime_contract_rejects_explicit_credential_files(forbidden_env):
-    """Production must not select an exportable service-account credential file."""
+def test_production_runtime_contract_rejects_exportable_service_account_key(tmp_path):
+    """A GOOGLE_APPLICATION_CREDENTIALS carrier must never smuggle a private key."""
+    credential_path = tmp_path / "service-account-key.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "type": "service_account",
+                "client_email": "history-rag-runtime@example.iam.gserviceaccount.com",
+                "private_key_id": "key-id",
+                "private_key": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+            }
+        )
+    )
+    credential_path.chmod(0o600)
+    target = "history-rag-runtime@example.iam.gserviceaccount.com"
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
         credentials_source="application_default",
+        credentials_profile="impersonated_service_account",
+        credentials_identity=target,
         storage_backend="spanner",
         spanner_project=FAKE_SPANNER_PROJECT,
         spanner_instance=FAKE_SPANNER_INSTANCE,
@@ -245,15 +286,47 @@ def test_production_runtime_contract_rejects_explicit_credential_files(forbidden
         status_server_port=PRODUCTION_STATUS_SERVER_PORT,
     )
 
-    with pytest.raises(RuntimeError, match=forbidden_env):
-        validate_production_runtime_contract(configured, {forbidden_env: "/tmp/key.json"})
+    with pytest.raises(RuntimeError, match="impersonated_service_account"):
+        validate_production_runtime_contract(
+            configured, {"GOOGLE_APPLICATION_CREDENTIALS": str(credential_path)}
+        )
+
+
+def test_production_runtime_contract_rejects_impersonation_target_mismatch(tmp_path):
+    credential_path = _impersonated_adc_file(tmp_path, "other@example.iam.gserviceaccount.com")
+    configured = Settings(
+        runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
+        credentials_source="application_default",
+        credentials_profile="impersonated_service_account",
+        credentials_identity="history-rag-runtime@example.iam.gserviceaccount.com",
+        storage_backend="spanner",
+        spanner_project=FAKE_SPANNER_PROJECT,
+        spanner_instance=FAKE_SPANNER_INSTANCE,
+        spanner_database=FAKE_SPANNER_DATABASE,
+        spanner_embedding_mode="spanner",
+        spanner_embedding_model_id=PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
+        embedding_provider=PRODUCTION_EMBEDDING_PROVIDER,
+        embedding_model=PRODUCTION_EMBEDDING_MODEL,
+        embedding_dimension=PRODUCTION_EMBEDDING_DIMENSION,
+        status_server_host=PRODUCTION_STATUS_SERVER_HOST,
+        status_server_port=PRODUCTION_STATUS_SERVER_PORT,
+    )
+
+    with pytest.raises(RuntimeError, match="target identity"):
+        validate_production_runtime_contract(
+            configured, {"GOOGLE_APPLICATION_CREDENTIALS": str(credential_path)}
+        )
 
 
 def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
     """A production Spanner daemon must not carry a local LanceDB fallback path."""
+    target = "history-rag-runtime@example.iam.gserviceaccount.com"
+    credential_path = _impersonated_adc_file(tmp_path, target)
     configured = Settings(
         runtime_contract=PRODUCTION_RUNTIME_CONTRACT,
         credentials_source="application_default",
+        credentials_profile="impersonated_service_account",
+        credentials_identity=target,
         storage_backend="spanner",
         spanner_project=FAKE_SPANNER_PROJECT,
         spanner_instance=FAKE_SPANNER_INSTANCE,
@@ -271,6 +344,7 @@ def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
         validate_production_runtime_contract(
             configured,
             {
+                "GOOGLE_APPLICATION_CREDENTIALS": str(credential_path),
                 "CLAUDE_HISTORY_RAG_DB_PATH": str(tmp_path / "lancedb"),
             },
         )

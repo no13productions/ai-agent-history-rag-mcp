@@ -21,6 +21,10 @@
         <string>production</string>
         <key>CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE</key>
         <string>application_default</string>
+        <key>CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE</key>
+        <string>impersonated_service_account</string>
+        <key>CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY</key>
+        <string>__CREDENTIALS_IDENTITY__</string>
         <key>CLAUDE_HISTORY_RAG_STORAGE_BACKEND</key>
         <string>spanner</string>
         <key>CLAUDE_HISTORY_RAG_SPANNER_PROJECT</key>
@@ -89,6 +93,8 @@
         <string>Brandon Mac Mini</string>
         <key>CLOUDSDK_CONFIG</key>
         <string>__HOME__/.config/gcloud</string>
+        <key>GOOGLE_APPLICATION_CREDENTIALS</key>
+        <string>__GOOGLE_APPLICATION_CREDENTIALS__</string>
         <key>GOOGLE_CLOUD_PROJECT</key>
         <string>__GCP_PROJECT__</string>
         <key>HOME</key>
