@@ -17,30 +17,29 @@ GCP_LOCATION_PATTERN = re.compile(r"^[a-z]+-[a-z]+[0-9](-[a-z])?$")
 OPTIMIZE_INTERVAL = 900
 
 
-# The production runtime contract is DEPLOYMENT-SPECIFIC and is therefore supplied by
-# the environment, never baked in here.
+# The production contract has two kinds of field, and they are checked differently.
 #
-# It used to be hardcoded to one operator's GCP project, Spanner instance and
-# service-account key path. This is a public repository, so those literals published
-# exactly which project and instance to aim at, plus the local account name of whoever
-# ran it. No credential was ever committed and none is now, but a project id and an
-# instance id are free reconnaissance and there is no reason for a general-purpose tool
-# to carry one deployment's identity in source.
+# SHAPE fields are universal — every production deployment of this tool must use Spanner
+# storage, Vertex embeddings at 3072d, and a loopback status server. Drifting back to the
+# LanceDB/Ollama defaults is the failure this contract exists to catch, so these are still
+# exact equality checks against the constants below.
 #
-# Behaviour is unchanged for an operator who sets these: the contract is still an exact
-# fail-loud equality check against the running settings. What changes is that the
-# expected values come from CLAUDE_HISTORY_RAG_PRODUCTION_* rather than from this file,
-# and that selecting runtime_contract="production" WITHOUT configuring them is itself a
-# contract error rather than a silent comparison against somebody else's coordinates.
-def _production_expectation(name: str, default: str | None = None) -> str | None:
-    """Read one deployment-specific production expectation from the environment."""
-    return os.environ.get(f"CLAUDE_HISTORY_RAG_PRODUCTION_{name}") or default
-
-
+# IDENTITY fields — which GCP project, which Spanner instance, which key file — are
+# deployment-specific. They are checked for PRESENCE, not against a fixed value. There is
+# no correct literal for them in a general-purpose tool, and hardcoding one is what
+# published this operator's project id, instance id and account name from a public
+# repository.
+#
+# Presence-checking keeps the whole point of the contract: a production daemon still
+# cannot start pointed at LanceDB, still cannot start with an unconfigured Spanner target,
+# and still cannot start without credentials. It just no longer asserts WHICH target,
+# which was never this file's business.
+#
+# Practical consequence, and the reason it is done this way: an operator whose launch
+# agent already sets CLAUDE_HISTORY_RAG_SPANNER_PROJECT / _INSTANCE / _DATABASE and
+# GOOGLE_APPLICATION_CREDENTIALS needs to change NOTHING. No new variables, no parallel
+# set of expectations to keep in sync with the real ones.
 PRODUCTION_RUNTIME_CONTRACT = "production"
-PRODUCTION_SPANNER_PROJECT = _production_expectation("SPANNER_PROJECT")
-PRODUCTION_SPANNER_INSTANCE = _production_expectation("SPANNER_INSTANCE")
-PRODUCTION_SPANNER_DATABASE = _production_expectation("SPANNER_DATABASE", "ai-agent-history-rag")
 PRODUCTION_SPANNER_EMBEDDING_MODEL_ID = "ConversationEmbeddingModel"
 PRODUCTION_EMBEDDING_PROVIDER = "vertex"
 PRODUCTION_EMBEDDING_MODEL = "gemini-embedding-001"
@@ -48,9 +47,11 @@ PRODUCTION_EMBEDDING_DIMENSION = 3072
 PRODUCTION_STATUS_SERVER_HOST = "127.0.0.1"
 PRODUCTION_STATUS_SERVER_PORT = 4680
 
-_PREFERRED_CREDENTIALS = _production_expectation("GOOGLE_APPLICATION_CREDENTIALS")
-PREFERRED_GOOGLE_APPLICATION_CREDENTIALS: Path | None = (
-    Path(_PREFERRED_CREDENTIALS) if _PREFERRED_CREDENTIALS else None
+# Identity fields the production contract requires to be SET (never to equal a literal).
+PRODUCTION_REQUIRED_IDENTITY_FIELDS = (
+    "spanner_project",
+    "spanner_instance",
+    "spanner_database",
 )
 
 PRODUCTION_SOURCE_PATHS = {
@@ -637,37 +638,20 @@ def validate_production_runtime_contract(
         return
 
     env = environ if environ is not None else os.environ
-    if credential_path is None:
-        credential_path = PREFERRED_GOOGLE_APPLICATION_CREDENTIALS
 
-    # The deployment-specific half of the contract must be configured before it can be
-    # enforced. Failing here is the point: silently skipping these comparisons would turn
-    # a drift detector into a no-op exactly when production is selected.
-    unconfigured = [
-        name
-        for name, value in (
-            ("CLAUDE_HISTORY_RAG_PRODUCTION_SPANNER_PROJECT", PRODUCTION_SPANNER_PROJECT),
-            ("CLAUDE_HISTORY_RAG_PRODUCTION_SPANNER_INSTANCE", PRODUCTION_SPANNER_INSTANCE),
-            ("CLAUDE_HISTORY_RAG_PRODUCTION_SPANNER_DATABASE", PRODUCTION_SPANNER_DATABASE),
-            (
-                "CLAUDE_HISTORY_RAG_PRODUCTION_GOOGLE_APPLICATION_CREDENTIALS",
-                credential_path,
-            ),
-        )
-        if not value
-    ]
-    if unconfigured:
-        raise RuntimeError(
-            "Production runtime contract invalid: runtime_contract='production' requires "
-            "the deployment-specific expectations to be set, but these are unset: "
-            + ", ".join(unconfigured)
-        )
+    errors: list[str] = []
 
+    # IDENTITY fields: required to be SET, never required to equal a literal. See the
+    # module header for why. An operator's existing CLAUDE_HISTORY_RAG_SPANNER_* settings
+    # satisfy these as-is — no additional configuration exists to forget.
+    for field_name in PRODUCTION_REQUIRED_IDENTITY_FIELDS:
+        if not (getattr(current, field_name, "") or "").strip():
+            errors.append(f"{field_name} must be set for runtime_contract='production'")
+
+    # SHAPE fields: exact equality, because there is one correct answer for every
+    # deployment and drifting off it is the failure this contract catches.
     expected_values = {
         "storage_backend": ("spanner", current.storage_backend),
-        "spanner_project": (PRODUCTION_SPANNER_PROJECT, current.spanner_project),
-        "spanner_instance": (PRODUCTION_SPANNER_INSTANCE, current.spanner_instance),
-        "spanner_database": (PRODUCTION_SPANNER_DATABASE, current.spanner_database),
         "spanner_embedding_mode": ("spanner", current.spanner_embedding_mode),
         "spanner_embedding_model_id": (
             PRODUCTION_SPANNER_EMBEDDING_MODEL_ID,
@@ -682,18 +666,22 @@ def validate_production_runtime_contract(
     for field_name, expected_path in PRODUCTION_SOURCE_PATHS.items():
         expected_values[field_name] = (str(expected_path), str(getattr(current, field_name)))
 
-    errors: list[str] = []
     for field_name, (expected, actual) in expected_values.items():
         if actual != expected:
             errors.append(f"{field_name}={actual!r} expected {expected!r}")
 
-    credential = env.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if credential != str(credential_path):
+    # Credentials: require that a key is configured and that the file is really there.
+    # Which path it is remains the deployment's business. `credential_path` is still an
+    # explicit override so tests can point at a temp file.
+    credential = (
+        str(credential_path) if credential_path else env.get("GOOGLE_APPLICATION_CREDENTIALS")
+    )
+    if not credential:
         errors.append(
-            f"GOOGLE_APPLICATION_CREDENTIALS={credential!r} expected {str(credential_path)!r}"
+            "GOOGLE_APPLICATION_CREDENTIALS must be set for runtime_contract='production'"
         )
-    if not credential_path.exists():
-        errors.append(f"credential file missing: {credential_path}")
+    elif not Path(credential).exists():
+        errors.append(f"credential file missing: {credential}")
 
     if env.get("CLAUDE_HISTORY_RAG_DB_PATH"):
         errors.append("CLAUDE_HISTORY_RAG_DB_PATH must be unset in production Spanner runtime")

@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 
 import pytest
 
-from claude_history_rag import config as config_module
 from claude_history_rag import store as store_module
 from claude_history_rag.config import (
     PRODUCTION_EMBEDDING_DIMENSION,
@@ -34,22 +33,12 @@ from claude_history_rag.store import (
     get_vector_dim,
 )
 
-# The deployment-specific half of the production contract is supplied by the
-# environment, so it is None unless an operator configures it. These tests exercise the
-# contract MECHANISM, which must not depend on any real deployment's coordinates — so
-# they inject their own fake ones. Deliberately not real values: this is a public
-# repository and a project/instance id in a fixture is still a published project id.
+# Identity fields are checked for PRESENCE, not against a literal, so these tests supply
+# any non-empty values. Deliberately fake: this is a public repository, and a real
+# project/instance id in a fixture is still a published project/instance id.
 FAKE_SPANNER_PROJECT = "example-project"
 FAKE_SPANNER_INSTANCE = "example-instance"
 FAKE_SPANNER_DATABASE = "example-database"
-
-
-@pytest.fixture
-def production_contract(monkeypatch):
-    """Configure the deployment-specific production expectations with fake values."""
-    monkeypatch.setattr(config_module, "PRODUCTION_SPANNER_PROJECT", FAKE_SPANNER_PROJECT)
-    monkeypatch.setattr(config_module, "PRODUCTION_SPANNER_INSTANCE", FAKE_SPANNER_INSTANCE)
-    monkeypatch.setattr(config_module, "PRODUCTION_SPANNER_DATABASE", FAKE_SPANNER_DATABASE)
 
 
 class FakeBatch:
@@ -192,7 +181,7 @@ def test_spanner_storage_requires_explicit_coordinates():
         Settings(storage_backend="spanner")
 
 
-def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path, production_contract):
+def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path):
     """The production contract pins Spanner, 3072d embeddings, status port, and key path."""
     key_path = tmp_path / "service-account.json"
     key_path.write_text("{}")
@@ -218,7 +207,7 @@ def test_production_runtime_contract_accepts_exact_spanner_config(tmp_path, prod
     )
 
 
-def test_production_runtime_contract_rejects_local_fallback_path(tmp_path, production_contract):
+def test_production_runtime_contract_rejects_local_fallback_path(tmp_path):
     """A production Spanner daemon must not carry a local LanceDB fallback path."""
     key_path = tmp_path / "service-account.json"
     key_path.write_text("{}")
