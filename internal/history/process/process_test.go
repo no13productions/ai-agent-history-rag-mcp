@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ type fakeOps struct {
 	mu        sync.Mutex
 	snapshots map[int]Snapshot
 	signals   []os.Signal
+	signalErr map[os.Signal]error
 	termStops bool
 	killStops bool
 }
@@ -34,6 +36,9 @@ func (f *fakeOps) Signal(pid int, signal os.Signal) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.signals = append(f.signals, signal)
+	if err := f.signalErr[signal]; err != nil {
+		return err
+	}
 	if (signal == os.Interrupt && f.termStops) || (signal == os.Kill && f.killStops) {
 		delete(f.snapshots, pid)
 	}
@@ -131,6 +136,79 @@ func TestSuperviseTermThenKillAndRefusesSurvivor(t *testing.T) {
 	}
 	if _, err := controller.Prepare(context.Background(), Supervise, record(999), 0, 0); !errors.Is(err, ErrTerminationUnproven) {
 		t.Fatalf("survivor error = %v", err)
+	}
+}
+
+func TestSuperviseFallsBackToIdentityCheckedKillWhenGracefulSignalFails(t *testing.T) {
+	r := record(123)
+	ops := &fakeOps{
+		snapshots: map[int]Snapshot{123: snapshot(r)},
+		signalErr: map[os.Signal]error{os.Interrupt: errors.New("graceful signal unavailable")},
+		killStops: true,
+	}
+	controller, _ := testController(t, ops)
+	if err := controller.WriteRecord(r); err != nil {
+		t.Fatal(err)
+	}
+	shouldRun, err := controller.Prepare(context.Background(), Supervise, record(999), 0, 0)
+	if err != nil || !shouldRun {
+		t.Fatalf("Prepare() = %v, %v", shouldRun, err)
+	}
+	if len(ops.signals) != 2 || ops.signals[0] != os.Interrupt || ops.signals[1] != os.Kill {
+		t.Fatalf("signals = %v", ops.signals)
+	}
+}
+
+func TestSuperviseDirectKillUsesTheIdentityCheckedTargetOnce(t *testing.T) {
+	r := record(123)
+	ops := &fakeOps{snapshots: map[int]Snapshot{123: snapshot(r)}, killStops: true}
+	controller, _ := testController(t, ops)
+	controller.termSignal = os.Kill
+	if err := controller.WriteRecord(r); err != nil {
+		t.Fatal(err)
+	}
+	shouldRun, err := controller.Prepare(context.Background(), Supervise, record(999), time.Second, 0)
+	if err != nil || !shouldRun {
+		t.Fatalf("Prepare() = %v, %v", shouldRun, err)
+	}
+	if len(ops.signals) != 1 || ops.signals[0] != os.Kill {
+		t.Fatalf("signals = %v", ops.signals)
+	}
+}
+
+func TestSuperviseDirectKillFailureRemainsFailClosed(t *testing.T) {
+	r := record(123)
+	ops := &fakeOps{
+		snapshots: map[int]Snapshot{123: snapshot(r)},
+		signalErr: map[os.Signal]error{os.Kill: errors.New("kill unavailable")},
+	}
+	controller, root := testController(t, ops)
+	controller.termSignal = os.Kill
+	if err := controller.WriteRecord(r); err != nil {
+		t.Fatal(err)
+	}
+	if shouldRun, err := controller.Prepare(context.Background(), Supervise, record(999), 0, 0); err == nil || shouldRun {
+		t.Fatalf("Prepare() = %v, %v", shouldRun, err)
+	}
+	if exists, err := root.Exists("daemon.pid"); err != nil || !exists {
+		t.Fatalf("pid file exists = %v, %v", exists, err)
+	}
+}
+
+func TestWindowsTerminationSourceUsesIdentityBoundProcessKill(t *testing.T) {
+	source, err := os.ReadFile("system_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if strings.Contains(text, "GenerateConsoleCtrlEvent") || strings.Contains(text, "CTRL_BREAK_EVENT") {
+		t.Fatal("Windows termination still depends on an unproven console process group")
+	}
+	if !strings.Contains(text, "func terminationSignal() os.Signal { return os.Kill }") {
+		t.Fatal("Windows termination is not pinned to identity-bound process kill")
+	}
+	if !strings.Contains(text, "if signal != os.Kill") {
+		t.Fatal("Windows process control accepts a signal without a proven target model")
 	}
 }
 

@@ -22,21 +22,18 @@ type SystemOps struct {
 func NewSystemOps() *SystemOps { return &SystemOps{} }
 
 func (ops *SystemOps) Signal(pid int, signal os.Signal) error {
+	if signal != os.Kill {
+		return ErrUncertainTarget
+	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return err
 	}
-	if signal == os.Kill {
-		if err := process.Kill(); errors.Is(err, os.ErrProcessDone) {
-			return ErrProcessNotFound
-		} else {
-			return err
-		}
-	}
-	if err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid)); err != nil {
+	if err := process.Kill(); errors.Is(err, os.ErrProcessDone) {
+		return ErrProcessNotFound
+	} else {
 		return err
 	}
-	return nil
 }
 
 func (ops *SystemOps) Snapshot(pid int) (Snapshot, error) {
@@ -68,7 +65,7 @@ func (ops *SystemOps) Snapshot(pid int) (Snapshot, error) {
 	return Snapshot{PID: pid, Executable: executable, CheckoutRoot: expectedCheckout, StartIdentity: strconv.FormatInt(creation.Nanoseconds(), 10)}, nil
 }
 
-func terminationSignal() os.Signal { return os.Interrupt }
+func terminationSignal() os.Signal { return os.Kill }
 
 func CurrentRecord(generic Ops, executable, checkoutRoot string) (Record, error) {
 	ops, ok := generic.(*SystemOps)

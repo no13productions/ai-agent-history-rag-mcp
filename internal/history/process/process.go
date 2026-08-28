@@ -109,14 +109,32 @@ func (c *Controller) Prepare(ctx context.Context, mode Mode, current Record, ter
 	if mode == Start {
 		return false, nil
 	}
-	if err := c.ops.Signal(existing.PID, c.termSignal); err != nil {
-		return false, fmt.Errorf("signal supervised process: %w", err)
+	exited := false
+	if c.termSignal == os.Kill {
+		signalErr := c.ops.Signal(existing.PID, os.Kill)
+		if errors.Is(signalErr, ErrProcessNotFound) {
+			exited = true
+		} else if signalErr != nil {
+			return false, fmt.Errorf("kill supervised process: %w", signalErr)
+		}
+		if !exited {
+			exited, err = c.waitForExit(ctx, existing, killTimeout)
+			if err != nil {
+				return false, err
+			}
+		}
+	} else {
+		signalErr := c.ops.Signal(existing.PID, c.termSignal)
+		if errors.Is(signalErr, ErrProcessNotFound) {
+			exited = true
+		} else if signalErr == nil {
+			exited, err = c.waitForExit(ctx, existing, termTimeout)
+			if err != nil {
+				return false, err
+			}
+		}
 	}
-	exited, err := c.waitForExit(ctx, existing, termTimeout)
-	if err != nil {
-		return false, err
-	}
-	if !exited {
+	if !exited && c.termSignal != os.Kill {
 		snapshot, inspectErr := c.ops.Snapshot(existing.PID)
 		if inspectErr != nil || !matches(existing, snapshot) {
 			return false, ErrUncertainTarget
