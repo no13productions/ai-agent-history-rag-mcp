@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify native prerequisites
-        run: command -v bash jq curl rg
+        run: for tool in bash jq curl grep; do command -v "$tool"; done
 
       - name: Shell syntax
         run: bash -n scripts/history-rag-mcp-native.sh scripts/history-rag-mcp-native.test.sh scripts/history-rag-mcp-native.mutation.test.sh scripts/start.sh

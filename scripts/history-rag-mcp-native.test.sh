@@ -161,7 +161,7 @@ mkdir -p "$private"
 write_adc "$private/adc.json" authorized_user true '[]' "$identity"
 fixture_env "$private" "$private/adc.json" impersonated_service_account
 assert_failure "private-key marker rejected at arbitrary depth" run_fixture --validate-only
-if rg -q 'DO_NOT_PRINT_PRIVATE_FIXTURE' "$TMP_ROOT/stdout" "$TMP_ROOT/stderr"; then
+if grep -Eq 'DO_NOT_PRINT_PRIVATE_FIXTURE' "$TMP_ROOT/stdout" "$TMP_ROOT/stderr"; then
   fail "private fixture value leaked in validator output"
 fi
 pass "validator output is secret-safe"
@@ -252,17 +252,17 @@ jq -s -e '
   jq -c . "$protocol/output" >&2
   fail "MCP lifecycle/tool responses are invalid"
 }
-rg -q '/api/search' "$protocol/curl-args" || fail "search tool did not map to daemon search route"
-rg -q '/api/search/files' "$protocol/curl-args" || fail "file tool did not map to daemon file route"
-rg -q '/api/sessions' "$protocol/curl-args" || fail "session tool did not map to daemon session route"
-[[ "$(rg -c '/status\?detail=' "$protocol/curl-args")" == "2" ]] || fail "status tools did not map to daemon status route"
-rg -q '"query":"needle","limit":2' "$protocol/curl-bodies" || fail "search request body was not preserved"
-rg -q '"file_path":"src/example.txt"' "$protocol/curl-bodies" || fail "file request body was not preserved"
-rg -q '"session_id":"session-fixture"' "$protocol/curl-bodies" || fail "session request body was not preserved"
-if rg -q 'Authorization:|synthetic-secret|synthetic-refresh' "$protocol/curl-args"; then
+grep -Eq '/api/search' "$protocol/curl-args" || fail "search tool did not map to daemon search route"
+grep -Eq '/api/search/files' "$protocol/curl-args" || fail "file tool did not map to daemon file route"
+grep -Eq '/api/sessions' "$protocol/curl-args" || fail "session tool did not map to daemon session route"
+[[ "$(grep -Ec '/status\?detail=' "$protocol/curl-args")" == "2" ]] || fail "status tools did not map to daemon status route"
+grep -Eq '"query":"needle","limit":2' "$protocol/curl-bodies" || fail "search request body was not preserved"
+grep -Eq '"file_path":"src/example.txt"' "$protocol/curl-bodies" || fail "file request body was not preserved"
+grep -Eq '"session_id":"session-fixture"' "$protocol/curl-bodies" || fail "session request body was not preserved"
+if grep -Eq 'Authorization:|synthetic-secret|synthetic-refresh' "$protocol/curl-args"; then
   fail "credential material appeared in curl argv"
 fi
-rg -q '^Authorization: Bearer SYNTHETIC_PSK_FOR_TEST_ONLY$' "$protocol/curl-headers" || fail "daemon authorization header was not forwarded through the protected descriptor"
+grep -Eq '^Authorization: Bearer SYNTHETIC_PSK_FOR_TEST_ONLY$' "$protocol/curl-headers" || fail "daemon authorization header was not forwarded through the protected descriptor"
 pass "MCP lifecycle and five-tool daemon proxy"
 pass "daemon authorization is not carried in argv"
 
@@ -282,7 +282,7 @@ FIXTURE_ENV+=("CLAUDE_HISTORY_RAG_AUTH_ENABLED=true")
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_server_status","arguments":{}}}'
 } | run_fixture >"$auth_state/output" 2>"$auth_state/stderr"
-rg -q '^Authorization: Bearer SYNTHETIC_AUTH_STATE_PSK$' "$auth_state/curl-header" || fail "active auth-state PSK was not forwarded"
+grep -Eq '^Authorization: Bearer SYNTHETIC_AUTH_STATE_PSK$' "$auth_state/curl-header" || fail "active auth-state PSK was not forwarded"
 pass "owner-only daemon auth state is supported"
 chmod 644 "$auth_state/home/.claude-history-rag/auth.json"
 rm -f "$auth_state/curl-invoked"
@@ -310,11 +310,11 @@ jq -e --arg command "$MCP_SCRIPT" '
 pass "native installer preserves config and projects no PSK"
 
 [[ ! -e "$ROOT_DIR/src/claude_history_rag/__main__.py" ]] || fail "legacy Python MCP entrypoint remains live"
-if rg -n 'uv run ai-agent-history-rag([[:space:]]|$)|python -m claude_history_rag' \
+if grep -En 'uv run ai-agent-history-rag([[:space:]]|$)|python -m claude_history_rag' \
   "$ROOT_DIR/README.md" "$ROOT_DIR/CLAUDE.md" "$ROOT_DIR/scripts/start.sh" >/dev/null; then
   fail "documented or scripted legacy MCP launch route remains"
 fi
-rg -q 'history-rag-mcp-native.sh' "$ROOT_DIR/scripts/start.sh" || fail "start helper does not select native MCP"
+grep -Eq 'history-rag-mcp-native.sh' "$ROOT_DIR/scripts/start.sh" || fail "start helper does not select native MCP"
 pass "legacy Python MCP launch routes are closed"
 
 printf 'PASS total=%d\n' "$PASS_COUNT"
