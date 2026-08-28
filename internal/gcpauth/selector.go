@@ -173,6 +173,9 @@ func (s Selector) tokenSource(ctx context.Context, detachRefresh bool, scopes ..
 	if len(scopes) == 0 {
 		scopes = []string{CloudPlatformScope}
 	}
+	if len(scopes) != 1 || scopes[0] != CloudPlatformScope {
+		return nil, fmt.Errorf("google_credentials: scopes must contain only %q", CloudPlatformScope)
+	}
 	switch s.CredentialsProfile {
 	case CredentialsProfileImpersonatedServiceAccount:
 		return s.impersonatedTokenSource(ctx, scopes, detachRefresh)
@@ -435,11 +438,13 @@ func validateImpersonatedConfiguration(data []byte, identity string) error {
 	if !ok || len(delegates) != 0 {
 		return fmt.Errorf("delegates must be an empty array")
 	}
-	if configuredScopes, exists := raw["scopes"]; exists {
-		scopes, ok := configuredScopes.([]any)
-		if !ok || len(scopes) != 1 || scopes[0] != CloudPlatformScope {
-			return fmt.Errorf("scopes must contain only %q when present", CloudPlatformScope)
-		}
+	configuredScopes, exists := raw["scopes"]
+	if !exists {
+		return fmt.Errorf("scopes are required for the impersonated credential carrier")
+	}
+	scopes, ok := configuredScopes.([]any)
+	if !ok || len(scopes) != 1 || scopes[0] != CloudPlatformScope {
+		return fmt.Errorf("scopes must contain only %q", CloudPlatformScope)
 	}
 	return nil
 }

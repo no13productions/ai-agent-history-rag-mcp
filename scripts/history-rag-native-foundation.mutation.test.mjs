@@ -42,10 +42,22 @@ const mutations = [
     to: "if false {",
   },
   {
+    name: "caller scope closure",
+    file: "internal/gcpauth/selector.go",
+    from: "if len(scopes) != 1 || scopes[0] != CloudPlatformScope {",
+    to: "if false {",
+  },
+  {
+    name: "carrier scope presence",
+    file: "internal/gcpauth/selector.go",
+    from: 'configuredScopes, exists := raw["scopes"]\n\tif !exists {',
+    to: 'configuredScopes, exists := raw["scopes"]\n\tif false {',
+  },
+  {
     name: "impersonation quota-project binding",
     file: "internal/gcpauth/selector.go",
-    from: "if !exists {",
-    to: "if false {",
+    from: 'configuredQuotaProject, exists := raw["quota_project_id"]\n\tif !exists {',
+    to: 'configuredQuotaProject, exists := raw["quota_project_id"]\n\tif false {',
   },
   {
     name: "Spanner-only production shape",

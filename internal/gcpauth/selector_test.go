@@ -89,6 +89,9 @@ func TestImpersonatedCarrierRejectsNestedExportableKeyAndAuthorityDrift(t *testi
 		{name: "wrong scope", mutate: func(raw string) string {
 			return strings.Replace(raw, cloudPlatformScopeFixture, "https://www.googleapis.com/auth/devstorage.read_only", 1)
 		}, want: "scopes must contain only"},
+		{name: "missing scope", mutate: func(raw string) string {
+			return strings.Replace(raw, ",\n  \"scopes\": [\""+cloudPlatformScopeFixture+"\"]", "", 1)
+		}, want: "scopes are required"},
 		{name: "missing quota project", mutate: func(raw string) string {
 			return strings.Replace(raw, ",\n  \"quota_project_id\": \"fixture-project\"", "", 1)
 		}, want: "quota_project_id is required"},
@@ -106,6 +109,31 @@ func TestImpersonatedCarrierRejectsNestedExportableKeyAndAuthorityDrift(t *testi
 				t.Fatalf("error = %v, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestTokenSourceRejectsCallerScopeExpansion(t *testing.T) {
+	clearAmbientGoogleEnvironment(t)
+	directory := t.TempDir()
+	path := filepath.Join(directory, "application_default_credentials.json")
+	if err := os.WriteFile(path, []byte(validImpersonatedCarrier(testIdentity)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalPath := defaultADCPath
+	defaultADCPath = func() (string, error) { return path, nil }
+	t.Cleanup(func() { defaultADCPath = originalPath })
+	selector := Selector{
+		CredentialsSource:   CredentialsSourceApplicationDefault,
+		CredentialsProfile:  CredentialsProfileImpersonatedServiceAccount,
+		CredentialsIdentity: testIdentity,
+	}
+	for _, scopes := range [][]string{
+		{"https://www.googleapis.com/auth/devstorage.read_only"},
+		{cloudPlatformScopeFixture, "https://www.googleapis.com/auth/devstorage.read_only"},
+	} {
+		if _, err := selector.TokenSource(context.Background(), scopes...); err == nil || !strings.Contains(err.Error(), "scopes must contain only") {
+			t.Fatalf("scopes %v error = %v", scopes, err)
+		}
 	}
 }
 
