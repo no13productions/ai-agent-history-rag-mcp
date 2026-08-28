@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	MaxRequestBodyBytes int64 = 4 << 10
-	MaxResponseBytes          = 32 << 10
-	MaxHeaderBytes            = 16 << 10
+	MaxRequestBodyBytes              int64 = 4 << 10
+	MaxResponseBytes                       = 32 << 10
+	MaxHeaderBytes                         = 16 << 10
+	requiredReadinessDependencyCount       = 2
 )
 
 type Verifier interface {
@@ -47,6 +48,9 @@ func New(config Config, verifier Verifier, dependencies []Readiness) (*Server, e
 		if dependency == nil || dependency.Name() == "" {
 			return nil, errors.New("readiness dependency name required")
 		}
+		if !isRequiredReadinessDependency(dependency.Name()) {
+			return nil, errors.New("unknown readiness dependency")
+		}
 		if _, exists := seen[dependency.Name()]; exists {
 			return nil, errors.New("duplicate readiness dependency")
 		}
@@ -56,6 +60,15 @@ func New(config Config, verifier Verifier, dependencies []Readiness) (*Server, e
 	server := &Server{config: config, verifier: verifier, dependencies: copyDependencies}
 	server.handler = server.routes()
 	return server, nil
+}
+
+func isRequiredReadinessDependency(name string) bool {
+	switch name {
+	case "store", "watcher":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) Handler() http.Handler { return s.handler }
@@ -112,7 +125,7 @@ func (s *Server) handleReadiness(response http.ResponseWriter, request *http.Req
 		Ready bool   `json:"ready"`
 	}
 	results := make([]result, 0, len(s.dependencies))
-	ready := len(s.dependencies) > 0
+	ready := len(s.dependencies) == requiredReadinessDependencyCount
 	for _, dependency := range s.dependencies {
 		dependencyReady := dependency.Ready(request.Context()) == nil
 		ready = ready && dependencyReady

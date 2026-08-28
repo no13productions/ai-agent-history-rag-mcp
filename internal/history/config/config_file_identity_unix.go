@@ -16,6 +16,13 @@ func requireOwnerOnlyConfigMode(info os.FileInfo) error {
 	return nil
 }
 
+func requireOwnerOnlyStateDirectoryMode(info os.FileInfo) error {
+	if info.Mode().Perm() != 0o700 {
+		return errors.New("directory mode must be owner-only")
+	}
+	return nil
+}
+
 func requireSingleLink(path string) error {
 	var identity unix.Stat_t
 	if err := unix.Lstat(path, &identity); err != nil {

@@ -81,6 +81,31 @@ func TestReadinessFailsClosedUntilAllDependenciesAttach(t *testing.T) {
 	}
 }
 
+func TestReadinessRequiresExactClosedDependencyRoster(t *testing.T) {
+	for _, dependencies := range [][]Readiness{
+		{dependency{name: "store"}},
+		{dependency{name: "watcher"}},
+	} {
+		server, err := New(Config{AuthEnabled: false}, nil, dependencies)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := request(t, server.Handler(), http.MethodGet, "/health", "", "")
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"status":"not_ready"`) {
+			t.Fatalf("incomplete roster returned %d %q", response.Code, response.Body.String())
+		}
+	}
+
+	if _, err := New(Config{AuthEnabled: false}, nil, []Readiness{dependency{name: "other"}}); err == nil {
+		t.Fatal("unknown readiness dependency was accepted")
+	}
+	if _, err := New(Config{AuthEnabled: false}, nil, []Readiness{
+		dependency{name: "store"}, dependency{name: "store"},
+	}); err == nil {
+		t.Fatal("duplicate readiness dependency was accepted")
+	}
+}
+
 func TestOperationalRoutesAuthenticateAndBoundInputs(t *testing.T) {
 	server, err := New(Config{AuthEnabled: true}, fakeVerifier{key: "secret"}, []Readiness{dependency{name: "store"}, dependency{name: "watcher"}})
 	if err != nil {

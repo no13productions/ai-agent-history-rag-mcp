@@ -10,6 +10,12 @@ import (
 
 func requireOwnerOnlyConfigMode(os.FileInfo) error { return nil }
 
+// Windows synthesizes os.FileMode permission bits from attributes rather than
+// the file's ACL. Comparing those bits to POSIX 0700 rejects ordinary private
+// directories without proving ownership, so the Windows path retains its
+// handle identity and single-link checks and does not interpret them as ACLs.
+func requireOwnerOnlyStateDirectoryMode(os.FileInfo) error { return nil }
+
 func requireSingleLink(path string) error {
 	file, err := os.Open(path)
 	if err != nil {

@@ -174,11 +174,11 @@ func (cfg *Config) validate() error {
 	if filepath.Dir(cfg.PIDFile) != cfg.StateDir || filepath.Dir(cfg.AuthStateFile) != cfg.StateDir || cfg.PIDFile == cfg.AuthStateFile {
 		return errors.New("durable files must be distinct direct children of state_dir")
 	}
-	stateDir, err := requireCanonicalDirectory(cfg.StateDir, 0o700)
+	stateDir, err := requireCanonicalDirectory(cfg.StateDir, true)
 	if err != nil {
 		return fmt.Errorf("state_dir: %w", err)
 	}
-	checkoutRoot, err := requireCanonicalDirectory(cfg.CheckoutRoot, 0)
+	checkoutRoot, err := requireCanonicalDirectory(cfg.CheckoutRoot, false)
 	if err != nil {
 		return fmt.Errorf("checkout_root: %w", err)
 	}
@@ -202,7 +202,7 @@ func (cfg *Config) validate() error {
 	return nil
 }
 
-func requireCanonicalDirectory(path string, mode os.FileMode) (string, error) {
+func requireCanonicalDirectory(path string, ownerOnly bool) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", errors.New("directory must exist")
@@ -211,8 +211,10 @@ func requireCanonicalDirectory(path string, mode os.FileMode) (string, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("directory must be a non-link directory")
 	}
-	if mode != 0 && info.Mode().Perm() != mode {
-		return "", errors.New("directory mode is not owner-only")
+	if ownerOnly {
+		if err := requireOwnerOnlyStateDirectoryMode(info); err != nil {
+			return "", err
+		}
 	}
 	return resolved, nil
 }
