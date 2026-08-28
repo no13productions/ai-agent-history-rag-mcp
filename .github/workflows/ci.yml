@@ -24,13 +24,16 @@ jobs:
           persist-credentials: false
 
       - name: Verify native prerequisites
-        run: for tool in bash jq curl grep; do command -v "$tool"; done
+        run: for tool in bash jq curl grep awk; do command -v "$tool"; done
 
       - name: Shell syntax
-        run: bash -n scripts/history-rag-mcp-native.sh scripts/history-rag-mcp-native.test.sh scripts/history-rag-mcp-native.mutation.test.sh scripts/start.sh
+        run: bash -n scripts/history-rag-mcp-native.sh scripts/history-rag-mcp-native.test.sh scripts/history-rag-mcp-native.mutation.test.sh scripts/daemon-supervision-native.test.sh scripts/start.sh
 
       - name: Native MCP security contract
         run: bash scripts/history-rag-mcp-native.test.sh
+
+      - name: Native daemon supervision contract
+        run: bash scripts/daemon-supervision-native.test.sh
 
       - name: Mutation strength
         run: bash scripts/history-rag-mcp-native.mutation.test.sh
