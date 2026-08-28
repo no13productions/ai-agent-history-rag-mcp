@@ -14,6 +14,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-mcp-security:
+    name: native MCP security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify native prerequisites
+        run: command -v bash jq curl rg
+
+      - name: Shell syntax
+        run: bash -n scripts/history-rag-mcp-native.sh scripts/history-rag-mcp-native.test.sh scripts/history-rag-mcp-native.mutation.test.sh scripts/start.sh
+
+      - name: Native MCP security contract
+        run: bash scripts/history-rag-mcp-native.test.sh
+
+      - name: Mutation strength
+        run: bash scripts/history-rag-mcp-native.mutation.test.sh
+
   test:
     name: lint and test
     runs-on: ubuntu-24.04

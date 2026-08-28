@@ -27,8 +27,8 @@ This is an MCP server that provides RAG (Retrieval-Augmented Generation) over AI
 # Install dependencies
 uv sync
 
-# Run the MCP server
-uv run ai-agent-history-rag
+# Run the production-gated native MCP proxy (the daemon must already be running)
+./scripts/history-rag-mcp-native.sh
 
 # Run tests
 uv run pytest
@@ -40,8 +40,8 @@ uv run pytest tests/test_parser.py::test_specific_function
 uv run ruff check .
 uv run ruff format .
 
-# Test with MCP Inspector
-npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
+# Test the native MCP proxy with MCP Inspector
+npx @modelcontextprotocol/inspector ./scripts/history-rag-mcp-native.sh
 ```
 
 ## Architecture
@@ -59,7 +59,7 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
 3. **Embedder** ([src/claude_history_rag/embedder.py](src/claude_history_rag/embedder.py)) - Async facade over pluggable OpenAI-compatible or Vertex AI embedding providers
 4. **Store** ([src/claude_history_rag/store.py](src/claude_history_rag/store.py)) - Pluggable LanceDB or Cloud Spanner storage backends
 5. **Watcher** ([src/claude_history_rag/watcher.py](src/claude_history_rag/watcher.py)) - watchfiles async file monitoring with debouncing
-6. **Server** ([src/claude_history_rag/server.py](src/claude_history_rag/server.py)) - FastMCP server with async tools
+6. **Native MCP proxy** ([scripts/history-rag-mcp-native.sh](scripts/history-rag-mcp-native.sh)) - production-gated STDIO tools over the loopback daemon API
 
 ### MCP Tools Exposed
 
