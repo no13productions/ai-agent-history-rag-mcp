@@ -8,6 +8,45 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+const requiredModuleFloors = new Map([
+  ["cloud.google.com/go/compute/metadata", "v0.9.0"],
+  ["golang.org/x/oauth2", "v0.36.0"],
+  ["golang.org/x/sys", "v0.46.0"],
+]);
+
+function versionParts(version) {
+  const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!match) {
+    throw new Error(`unsupported module version ${version}`);
+  }
+  return match.slice(1).map(Number);
+}
+
+function compareVersions(left, right) {
+  const leftParts = versionParts(left);
+  const rightParts = versionParts(right);
+  for (let index = 0; index < leftParts.length; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] - rightParts[index];
+    }
+  }
+  return 0;
+}
+
+function assertFleetDependencyPolicy(directory) {
+  const source = readFileSync(join(directory, "go.mod"), "utf8");
+  if (!/^go 1\.27\.0$/m.test(source)) {
+    throw new Error("go.mod must retain the Go 1.27.0 fleet floor");
+  }
+  for (const [modulePath, floor] of requiredModuleFloors) {
+    const escapedPath = modulePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(`^\\t${escapedPath} (v\\d+\\.\\d+\\.\\d+)$`, "m").exec(source);
+    if (!match || compareVersions(match[1], floor) < 0) {
+      throw new Error(`${modulePath} must be declared at or above ${floor}`);
+    }
+  }
+}
+
 const mutations = [
   {
     name: "nested exportable key rejection",
@@ -71,7 +110,15 @@ const mutations = [
     from: "if c.StatusServerPort != ProductionStatusServerPort {",
     to: "if false {",
   },
+  {
+    name: "x/sys fleet floor",
+    file: "go.mod",
+    from: "golang.org/x/sys v0.46.0",
+    to: "golang.org/x/sys v0.45.0",
+  },
 ];
+
+assertFleetDependencyPolicy(root);
 
 for (const mutation of mutations) {
   const directory = mkdtempSync(join(tmpdir(), "history-rag-native-mutation-"));
@@ -95,6 +142,7 @@ for (const mutation of mutations) {
 
     let survived = true;
     try {
+      assertFleetDependencyPolicy(directory);
       execFileSync("go", ["test", "./internal/..."], {
         cwd: directory,
         env: { ...process.env, GOTOOLCHAIN: "go1.27.0" },
