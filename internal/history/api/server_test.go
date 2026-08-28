@@ -106,6 +106,25 @@ func TestReadinessRequiresExactClosedDependencyRoster(t *testing.T) {
 	}
 }
 
+func TestReadinessSnapshotsValidatedDependencyNames(t *testing.T) {
+	store := &dependency{name: "store"}
+	watcher := &dependency{name: "watcher"}
+	server, err := New(Config{AuthEnabled: false}, nil, []Readiness{store, watcher})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.name = "other"
+	watcher.name = "other"
+	response := request(t, server.Handler(), http.MethodGet, "/health", "", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("health = %d %q", response.Code, response.Body.String())
+	}
+	if response.Body.String() != "{\"status\":\"ready\",\"dependencies\":[{\"name\":\"store\",\"ready\":true},{\"name\":\"watcher\",\"ready\":true}]}\n" {
+		t.Fatalf("mutable dependency names escaped snapshot: %q", response.Body.String())
+	}
+}
+
 func TestOperationalRoutesAuthenticateAndBoundInputs(t *testing.T) {
 	server, err := New(Config{AuthEnabled: true}, fakeVerifier{key: "secret"}, []Readiness{dependency{name: "store"}, dependency{name: "watcher"}})
 	if err != nil {

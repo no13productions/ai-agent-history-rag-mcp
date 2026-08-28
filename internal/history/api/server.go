@@ -31,10 +31,15 @@ type Config struct {
 	AuthEnabled bool
 }
 
+type readinessDependency struct {
+	name      string
+	readiness Readiness
+}
+
 type Server struct {
 	config       Config
 	verifier     Verifier
-	dependencies []Readiness
+	dependencies []readinessDependency
 	handler      http.Handler
 }
 
@@ -43,21 +48,26 @@ func New(config Config, verifier Verifier, dependencies []Readiness) (*Server, e
 		return nil, errors.New("authenticated API requires verifier")
 	}
 	seen := make(map[string]struct{})
-	copyDependencies := append([]Readiness(nil), dependencies...)
-	for _, dependency := range copyDependencies {
-		if dependency == nil || dependency.Name() == "" {
+	ownedDependencies := make([]readinessDependency, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		if dependency == nil {
 			return nil, errors.New("readiness dependency name required")
 		}
-		if !isRequiredReadinessDependency(dependency.Name()) {
+		name := dependency.Name()
+		if name == "" {
+			return nil, errors.New("readiness dependency name required")
+		}
+		if !isRequiredReadinessDependency(name) {
 			return nil, errors.New("unknown readiness dependency")
 		}
-		if _, exists := seen[dependency.Name()]; exists {
+		if _, exists := seen[name]; exists {
 			return nil, errors.New("duplicate readiness dependency")
 		}
-		seen[dependency.Name()] = struct{}{}
+		seen[name] = struct{}{}
+		ownedDependencies = append(ownedDependencies, readinessDependency{name: name, readiness: dependency})
 	}
-	sort.Slice(copyDependencies, func(i, j int) bool { return copyDependencies[i].Name() < copyDependencies[j].Name() })
-	server := &Server{config: config, verifier: verifier, dependencies: copyDependencies}
+	sort.Slice(ownedDependencies, func(i, j int) bool { return ownedDependencies[i].name < ownedDependencies[j].name })
+	server := &Server{config: config, verifier: verifier, dependencies: ownedDependencies}
 	server.handler = server.routes()
 	return server, nil
 }
@@ -127,9 +137,9 @@ func (s *Server) handleReadiness(response http.ResponseWriter, request *http.Req
 	results := make([]result, 0, len(s.dependencies))
 	ready := len(s.dependencies) == requiredReadinessDependencyCount
 	for _, dependency := range s.dependencies {
-		dependencyReady := dependency.Ready(request.Context()) == nil
+		dependencyReady := dependency.readiness.Ready(request.Context()) == nil
 		ready = ready && dependencyReady
-		results = append(results, result{Name: dependency.Name(), Ready: dependencyReady})
+		results = append(results, result{Name: dependency.name, Ready: dependencyReady})
 	}
 	status := "ready"
 	code := http.StatusOK
