@@ -8,7 +8,7 @@ import (
 )
 
 var identifierPart = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}[a-z0-9]$|^[a-z]$`)
-var locationPart = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9](-[a-z])?$`)
+var locationPart = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9]$`)
 
 type Config struct {
 	Project                    string
@@ -68,11 +68,14 @@ func (c Config) Validate() error {
 	if c.EmbeddingDimension != VectorDimension {
 		return fmt.Errorf("embedding dimension must be exactly %d", VectorDimension)
 	}
-	if !validTaskType(c.DocumentTaskType) || !validTaskType(c.QueryTaskType) {
-		return fmt.Errorf("embedding task types are invalid")
+	if c.DocumentTaskType != TaskRetrievalDocument {
+		return fmt.Errorf("document embedding task type must be %q", TaskRetrievalDocument)
 	}
-	if err := bounded("remote RPC batch", c.RemoteRPCBatch, 1, 250); err != nil {
-		return err
+	if c.QueryTaskType != TaskRetrievalQuery {
+		return fmt.Errorf("query embedding task type must be %q", TaskRetrievalQuery)
+	}
+	if c.RemoteRPCBatch != 1 {
+		return fmt.Errorf("remote RPC batch must be exactly 1 for %s", EmbeddingModelName)
 	}
 	if err := bounded("vector index leaves", c.VectorIndexLeaves, 1, 1_000_000); err != nil {
 		return err
@@ -108,15 +111,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("ANN use requires ANN to be enabled")
 	}
 	return nil
-}
-
-func validTaskType(value string) bool {
-	switch value {
-	case TaskRetrievalQuery, TaskRetrievalDocument, TaskSemanticSimilarity:
-		return true
-	default:
-		return false
-	}
 }
 
 func bounded(name string, value, minimum, maximum int) error {

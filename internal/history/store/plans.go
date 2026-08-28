@@ -20,6 +20,8 @@ var columnsWithoutVector = []string{
 	"SourceFile", "SourceLine", "ParentChunkId", "ChildChunkIds", "MachineId",
 }
 
+const maxQueryTextBytes = 16_384
+
 func BuildInitializationDDL(config Config) ([]DDLStatement, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -88,6 +90,9 @@ func BuildUpsertPlan(config Config, chunks []Chunk) (UpsertPlan, error) {
 		if err := validateChunk(chunks[index]); err != nil {
 			return UpsertPlan{}, fmt.Errorf("chunk %d: %w", index, err)
 		}
+		if config.EmbeddingStrategy == EmbeddingDeferred && len(chunks[index].Vector) == 0 && !hasLowerHexShardPrefix(chunks[index].ID) {
+			return UpsertPlan{}, fmt.Errorf("chunk %d: deferred id must begin with two lowercase hexadecimal characters", index)
+		}
 		if len(chunks[index].Vector) == 0 {
 			unembedded++
 		} else {
@@ -116,6 +121,26 @@ func BuildUpsertPlan(config Config, chunks []Chunk) (UpsertPlan, error) {
 	}
 	statement := buildRemoteModelStatement(config, chunks)
 	return UpsertPlan{Statement: &statement}, nil
+}
+
+func BuildQueryEmbeddingPlan(config Config, text string) (Statement, error) {
+	if err := config.Validate(); err != nil {
+		return Statement{}, err
+	}
+	if err := validateQueryText(text); err != nil {
+		return Statement{}, err
+	}
+	return Statement{
+		SQL: `SELECT ARRAY(
+  SELECT CAST(value AS FLOAT32) FROM UNNEST(embeddings.values) AS value
+) AS Vector
+FROM ML.PREDICT(
+  MODEL ConversationEmbeddingModel,
+  (SELECT @content AS content, @task_type AS task_type),
+  STRUCT(3072 AS outputDimensionality)
+) @{remote_udf_max_rows_per_rpc=1}`,
+		Params: map[string]any{"content": text, "task_type": config.QueryTaskType},
+	}, nil
 }
 
 func buildRemoteModelStatement(config Config, chunks []Chunk) Statement {
@@ -190,8 +215,8 @@ func BuildFullTextPlan(config Config, query Query) (SearchPlan, error) {
 	if err := validateLimit(query.Limit, config.MaxSearchLimit); err != nil {
 		return SearchPlan{}, err
 	}
-	if strings.TrimSpace(query.Text) == "" || len(query.Text) > 16_384 {
-		return SearchPlan{}, fmt.Errorf("full-text query must be nonempty and at most 16384 bytes")
+	if err := validateQueryText(query.Text); err != nil {
+		return SearchPlan{}, fmt.Errorf("full-text query: %w", err)
 	}
 	filters, params, err := buildFilters(query.Filter, false)
 	if err != nil {
@@ -216,8 +241,8 @@ func BuildHybridPlan(config Config, query Query, vectorIndexAvailable bool) (Sea
 	if !config.EnableFullText {
 		return SearchPlan{}, fmt.Errorf("hybrid search requires full-text search")
 	}
-	if strings.TrimSpace(query.Text) == "" || len(query.Text) > 16_384 {
-		return SearchPlan{}, fmt.Errorf("hybrid query text must be nonempty and at most 16384 bytes")
+	if err := validateQueryText(query.Text); err != nil {
+		return SearchPlan{}, fmt.Errorf("hybrid query text: %w", err)
 	}
 	if err := validateLimit(query.Limit, config.MaxSearchLimit); err != nil {
 		return SearchPlan{}, err
@@ -380,6 +405,13 @@ func validateLimit(limit, maximum int) error {
 	return nil
 }
 
+func validateQueryText(text string) error {
+	if strings.TrimSpace(text) == "" || len(text) > maxQueryTextBytes {
+		return fmt.Errorf("must be nonempty and at most %d bytes", maxQueryTextBytes)
+	}
+	return nil
+}
+
 func validateVector(vector []float32) error {
 	if len(vector) != VectorDimension {
 		return fmt.Errorf("vector dimension must be exactly %d, got %d", VectorDimension, len(vector))
@@ -450,6 +482,18 @@ func validateChunk(chunk Chunk) error {
 	return nil
 }
 
+func hasLowerHexShardPrefix(id string) bool {
+	if len(id) < 2 {
+		return false
+	}
+	for _, value := range id[:2] {
+		if !strings.ContainsRune("0123456789abcdef", value) {
+			return false
+		}
+	}
+	return true
+}
+
 func chunkValues(chunk Chunk, includeVector bool) []any {
 	values := []any{chunk.ID, chunk.Content}
 	if includeVector {
@@ -498,21 +542,38 @@ func parseResultRows(rows []Row, searchType SearchType) ([]Result, error) {
 			return nil, fmt.Errorf("result row %d has %d columns, want 11", index, len(row))
 		}
 		result := Result{SearchType: searchType}
+		var err error
+		if result.ID, err = requiredRowString(row[0], "id"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
+		if result.Content, err = requiredRowString(row[1], "content"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
+		if result.ChunkType, err = requiredRowString(row[2], "chunk_type"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
+		if result.SessionID, err = requiredRowString(row[3], "session_id"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
+		if result.ProjectPath, err = requiredRowString(row[4], "project_path"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
+		if result.ProjectName, err = requiredRowString(row[5], "project_name"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
 		var ok bool
-		if result.ID, ok = row[0].(string); !ok {
-			return nil, fmt.Errorf("result row %d id is not string", index)
+		if result.Timestamp, ok = row[6].(time.Time); !ok || result.Timestamp.IsZero() {
+			return nil, fmt.Errorf("result row %d: timestamp is invalid", index)
 		}
-		if result.Content, ok = row[1].(string); !ok {
-			return nil, fmt.Errorf("result row %d content is not string", index)
+		if result.FilePath, err = optionalRowString(row[7], "file_path"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
 		}
-		result.ChunkType, _ = row[2].(string)
-		result.SessionID, _ = row[3].(string)
-		result.ProjectPath, _ = row[4].(string)
-		result.ProjectName, _ = row[5].(string)
-		result.Timestamp, _ = row[6].(time.Time)
-		result.FilePath, _ = row[7].(string)
-		result.Operation, _ = row[8].(string)
-		result.MachineID, _ = row[9].(string)
+		if result.Operation, err = optionalRowString(row[8], "operation"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
+		if result.MachineID, err = optionalRowString(row[9], "machine_id"); err != nil {
+			return nil, fmt.Errorf("result row %d: %w", index, err)
+		}
 		switch value := row[10].(type) {
 		case float64:
 			result.Distance = value
@@ -521,9 +582,56 @@ func parseResultRows(rows []Row, searchType SearchType) ([]Result, error) {
 		default:
 			return nil, fmt.Errorf("result row %d distance is not numeric", index)
 		}
+		if math.IsNaN(result.Distance) || math.IsInf(result.Distance, 0) {
+			return nil, fmt.Errorf("result row %d distance is not finite", index)
+		}
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+func parseEmbeddingRows(rows []Row) ([]float32, error) {
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		return nil, fmt.Errorf("query embedding returned an invalid row shape")
+	}
+	var vector []float32
+	switch values := rows[0][0].(type) {
+	case []float32:
+		vector = append([]float32(nil), values...)
+	case []float64:
+		vector = make([]float32, len(values))
+		for index, value := range values {
+			if math.IsNaN(value) || math.IsInf(value, 0) || value > math.MaxFloat32 || value < -math.MaxFloat32 {
+				return nil, fmt.Errorf("query embedding value %d is invalid", index)
+			}
+			vector[index] = float32(value)
+		}
+	default:
+		return nil, fmt.Errorf("query embedding vector has an invalid type")
+	}
+	if err := validateVector(vector); err != nil {
+		return nil, fmt.Errorf("query embedding: %w", err)
+	}
+	return vector, nil
+}
+
+func requiredRowString(value any, name string) (string, error) {
+	converted, ok := value.(string)
+	if !ok || converted == "" {
+		return "", fmt.Errorf("%s is not a nonempty string", name)
+	}
+	return converted, nil
+}
+
+func optionalRowString(value any, name string) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	converted, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s is neither string nor NULL", name)
+	}
+	return converted, nil
 }
 
 func hexByte(value byte) string {

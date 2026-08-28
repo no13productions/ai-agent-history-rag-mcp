@@ -19,15 +19,26 @@ type fakeExecutor struct {
 	ddl         [][]DDLStatement
 	queryRows   []Row
 	queryErr    error
+	queryQueue  []queryResponse
 	executeRows int64
 	executeErr  error
 	closeCalls  int
+}
+
+type queryResponse struct {
+	rows []Row
+	err  error
 }
 
 func (f *fakeExecutor) Query(_ context.Context, statement Statement) ([]Row, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queries = append(f.queries, statement)
+	if len(f.queryQueue) != 0 {
+		response := f.queryQueue[0]
+		f.queryQueue = f.queryQueue[1:]
+		return response.rows, response.err
+	}
 	return f.queryRows, f.queryErr
 }
 
@@ -76,7 +87,7 @@ func validConfig(strategy EmbeddingStrategy) Config {
 		EmbeddingDimension:         VectorDimension,
 		DocumentTaskType:           TaskRetrievalDocument,
 		QueryTaskType:              TaskRetrievalQuery,
-		RemoteRPCBatch:             10,
+		RemoteRPCBatch:             1,
 		EnableFullText:             true,
 		EnableANN:                  true,
 		UseANN:                     true,
@@ -114,6 +125,19 @@ func validVector() []float32 {
 	return vector
 }
 
+func validVector64() []float64 {
+	vector := make([]float64, VectorDimension)
+	vector[0] = 1
+	return vector
+}
+
+func validResultRow() Row {
+	return Row{
+		"id", "content", "turn", "session", "/project", "project",
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), nil, nil, nil, float64(0.25),
+	}
+}
+
 func TestConfigRequiresExplicitProductionEmbeddingStrategy(t *testing.T) {
 	config := validConfig("")
 	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "embedding strategy") {
@@ -123,7 +147,7 @@ func TestConfigRequiresExplicitProductionEmbeddingStrategy(t *testing.T) {
 		func() Config { c := validConfig(EmbeddingRemoteModel); c.RemoteModel = "bad"; return c }(),
 		func() Config { c := validConfig(EmbeddingRemoteModel); c.EmbeddingModel = "bad"; return c }(),
 		func() Config { c := validConfig(EmbeddingRemoteModel); c.EmbeddingDimension = 768; return c }(),
-		func() Config { c := validConfig(EmbeddingRemoteModel); c.RemoteRPCBatch = 251; return c }(),
+		func() Config { c := validConfig(EmbeddingRemoteModel); c.RemoteRPCBatch = 2; return c }(),
 		func() Config { c := validConfig(EmbeddingRemoteModel); c.BackfillConcurrency = 257; return c }(),
 		func() Config { c := validConfig(EmbeddingRemoteModel); c.BackfillBatch = 2001; return c }(),
 		func() Config { c := validConfig(EmbeddingRemoteModel); c.BackfillInterval = 9 * time.Second; return c }(),
@@ -131,6 +155,24 @@ func TestConfigRequiresExplicitProductionEmbeddingStrategy(t *testing.T) {
 		if err := bad.Validate(); err == nil {
 			t.Fatalf("Validate() accepted invalid config: %+v", bad)
 		}
+	}
+}
+
+func TestConfigClosesEmbeddingRolesRegionAndBatch(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"document role": func(config *Config) { config.DocumentTaskType = TaskRetrievalQuery },
+		"query role":    func(config *Config) { config.QueryTaskType = TaskRetrievalDocument },
+		"zone":          func(config *Config) { config.ModelLocation = "us-central1-a" },
+		"batch zero":    func(config *Config) { config.RemoteRPCBatch = 0 },
+		"batch two":     func(config *Config) { config.RemoteRPCBatch = 2 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := validConfig(EmbeddingRemoteModel)
+			mutate(&config)
+			if err := config.Validate(); err == nil {
+				t.Fatalf("Validate() accepted %+v", config)
+			}
+		})
 	}
 }
 
@@ -252,7 +294,7 @@ func TestUpsertPlansAreDeterministicAndParameterized(t *testing.T) {
 	}
 
 	deferred := validConfig(EmbeddingDeferred)
-	plan, err := BuildUpsertPlan(deferred, []Chunk{validChunk("raw")})
+	plan, err := BuildUpsertPlan(deferred, []Chunk{validChunk("abraw")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,6 +314,16 @@ func TestUpsertPlansAreDeterministicAndParameterized(t *testing.T) {
 	values := plan.Mutation.Values[0]
 	if values[0] != "embedded" || !reflect.DeepEqual(values[2], embedded.Vector) || values[17] != "machine" {
 		t.Fatalf("embedded mutation field order is wrong: %#v", values)
+	}
+}
+
+func TestDeferredUpsertRequiresReachableHexShardPrefix(t *testing.T) {
+	config := validConfig(EmbeddingDeferred)
+	if _, err := BuildUpsertPlan(config, []Chunk{validChunk("chunk-not-hex")}); err == nil {
+		t.Fatal("deferred upsert accepted an unreachable id")
+	}
+	if _, err := BuildUpsertPlan(config, []Chunk{validChunk("0achunk")}); err != nil {
+		t.Fatalf("reachable deferred id refused: %v", err)
 	}
 }
 
@@ -337,6 +389,33 @@ func TestSearchLimitRejectedBeforeExecutor(t *testing.T) {
 	}
 }
 
+func TestSearchEmbedsQueryThroughSpannerQueryTask(t *testing.T) {
+	executor := &fakeExecutor{queryQueue: []queryResponse{
+		{rows: []Row{{validVector64()}}},
+		{rows: []Row{validResultRow()}},
+	}}
+	store, err := New(validConfig(EmbeddingRemoteModel), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Search(context.Background(), Query{Text: "oauth", Limit: 1, Mode: SearchExact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].SearchType != SearchTypeExact {
+		t.Fatalf("Search() = %#v", results)
+	}
+	if len(executor.queries) != 2 || !strings.Contains(executor.queries[0].SQL, "ML.PREDICT") {
+		t.Fatalf("query embedding path = %#v", executor.queries)
+	}
+	if executor.queries[0].Params["task_type"] != TaskRetrievalQuery {
+		t.Fatalf("query task type = %#v", executor.queries[0].Params)
+	}
+	if !strings.Contains(executor.queries[0].SQL, "remote_udf_max_rows_per_rpc=1") {
+		t.Fatalf("query embedding batch is not closed: %s", executor.queries[0].SQL)
+	}
+}
+
 func TestHybridPlanUsesFTSAndRRFWithoutLosingVectorGuard(t *testing.T) {
 	query := Query{Text: "oauth", Vector: validVector(), Limit: 5, Mode: SearchAuto}
 	plan, err := BuildHybridPlan(validConfig(EmbeddingRemoteModel), query, true)
@@ -347,6 +426,47 @@ func TestHybridPlanUsesFTSAndRRFWithoutLosingVectorGuard(t *testing.T) {
 		if !strings.Contains(plan.Statement.SQL, fragment) {
 			t.Fatalf("hybrid SQL missing %q:\n%s", fragment, plan.Statement.SQL)
 		}
+	}
+}
+
+func TestHybridSearchFallsBackTruthfullyToVector(t *testing.T) {
+	executor := &fakeExecutor{queryQueue: []queryResponse{
+		{err: errors.New("full-text index unavailable")},
+		{rows: []Row{validResultRow()}},
+	}}
+	store, err := New(validConfig(EmbeddingRemoteModel), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.HybridSearch(context.Background(), Query{
+		Text: "oauth", Vector: validVector(), Limit: 1, Mode: SearchExact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].SearchType != SearchTypeExact {
+		t.Fatalf("fallback results = %#v", results)
+	}
+	if len(executor.queries) != 2 || !strings.Contains(executor.queries[0].SQL, "SEARCH(") || strings.Contains(executor.queries[1].SQL, "SEARCH(") {
+		t.Fatalf("hybrid fallback queries = %#v", executor.queries)
+	}
+}
+
+func TestResultRowsRejectMalformedFieldsAndNonfiniteDistance(t *testing.T) {
+	for name, mutate := range map[string]func(Row){
+		"chunk type": func(row Row) { row[2] = int64(1) },
+		"timestamp":  func(row Row) { row[6] = time.Time{} },
+		"optional":   func(row Row) { row[7] = int64(1) },
+		"nan":        func(row Row) { row[10] = math.NaN() },
+		"infinity":   func(row Row) { row[10] = math.Inf(1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			row := validResultRow()
+			mutate(row)
+			if _, err := parseResultRows([]Row{row}, SearchTypeExact); err == nil {
+				t.Fatalf("parseResultRows accepted %#v", row)
+			}
+		})
 	}
 }
 
@@ -457,6 +577,54 @@ func TestStatsCalculatesTypedAwaitingCount(t *testing.T) {
 	}
 	if stats.TotalChunks != 10 || stats.EmbeddedChunks != 7 || stats.AwaitingEmbedding != 3 {
 		t.Fatalf("Stats() = %#v", stats)
+	}
+}
+
+func TestStatsReportsBackfillRateAndETA(t *testing.T) {
+	config := validConfig(EmbeddingRemoteModel)
+	config.StatsCacheTTL = time.Second
+	executor := &fakeExecutor{queryQueue: []queryResponse{
+		{rows: []Row{{int64(1000), int64(700)}}},
+		{rows: []Row{{int64(1000), int64(800)}}},
+	}}
+	store, err := New(config, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	if _, err := store.Stats(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Second)
+	stats, err := store.Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.BackfillRatePerMinute != 200 || stats.BackfillETASeconds == nil || *stats.BackfillETASeconds != 60 {
+		t.Fatalf("backfill status = %#v", stats)
+	}
+}
+
+func TestChunkExistsIsBoundAndTyped(t *testing.T) {
+	executor := &fakeExecutor{queryRows: []Row{{true}}}
+	store, err := New(validConfig(EmbeddingRemoteModel), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exists, err := store.ChunkExists(context.Background(), "chunk-id")
+	if err != nil || !exists {
+		t.Fatalf("ChunkExists() = (%v, %v)", exists, err)
+	}
+	if len(executor.queries) != 1 || executor.queries[0].Params["id"] != "chunk-id" ||
+		!strings.Contains(executor.queries[0].SQL, "WHERE Id = @id") || strings.Contains(executor.queries[0].SQL, "chunk-id") {
+		t.Fatalf("chunk existence query = %#v", executor.queries)
+	}
+	if _, err := store.ChunkExists(context.Background(), " "); err == nil {
+		t.Fatal("ChunkExists accepted empty id")
+	}
+	if _, err := store.ChunkExists(context.Background(), " chunk-id"); err == nil {
+		t.Fatal("ChunkExists normalized a noncanonical id")
 	}
 }
 

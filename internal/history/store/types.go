@@ -120,19 +120,21 @@ type Result struct {
 }
 
 type Stats struct {
-	TotalChunks        int64
-	EmbeddedChunks     int64
-	AwaitingEmbedding  int64
-	Backend            string
-	Project            string
-	Instance           string
-	Database           string
-	Dimension          int
-	FullTextEnabled    bool
-	VectorIndexEnabled bool
-	VectorSearchMode   SearchMode
-	EmbeddingStrategy  EmbeddingStrategy
-	EmbeddingModel     string
+	TotalChunks           int64
+	EmbeddedChunks        int64
+	AwaitingEmbedding     int64
+	BackfillRatePerMinute float64
+	BackfillETASeconds    *float64
+	Backend               string
+	Project               string
+	Instance              string
+	Database              string
+	Dimension             int
+	FullTextEnabled       bool
+	VectorIndexEnabled    bool
+	VectorSearchMode      SearchMode
+	EmbeddingStrategy     EmbeddingStrategy
+	EmbeddingModel        string
 }
 
 type BackfillReport struct {
@@ -178,6 +180,7 @@ type Store interface {
 	Search(context.Context, Query) ([]Result, error)
 	HybridSearch(context.Context, Query) ([]Result, error)
 	Stats(context.Context) (Stats, error)
+	ChunkExists(context.Context, string) (bool, error)
 	DeleteMachine(context.Context, string) (int64, error)
 	Clear(context.Context) (int64, error)
 	Optimize(context.Context) error

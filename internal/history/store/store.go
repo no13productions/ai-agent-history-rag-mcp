@@ -21,6 +21,8 @@ type SpannerStore struct {
 	vectorIndexAvailable bool
 	statsMu              sync.Mutex
 	statsCache           *cachedStats
+	statsSample          *embeddingStatsSample
+	now                  func() time.Time
 
 	backfillShard func(context.Context, string) (int64, error)
 }
@@ -28,6 +30,11 @@ type SpannerStore struct {
 type cachedStats struct {
 	at    time.Time
 	value Stats
+}
+
+type embeddingStatsSample struct {
+	at       time.Time
+	embedded int64
 }
 
 var _ Store = (*SpannerStore)(nil)
@@ -39,7 +46,7 @@ func New(config Config, executor Executor) (*SpannerStore, error) {
 	if executor == nil {
 		return nil, fmt.Errorf("executor is required")
 	}
-	store := &SpannerStore{config: config, executor: executor}
+	store := &SpannerStore{config: config, executor: executor, now: time.Now}
 	store.backfillShard = store.runBackfillShard
 	return store, nil
 }
@@ -111,6 +118,11 @@ func (s *SpannerStore) Search(ctx context.Context, query Query) ([]Result, error
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	var err error
+	query, err = s.ensureQueryVector(ctx, query)
+	if err != nil {
+		return nil, err
+	}
 	plan, err := BuildSearchPlan(s.config, query, s.vectorIndexReady())
 	if err != nil {
 		return nil, err
@@ -122,7 +134,54 @@ func (s *SpannerStore) HybridSearch(ctx context.Context, query Query) ([]Result,
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	var err error
+	query, err = s.ensureQueryVector(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(query.Text) == "" || !s.config.EnableFullText {
+		return s.runVectorFallback(ctx, query)
+	}
 	plan, err := BuildHybridPlan(s.config, query, s.vectorIndexReady())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.executor.Query(ctx, plan.Statement)
+	if err != nil {
+		if contextErr := contextError(ctx); contextErr != nil {
+			return nil, contextErr
+		}
+		return s.runVectorFallback(ctx, query)
+	}
+	results, err := parseResultRows(rows, plan.Type)
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *SpannerStore) ensureQueryVector(ctx context.Context, query Query) (Query, error) {
+	if len(query.Vector) != 0 {
+		return query, nil
+	}
+	statement, err := BuildQueryEmbeddingPlan(s.config, query.Text)
+	if err != nil {
+		return Query{}, err
+	}
+	rows, err := s.executor.Query(ctx, statement)
+	if err != nil {
+		return Query{}, fmt.Errorf("execute query-task embedding: %w", err)
+	}
+	vector, err := parseEmbeddingRows(rows)
+	if err != nil {
+		return Query{}, err
+	}
+	query.Vector = vector
+	return query, nil
+}
+
+func (s *SpannerStore) runVectorFallback(ctx context.Context, query Query) ([]Result, error) {
+	plan, err := BuildSearchPlan(s.config, query, s.vectorIndexReady())
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +209,8 @@ func (s *SpannerStore) Stats(ctx context.Context) (Stats, error) {
 	}
 	s.statsMu.Lock()
 	defer s.statsMu.Unlock()
-	if s.statsCache != nil && time.Since(s.statsCache.at) < s.config.StatsCacheTTL {
+	now := s.now()
+	if s.statsCache != nil && now.After(s.statsCache.at) && now.Sub(s.statsCache.at) < s.config.StatsCacheTTL {
 		return s.statsCache.value, nil
 	}
 	if err := contextError(ctx); err != nil {
@@ -176,16 +236,55 @@ func (s *SpannerStore) Stats(ctx context.Context) (Stats, error) {
 	if s.config.UseANN && s.vectorIndexReady() {
 		mode = SearchANN
 	}
+	awaiting := total - embedded
+	var ratePerMinute float64
+	var etaSeconds *float64
+	if s.statsSample != nil && now.After(s.statsSample.at) && embedded >= s.statsSample.embedded {
+		elapsedMinutes := now.Sub(s.statsSample.at).Minutes()
+		if elapsedMinutes > 0 {
+			ratePerMinute = float64(embedded-s.statsSample.embedded) / elapsedMinutes
+			if ratePerMinute > 0 && awaiting > 0 {
+				value := float64(awaiting) / (ratePerMinute / 60)
+				etaSeconds = &value
+			}
+		}
+	}
 	stats := Stats{
-		TotalChunks: total, EmbeddedChunks: embedded, AwaitingEmbedding: total - embedded,
+		TotalChunks: total, EmbeddedChunks: embedded, AwaitingEmbedding: awaiting,
+		BackfillRatePerMinute: ratePerMinute, BackfillETASeconds: etaSeconds,
 		Backend: "spanner", Project: s.config.Project, Instance: s.config.Instance,
 		Database: s.config.Database, Dimension: VectorDimension,
 		FullTextEnabled: s.config.EnableFullText, VectorIndexEnabled: s.vectorIndexReady(),
 		VectorSearchMode: mode, EmbeddingStrategy: s.config.EmbeddingStrategy,
 		EmbeddingModel: EmbeddingModelName,
 	}
-	s.statsCache = &cachedStats{at: time.Now(), value: stats}
+	s.statsSample = &embeddingStatsSample{at: now, embedded: embedded}
+	s.statsCache = &cachedStats{at: now, value: stats}
 	return stats, nil
+}
+
+func (s *SpannerStore) ChunkExists(ctx context.Context, id string) (bool, error) {
+	if err := contextError(ctx); err != nil {
+		return false, err
+	}
+	if id == "" || strings.TrimSpace(id) != id || len(id) > 64 {
+		return false, fmt.Errorf("chunk id must be nonempty and at most 64 bytes")
+	}
+	rows, err := s.executor.Query(ctx, Statement{
+		SQL:    "SELECT EXISTS(SELECT 1 FROM ConversationChunks WHERE Id = @id)",
+		Params: map[string]any{"id": id},
+	})
+	if err != nil {
+		return false, fmt.Errorf("query chunk existence: %w", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		return false, fmt.Errorf("chunk existence query returned an invalid row shape")
+	}
+	exists, ok := rows[0][0].(bool)
+	if !ok {
+		return false, fmt.Errorf("chunk existence query returned a non-boolean value")
+	}
+	return exists, nil
 }
 
 func (s *SpannerStore) DeleteMachine(ctx context.Context, machineID string) (int64, error) {

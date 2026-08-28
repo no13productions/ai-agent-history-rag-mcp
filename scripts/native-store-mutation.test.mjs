@@ -69,6 +69,60 @@ const mutations = [
     from: "return ctx.Err()",
     to: "return nil",
   },
+  {
+    name: "Gemini single-row remote batch",
+    file: "internal/history/store/config.go",
+    from: "if c.RemoteRPCBatch != 1 {",
+    to: "if false {",
+  },
+  {
+    name: "exact document embedding task role",
+    file: "internal/history/store/config.go",
+    from: "if c.DocumentTaskType != TaskRetrievalDocument {",
+    to: "if false {",
+  },
+  {
+    name: "region-only model location",
+    file: "internal/history/store/config.go",
+    from: "`^[a-z]+-[a-z]+[0-9]$`",
+    to: "`^[a-z]+-[a-z]+[0-9](-[a-z])?$`",
+  },
+  {
+    name: "deferred id shard reachability",
+    file: "internal/history/store/plans.go",
+    from: "config.EmbeddingStrategy == EmbeddingDeferred && len(chunks[index].Vector) == 0 && !hasLowerHexShardPrefix(chunks[index].ID)",
+    to: "false",
+  },
+  {
+    name: "finite result distances",
+    file: "internal/history/store/plans.go",
+    from: "if math.IsNaN(result.Distance) || math.IsInf(result.Distance, 0) {",
+    to: "if false {",
+  },
+  {
+    name: "query-task ML.PREDICT binding",
+    file: "internal/history/store/plans.go",
+    from: 'Params: map[string]any{"content": text, "task_type": config.QueryTaskType},',
+    to: 'Params: map[string]any{"content": text, "task_type": config.DocumentTaskType},',
+  },
+  {
+    name: "hybrid executor vector fallback",
+    file: "internal/history/store/store.go",
+    from: "rows, err := s.executor.Query(ctx, plan.Statement)\n\tif err != nil {\n\t\tif contextErr := contextError(ctx); contextErr != nil {",
+    to: "rows, err := s.executor.Query(ctx, plan.Statement)\n\tif false {\n\t\tif contextErr := contextError(ctx); contextErr != nil {",
+  },
+  {
+    name: "chunk existence predicate",
+    file: "internal/history/store/store.go",
+    from: 'SQL:    "SELECT EXISTS(SELECT 1 FROM ConversationChunks WHERE Id = @id)",',
+    to: 'SQL:    "SELECT TRUE",',
+  },
+  {
+    name: "backfill rate computation",
+    file: "internal/history/store/store.go",
+    from: "ratePerMinute = float64(embedded-s.statsSample.embedded) / elapsedMinutes",
+    to: "ratePerMinute = 0",
+  },
 ];
 
 for (const mutation of mutations) {

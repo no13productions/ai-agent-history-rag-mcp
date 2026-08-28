@@ -133,32 +133,70 @@ func backfillRows(rows []Row) ([]Chunk, error) {
 			return nil, fmt.Errorf("backfill row %d has %d columns, want 17", index, len(row))
 		}
 		chunk := Chunk{}
+		var err error
+		if chunk.ID, err = requiredRowString(row[0], "id"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.Content, err = requiredRowString(row[1], "content"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.ChunkType, err = requiredRowString(row[2], "chunk_type"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.SessionID, err = requiredRowString(row[3], "session_id"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.ProjectPath, err = requiredRowString(row[4], "project_path"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.ProjectName, err = requiredRowString(row[5], "project_name"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
 		var ok bool
-		if chunk.ID, ok = row[0].(string); !ok {
-			return nil, fmt.Errorf("backfill row %d id is not string", index)
-		}
-		if chunk.Content, ok = row[1].(string); !ok {
-			return nil, fmt.Errorf("backfill row %d content is not string", index)
-		}
-		chunk.ChunkType, _ = row[2].(string)
-		chunk.SessionID, _ = row[3].(string)
-		chunk.ProjectPath, _ = row[4].(string)
-		chunk.ProjectName, _ = row[5].(string)
 		if chunk.Timestamp, ok = row[6].(time.Time); !ok {
 			return nil, fmt.Errorf("backfill row %d timestamp is invalid", index)
 		}
-		chunk.UserUUID, _ = row[7].(string)
-		chunk.AssistantUUID, _ = row[8].(string)
-		chunk.FilePath, _ = row[9].(string)
-		chunk.Operation, _ = row[10].(string)
-		chunk.Model, _ = row[11].(string)
-		chunk.SourceFile, _ = row[12].(string)
+		if chunk.UserUUID, err = optionalRowString(row[7], "user_uuid"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.AssistantUUID, err = optionalRowString(row[8], "assistant_uuid"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.FilePath, err = optionalRowString(row[9], "file_path"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.Operation, err = optionalRowString(row[10], "operation"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.Model, err = optionalRowString(row[11], "model"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if chunk.SourceFile, err = requiredRowString(row[12], "source_file"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
 		if chunk.SourceLine, ok = toInt64(row[13]); !ok {
 			return nil, fmt.Errorf("backfill row %d source line is invalid", index)
 		}
-		chunk.ParentChunkID, _ = row[14].(string)
-		chunk.ChildChunkIDs, _ = row[15].([]string)
-		chunk.MachineID, _ = row[16].(string)
+		if chunk.ParentChunkID, err = optionalRowString(row[14], "parent_chunk_id"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		switch childIDs := row[15].(type) {
+		case nil:
+			chunk.ChildChunkIDs = nil
+		case []string:
+			chunk.ChildChunkIDs = append([]string(nil), childIDs...)
+		default:
+			return nil, fmt.Errorf("backfill row %d child_chunk_ids is neither string array nor NULL", index)
+		}
+		if chunk.MachineID, err = optionalRowString(row[16], "machine_id"); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if err := validateChunk(chunk); err != nil {
+			return nil, fmt.Errorf("backfill row %d: %w", index, err)
+		}
+		if !hasLowerHexShardPrefix(chunk.ID) {
+			return nil, fmt.Errorf("backfill row %d id lacks a lowercase hexadecimal shard prefix", index)
+		}
 		chunks = append(chunks, chunk)
 	}
 	return chunks, nil
