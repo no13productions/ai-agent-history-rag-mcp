@@ -28,12 +28,12 @@ exact_value() {
 
 file_mode() {
   local path="$1"
-  stat -f '%Lp' -- "$path" 2>/dev/null || stat -c '%a' -- "$path" 2>/dev/null
+  stat -c '%a' -- "$path" 2>/dev/null || stat -f '%Lp' -- "$path" 2>/dev/null
 }
 
 file_owner() {
   local path="$1"
-  stat -f '%u' -- "$path" 2>/dev/null || stat -c '%u' -- "$path" 2>/dev/null
+  stat -c '%u' -- "$path" 2>/dev/null || stat -f '%u' -- "$path" 2>/dev/null
 }
 
 secure_regular_file() {
