@@ -309,12 +309,25 @@ jq -e --arg command "$MCP_SCRIPT" '
 ' "$install/config.json" >/dev/null || fail "native installer emitted unsafe or incomplete config"
 pass "native installer preserves config and projects no PSK"
 
-[[ ! -e "$ROOT_DIR/src/claude_history_rag/__main__.py" ]] || fail "legacy Python MCP entrypoint remains live"
-if grep -En 'uv run ai-agent-history-rag([[:space:]]|$)|python -m claude_history_rag' \
+legacy_python_targets=(
+  "$ROOT_DIR/src/claude_history_rag/__main__.py"
+  "$ROOT_DIR/src/claude_history_rag/installer.py"
+)
+for legacy_target in "${legacy_python_targets[@]}"; do
+  [[ ! -e "$legacy_target" ]] || fail "legacy Python MCP entrypoint remains live: $legacy_target"
+done
+if grep -REn --include='*.py' \
+  'from claude_history_rag\.installer|uv run ai-agent-history-rag-install' \
+  "$ROOT_DIR/src/claude_history_rag" >/dev/null; then
+  fail "legacy Python installer remains reachable from a tracked runtime module"
+fi
+if grep -En 'uv run ai-agent-history-rag(-install)?([[:space:]]|$)|python -m claude_history_rag' \
   "$ROOT_DIR/README.md" "$ROOT_DIR/CLAUDE.md" "$ROOT_DIR/scripts/start.sh" >/dev/null; then
   fail "documented or scripted legacy MCP launch route remains"
 fi
+grep -Eq '^ai-agent-history-rag = "claude_history_rag\.__main__:main"$' "$ROOT_DIR/pyproject.toml" || fail "legacy MCP manifest sentinel changed without the packaging owner"
+grep -Eq '^ai-agent-history-rag-install = "claude_history_rag\.installer:main"$' "$ROOT_DIR/pyproject.toml" || fail "legacy installer manifest sentinel changed without the packaging owner"
 grep -Eq 'history-rag-mcp-native.sh' "$ROOT_DIR/scripts/start.sh" || fail "start helper does not select native MCP"
-pass "legacy Python MCP launch routes are closed"
+pass "legacy Python MCP launch and installer routes fail closed"
 
 printf 'PASS total=%d\n' "$PASS_COUNT"

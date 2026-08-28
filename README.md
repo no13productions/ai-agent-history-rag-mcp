@@ -134,28 +134,12 @@ pip install -e ".[client]"
 
 ## Quick Start
 
-### Daemon Wizard and Native MCP Install
+### Native MCP Install
 
-The existing wizard configures the indexing daemon and its settings:
-
-```bash
-uv run ai-agent-history-rag-install
-```
-
-The wizard will:
-1. Configure the daemon service and runtime settings
-2. Configure server mode (local) or client mode (multi-machine)
-2.5. **Update mode** (new): reuses existing daemon config (from the service) to reinstall without prompts
-3. Detect installed AI tools (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, OpenAI Codex)
-4. Preserve existing client discovery for removal and migration
-5. Install daemon as a system service (launchd/systemd/Windows Task) — removing any existing service first to ensure updates apply
-6. Prompt for **PSK authentication** settings (optional PSK overrides + auth paths)
-7. **Verify installation** - waits for daemon startup and runs health checks
-
-Note: ChatGPT connectors are configured in-app (Developer mode) and are not managed by this installer.
-
-The production MCP path is the native STDIO proxy. After exporting the complete
-production environment shown below, install it into a JSON client config with:
+The retired Python wizard is not a supported installation path. Configure the daemon
+with the platform service scripts, then install the production MCP STDIO proxy only
+through its native, production-gated installer. After exporting the complete production
+environment shown below, write the proxy into a JSON client config with:
 
 ```bash
 ./scripts/history-rag-mcp-native.sh \
@@ -163,10 +147,12 @@ production environment shown below, install it into a JSON client config with:
   "$(pwd)/scripts/history-rag-mcp-native.sh"
 ```
 
-The installer validates the same production shape as the daemon before writing the
-client entry. It never embeds the daemon PSK, and an impersonated ADC profile is
-accepted only when its nested source is a keyless `authorized_user` profile with no
-private-key fields, delegates, target drift, symlink, or permissive file mode.
+The native installer validates the same production shape as the daemon before writing
+the client entry. It preserves unrelated JSON keys, writes an owner-only file, and never
+embeds the daemon PSK. An impersonated ADC profile is accepted only when its nested
+source is a keyless `authorized_user` profile with no private-key fields, delegates,
+target drift, symlink, or permissive file mode. JSON clients with a different wrapper
+shape must be migrated explicitly; the installer does not guess or rewrite them.
 
 ### Docker (Server Only)
 
@@ -544,11 +530,10 @@ separate native proxy:
 |---------|-------------|
 | `scripts/history-rag-mcp-native.sh` | Production-gated MCP STDIO proxy to the loopback daemon |
 | `ai-agent-history-rag-daemon` | Background daemon for indexing |
-| `ai-agent-history-rag-install` | Interactive installation wizard |
-| `ai-agent-history-rag-doctor` | Diagnostic and troubleshooting tool |
 | `ai-agent-history-rag-settings` | Interactive settings wizard |
-| `ai-agent-history-rag-uninstall` | Uninstall wizard (removes configs/services/data) |
-| `ai-agent-history-rag-docker` | Docker deployment wizard for central server |
+| `scripts/status.sh` | Native daemon status and log inspection |
+| `scripts/cleanup.sh` | Native cleanup helper |
+| `docker compose` | Declarative Docker deployment path |
 
 Run daemon-management commands with their existing package launcher. MCP clients
 must execute the native proxy directly.
@@ -912,51 +897,19 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 
 ## Troubleshooting
 
-### Diagnostic Tool
+### Native Diagnostics
 
-Run the doctor command for comprehensive system diagnostics:
+Inspect the daemon and validate the MCP production boundary without invoking a Python
+wizard:
 
 ```bash
-uv run ai-agent-history-rag-doctor
+./scripts/status.sh
+./scripts/history-rag-mcp-native.sh --validate-only
 ```
 
-The doctor checks:
-- **Configuration** - validates settings and detects client/server mode
-- **Daemon Status** - verifies the daemon is running (checks PID file)
-- **Port Availability** - checks if port 4680 is in use and by what process
-- **Service Connectivity** - tests connection to embedding server or central server
-- **File System** - validates database and projects directories exist
-- **Recent Logs** - displays last 10 log entries with error highlighting
-- **Environment Variables** - shows configured env vars
-- **Service Installation** - checks launchd/systemd/Windows task status
-
-Cross-platform support: macOS (launchd), Linux (systemd), Windows (scheduled tasks).
-
-Example output:
-```
-============================================================
-                 AI Agent History RAG Doctor
-============================================================
-
-Configuration
-  ✓ Configuration loaded successfully
-  → Mode: CLIENT (connecting to http://192.168.1.100:4680)
-  → Machine ID: my-laptop
-
-Daemon Status
-  ✓ Daemon is running (PID 12345)
-
-Service Connectivity
-  ✓ Central server is reachable (HTTP 200)
-
-...
-
-============================================================
-                          Summary
-============================================================
-
-All checks passed!
-```
+The first command reports daemon and log state. The second fails closed unless the
+complete production runtime and credential contract is valid; it performs no MCP
+handler or daemon network call during validation.
 
 ### Client can't connect to server
 
