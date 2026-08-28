@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -103,8 +104,8 @@ func (s *SpannerStore) Upsert(ctx context.Context, chunks []Chunk) error {
 		if err != nil {
 			return err
 		}
-		if affected < 0 || affected > int64(len(chunks)) {
-			return fmt.Errorf("remote-model affected count %d is invalid for batch %d", affected, len(chunks))
+		if affected != int64(len(chunks)) {
+			return fmt.Errorf("remote-model affected count %d does not match batch %d", affected, len(chunks))
 		}
 		return nil
 	}); err != nil {
@@ -148,6 +149,9 @@ func (s *SpannerStore) HybridSearch(ctx context.Context, query Query) ([]Result,
 	}
 	rows, err := s.executor.Query(ctx, plan.Statement)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		if contextErr := contextError(ctx); contextErr != nil {
 			return nil, contextErr
 		}

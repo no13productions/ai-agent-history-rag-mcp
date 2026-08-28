@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -317,6 +318,29 @@ func TestUpsertPlansAreDeterministicAndParameterized(t *testing.T) {
 	}
 }
 
+func TestRemoteModelUpsertRequiresExactAffectedCount(t *testing.T) {
+	for _, affected := range []int64{0, 2} {
+		t.Run(fmt.Sprintf("affected_%d", affected), func(t *testing.T) {
+			executor := &fakeExecutor{executeRows: affected}
+			store, err := New(validConfig(EmbeddingRemoteModel), executor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Upsert(context.Background(), []Chunk{validChunk("raw")}); err == nil {
+				t.Fatalf("Upsert() accepted affected count %d for one chunk", affected)
+			}
+		})
+	}
+	executor := &fakeExecutor{executeRows: 1}
+	store, err := New(validConfig(EmbeddingRemoteModel), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(context.Background(), []Chunk{validChunk("raw")}); err != nil {
+		t.Fatalf("Upsert() refused exact affected count: %v", err)
+	}
+}
+
 func TestDeferredUpsertRequiresReachableHexShardPrefix(t *testing.T) {
 	config := validConfig(EmbeddingDeferred)
 	if _, err := BuildUpsertPlan(config, []Chunk{validChunk("chunk-not-hex")}); err == nil {
@@ -449,6 +473,30 @@ func TestHybridSearchFallsBackTruthfullyToVector(t *testing.T) {
 	}
 	if len(executor.queries) != 2 || !strings.Contains(executor.queries[0].SQL, "SEARCH(") || strings.Contains(executor.queries[1].SQL, "SEARCH(") {
 		t.Fatalf("hybrid fallback queries = %#v", executor.queries)
+	}
+}
+
+func TestHybridSearchNeverSwallowsExecutorCancellation(t *testing.T) {
+	for _, cancellation := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cancellation.Error(), func(t *testing.T) {
+			executor := &fakeExecutor{queryQueue: []queryResponse{
+				{err: cancellation},
+				{rows: []Row{validResultRow()}},
+			}}
+			store, err := New(validConfig(EmbeddingRemoteModel), executor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = store.HybridSearch(context.Background(), Query{
+				Text: "oauth", Vector: validVector(), Limit: 1, Mode: SearchExact,
+			})
+			if !errors.Is(err, cancellation) {
+				t.Fatalf("HybridSearch() error = %v, want %v", err, cancellation)
+			}
+			if len(executor.queries) != 1 {
+				t.Fatalf("HybridSearch() issued %d queries after cancellation", len(executor.queries))
+			}
+		})
 	}
 }
 

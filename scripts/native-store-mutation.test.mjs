@@ -108,8 +108,8 @@ const mutations = [
   {
     name: "hybrid executor vector fallback",
     file: "internal/history/store/store.go",
-    from: "rows, err := s.executor.Query(ctx, plan.Statement)\n\tif err != nil {\n\t\tif contextErr := contextError(ctx); contextErr != nil {",
-    to: "rows, err := s.executor.Query(ctx, plan.Statement)\n\tif false {\n\t\tif contextErr := contextError(ctx); contextErr != nil {",
+    from: "rows, err := s.executor.Query(ctx, plan.Statement)\n\tif err != nil {\n\t\tif errors.Is(err, context.Canceled)",
+    to: "rows, err := s.executor.Query(ctx, plan.Statement)\n\tif false {\n\t\tif errors.Is(err, context.Canceled)",
   },
   {
     name: "chunk existence predicate",
@@ -122,6 +122,18 @@ const mutations = [
     file: "internal/history/store/store.go",
     from: "ratePerMinute = float64(embedded-s.statsSample.embedded) / elapsedMinutes",
     to: "ratePerMinute = 0",
+  },
+  {
+    name: "exact remote-model affected count",
+    file: "internal/history/store/store.go",
+    from: "if affected != int64(len(chunks)) {",
+    to: "if false {",
+  },
+  {
+    name: "hybrid executor cancellation propagation",
+    file: "internal/history/store/store.go",
+    from: "if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {",
+    to: "if false {",
   },
 ];
 
