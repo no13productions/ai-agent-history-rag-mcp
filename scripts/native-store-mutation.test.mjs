@@ -135,6 +135,12 @@ const mutations = [
     from: "if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {",
     to: "if false {",
   },
+  {
+    name: "backfill exact remote-model affected count",
+    file: "internal/history/store/backfill.go",
+    from: "if count != int64(len(chunks)) {",
+    to: "if false {",
+  },
 ];
 
 for (const mutation of mutations) {

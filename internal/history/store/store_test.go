@@ -595,6 +595,41 @@ func TestBackfillReadPlanIsBoundedAndNullOnly(t *testing.T) {
 	}
 }
 
+func TestBackfillRemoteModelRequiresExactAffectedCount(t *testing.T) {
+	row := Row{
+		"0achunk", "content", "turn", "session", "/project", "project",
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), nil, nil, nil, nil, nil,
+		"/source.jsonl", int64(1), nil, []string(nil), "machine",
+	}
+	for _, affected := range []int64{0, 2} {
+		t.Run(fmt.Sprintf("affected_%d", affected), func(t *testing.T) {
+			executor := &fakeExecutor{
+				queryQueue:  []queryResponse{{rows: []Row{row}}, {rows: nil}},
+				executeRows: affected,
+			}
+			store, err := New(validConfig(EmbeddingDeferred), executor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if embedded, err := store.runBackfillShard(context.Background(), "0a"); err == nil || embedded != 0 {
+				t.Fatalf("runBackfillShard() = (%d, %v), want exact-count refusal", embedded, err)
+			}
+		})
+	}
+
+	executor := &fakeExecutor{
+		queryQueue:  []queryResponse{{rows: []Row{row}}, {rows: nil}},
+		executeRows: 1,
+	}
+	store, err := New(validConfig(EmbeddingDeferred), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if embedded, err := store.runBackfillShard(context.Background(), "0a"); err != nil || embedded != 1 {
+		t.Fatalf("runBackfillShard() = (%d, %v), want (1, nil)", embedded, err)
+	}
+}
+
 func TestBackfillIsolatesShardFailureAndPreservesNullRetry(t *testing.T) {
 	executor := &fakeExecutor{}
 	store, _ := New(validConfig(EmbeddingDeferred), executor)

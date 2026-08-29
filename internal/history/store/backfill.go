@@ -118,8 +118,8 @@ func (s *SpannerStore) runBackfillShard(ctx context.Context, prefix string) (int
 		if err != nil {
 			return embedded, fmt.Errorf("embed NULL-vector batch: %w", err)
 		}
-		if count < 0 || count > int64(len(chunks)) {
-			return embedded, fmt.Errorf("remote-model affected count %d is invalid for batch %d", count, len(chunks))
+		if count != int64(len(chunks)) {
+			return embedded, fmt.Errorf("remote-model affected count %d does not match batch %d", count, len(chunks))
 		}
 		embedded += count
 	}
