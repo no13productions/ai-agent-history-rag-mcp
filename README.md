@@ -134,25 +134,25 @@ pip install -e ".[client]"
 
 ## Quick Start
 
-### Install Wizard (Recommended)
+### Native MCP Install
 
-The install wizard configures everything for you - MCP servers, daemon service, and all settings:
+The retired Python wizard is not a supported installation path. Configure the daemon
+with the platform service scripts, then install the production MCP STDIO proxy only
+through its native, production-gated installer. After exporting the complete production
+environment shown below, write the proxy into a JSON client config with:
 
 ```bash
-uv run ai-agent-history-rag-install
+./scripts/history-rag-mcp-native.sh \
+  --install-json "$HOME/.claude.json" \
+  "$(pwd)/scripts/history-rag-mcp-native.sh"
 ```
 
-The wizard will:
-1. Ask whether to install MCP server, daemon, or both
-2. Configure server mode (local) or client mode (multi-machine)
-2.5. **Update mode** (new): reuses existing daemon config (from the service) to reinstall without prompts
-3. Detect installed AI tools (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, OpenAI Codex)
-4. Add MCP configuration to selected applications
-5. Install daemon as a system service (launchd/systemd/Windows Task) — removing any existing service first to ensure updates apply
-6. Prompt for **PSK authentication** settings (optional PSK overrides + auth paths)
-7. **Verify installation** - waits for daemon startup and runs health checks
-
-Note: ChatGPT connectors are configured in-app (Developer mode) and are not managed by this installer.
+The native installer validates the same production shape as the daemon before writing
+the client entry. It preserves unrelated JSON keys, writes an owner-only file, and never
+embeds the daemon PSK. An impersonated ADC profile is accepted only when its nested
+source is a keyless `authorized_user` profile with no private-key fields, delegates,
+target drift, symlink, or permissive file mode. JSON clients with a different wrapper
+shape must be migrated explicitly; the installer does not guess or rewrite them.
 
 ### Docker (Server Only)
 
@@ -262,20 +262,25 @@ export CLAUDE_HISTORY_RAG_EMBEDDING_MODEL=gemini-embedding-001
 export CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION=3072
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST=127.0.0.1
 export CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT=4680
-export GOOGLE_APPLICATION_CREDENTIALS=<path-to-your-service-account-key.json>
+export CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE=application_default
+export CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE=impersonated_service_account
+export CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY=<dedicated-runtime-service-account>
+export GOOGLE_APPLICATION_CREDENTIALS=<path-to-keyless-impersonated-adc-profile.json>
 export GOOGLE_CLOUD_PROJECT=<your-gcp-project>
 uv run ai-agent-history-rag-daemon start
 ```
 
 These are deployment-specific and this repository is public, so it ships placeholders
-rather than any real project, instance or key path. `scripts/install-launchd.sh` reads
+rather than any real project or instance. `scripts/install-launchd.sh` reads
 the same variables from your environment and fails with a readable message if they are
 unset, instead of generating a launch agent pointed at somebody else's project.
 
 The launchd source at `scripts/com.ai-agent-history-rag.daemon.plist.template` pins the same contract, including:
 - watch roots: `~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`, `~/.gemini/antigravity`, `~/.claude-history-rag/imports/chatgpt`, and `~/.claude-history-rag/imports/claude-app`
 - state/auth roots: `~/.claude-history-rag/*.json`
-- credential path: substituted from `GOOGLE_APPLICATION_CREDENTIALS` at install time
+- credentials: a short-lived, exact-target impersonated ADC profile for the local daemon;
+  `GOOGLE_APPLICATION_CREDENTIALS` is only the standard ADC carrier and the runtime rejects
+  service-account-key JSON, private-key fields, target drift, and broad gcloud-user fallback
 
 On another workstation, point at that server and use a stable machine id:
 
@@ -292,28 +297,32 @@ Each workstation watches its local Claude Code, Codex, Gemini, Antigravity, Chat
 
 ### Claude Code MCP Settings
 
-#### Option 1: Using `claude mcp add-json` (Easiest)
+#### Option 1: Using `claude mcp add-json`
 
-**Server Mode (default)**:
+The daemon must already be running under the production contract. Point the client
+at the native proxy and project the same non-secret production environment:
+
 ```bash
 claude mcp add-json ai-agent-history-rag '{
-  "command": "uv",
-  "args": ["--directory", "/path/to/claude-history-rag-mcp", "run", "ai-agent-history-rag"],
+  "command": "/path/to/claude-history-rag-mcp/scripts/history-rag-mcp-native.sh",
+  "args": [],
   "env": {
-    "CLAUDE_HISTORY_RAG_DEFER_STARTUP_INDEXING": "true"
-  }
-}'
-```
-
-**Client Mode (multi-machine)**:
-```bash
-claude mcp add-json ai-agent-history-rag '{
-  "command": "uv",
-  "args": ["--directory", "/path/to/claude-history-rag-mcp", "run", "ai-agent-history-rag"],
-  "env": {
-    "CLAUDE_HISTORY_RAG_SERVER_URL": "http://192.168.1.100:4680",
-    "CLAUDE_HISTORY_RAG_MACHINE_ID": "my-laptop",
-    "CLAUDE_HISTORY_RAG_CLIENT_NAME": "Brandon MacBook"
+    "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
+    "CLAUDE_HISTORY_RAG_STORAGE_BACKEND": "spanner",
+    "CLAUDE_HISTORY_RAG_SPANNER_PROJECT": "<your-gcp-project>",
+    "CLAUDE_HISTORY_RAG_SPANNER_INSTANCE": "<your-spanner-instance>",
+    "CLAUDE_HISTORY_RAG_SPANNER_DATABASE": "ai-agent-history-rag",
+    "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE": "spanner",
+    "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID": "ConversationEmbeddingModel",
+    "CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER": "vertex",
+    "CLAUDE_HISTORY_RAG_EMBEDDING_MODEL": "gemini-embedding-001",
+    "CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION": "3072",
+    "CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST": "127.0.0.1",
+    "CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT": "4680",
+    "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
+    "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE": "impersonated_service_account",
+    "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY": "<dedicated-runtime-service-account>",
+    "GOOGLE_APPLICATION_CREDENTIALS": "<path-to-keyless-impersonated-adc-profile.json>"
   }
 }'
 ```
@@ -324,32 +333,29 @@ Replace `/path/to/claude-history-rag-mcp` with your actual project path.
 
 Add to `~/.config/Claude/claude_desktop_config.json`:
 
-**Server Mode**:
 ```json
 {
   "mcpServers": {
     "ai-agent-history-rag": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/claude-history-rag-mcp", "run", "ai-agent-history-rag"],
+      "command": "/path/to/claude-history-rag-mcp/scripts/history-rag-mcp-native.sh",
+      "args": [],
       "env": {
-        "CLAUDE_HISTORY_RAG_EMBEDDING_BASE_URL": "http://localhost:11434/v1",
-        "CLAUDE_HISTORY_RAG_EMBEDDING_MODEL": "nomic-embed-text"
-      }
-    }
-  }
-}
-```
-
-**Client Mode**:
-```json
-{
-  "mcpServers": {
-    "ai-agent-history-rag": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/claude-history-rag-mcp", "run", "ai-agent-history-rag"],
-      "env": {
-        "CLAUDE_HISTORY_RAG_SERVER_URL": "http://192.168.1.100:4680",
-        "CLAUDE_HISTORY_RAG_CLIENT_NAME": "Brandon MacBook"
+        "CLAUDE_HISTORY_RAG_RUNTIME_CONTRACT": "production",
+        "CLAUDE_HISTORY_RAG_STORAGE_BACKEND": "spanner",
+        "CLAUDE_HISTORY_RAG_SPANNER_PROJECT": "<your-gcp-project>",
+        "CLAUDE_HISTORY_RAG_SPANNER_INSTANCE": "<your-spanner-instance>",
+        "CLAUDE_HISTORY_RAG_SPANNER_DATABASE": "ai-agent-history-rag",
+        "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODE": "spanner",
+        "CLAUDE_HISTORY_RAG_SPANNER_EMBEDDING_MODEL_ID": "ConversationEmbeddingModel",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_PROVIDER": "vertex",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_MODEL": "gemini-embedding-001",
+        "CLAUDE_HISTORY_RAG_EMBEDDING_DIMENSION": "3072",
+        "CLAUDE_HISTORY_RAG_STATUS_SERVER_HOST": "127.0.0.1",
+        "CLAUDE_HISTORY_RAG_STATUS_SERVER_PORT": "4680",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_SOURCE": "application_default",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_PROFILE": "impersonated_service_account",
+        "CLAUDE_HISTORY_RAG_CREDENTIALS_IDENTITY": "<dedicated-runtime-service-account>",
+        "GOOGLE_APPLICATION_CREDENTIALS": "<path-to-keyless-impersonated-adc-profile.json>"
       }
     }
   }
@@ -517,19 +523,20 @@ uv run ai-agent-history-rag-daemon restart
 
 ## CLI Commands
 
-The package provides seven command-line tools:
+The daemon package provides its existing management tools. Production MCP uses the
+separate native proxy:
 
 | Command | Description |
 |---------|-------------|
-| `ai-agent-history-rag` | MCP server (lightweight mode by default) |
+| `scripts/history-rag-mcp-native.sh` | Production-gated MCP STDIO proxy to the loopback daemon |
 | `ai-agent-history-rag-daemon` | Background daemon for indexing |
-| `ai-agent-history-rag-install` | Interactive installation wizard |
-| `ai-agent-history-rag-doctor` | Diagnostic and troubleshooting tool |
 | `ai-agent-history-rag-settings` | Interactive settings wizard |
-| `ai-agent-history-rag-uninstall` | Uninstall wizard (removes configs/services/data) |
-| `ai-agent-history-rag-docker` | Docker deployment wizard for central server |
+| `scripts/status.sh` | Native daemon status and log inspection |
+| `scripts/cleanup.sh` | Native cleanup helper |
+| `docker compose` | Declarative Docker deployment path |
 
-Run with `uv run <command>` or directly if installed globally.
+Run daemon-management commands with their existing package launcher. MCP clients
+must execute the native proxy directly.
 
 ## Running Modes
 
@@ -567,13 +574,12 @@ Starting daemon [SERVER] | db=~/.claude-history-rag/lancedb | embedding_url=http
 Starting daemon [CLIENT] | server_url=http://192.168.1.100:4680 | machine_id=my-laptop
 ```
 
-### Standalone Mode
+### MCP Process Model
 
-Run everything in a single process:
-
-```bash
-uv run ai-agent-history-rag --standalone
-```
+The MCP process is intentionally not a standalone indexer. It validates the full
+production runtime and credential contract before entering the STDIO loop, then
+proxies the five tools to the already-running loopback daemon. The retired Python
+console path fails closed and cannot reach Spanner or Vertex.
 
 ### Auto-start on Boot
 
@@ -784,7 +790,7 @@ uv run ruff format .
 ### Testing with MCP Inspector
 
 ```bash
-npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
+npx @modelcontextprotocol/inspector ./scripts/history-rag-mcp-native.sh
 ```
 
 ## Detailed Architecture
@@ -807,14 +813,13 @@ npx @modelcontextprotocol/inspector uv run ai-agent-history-rag
                                                     │
                                                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   MCP Server Process                        │
-│  (ai-agent-history-rag - lightweight mode)                    │
+│                   MCP Proxy Process                         │
+│  (scripts/history-rag-mcp-native.sh)                        │
 │                                                             │
 │     Claude Code ◄──► STDIO Transport ◄──► MCP Tools         │
 │                                               │             │
 │                                               ▼             │
-│                                           LanceDB           │
-│                                           (queries)         │
+│                                  Loopback daemon API        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -892,51 +897,19 @@ Each chunk includes `machine_id` in multi-machine mode for tracking origin.
 
 ## Troubleshooting
 
-### Diagnostic Tool
+### Native Diagnostics
 
-Run the doctor command for comprehensive system diagnostics:
+Inspect the daemon and validate the MCP production boundary without invoking a Python
+wizard:
 
 ```bash
-uv run ai-agent-history-rag-doctor
+./scripts/status.sh
+./scripts/history-rag-mcp-native.sh --validate-only
 ```
 
-The doctor checks:
-- **Configuration** - validates settings and detects client/server mode
-- **Daemon Status** - verifies the daemon is running (checks PID file)
-- **Port Availability** - checks if port 4680 is in use and by what process
-- **Service Connectivity** - tests connection to embedding server or central server
-- **File System** - validates database and projects directories exist
-- **Recent Logs** - displays last 10 log entries with error highlighting
-- **Environment Variables** - shows configured env vars
-- **Service Installation** - checks launchd/systemd/Windows task status
-
-Cross-platform support: macOS (launchd), Linux (systemd), Windows (scheduled tasks).
-
-Example output:
-```
-============================================================
-                 AI Agent History RAG Doctor
-============================================================
-
-Configuration
-  ✓ Configuration loaded successfully
-  → Mode: CLIENT (connecting to http://192.168.1.100:4680)
-  → Machine ID: my-laptop
-
-Daemon Status
-  ✓ Daemon is running (PID 12345)
-
-Service Connectivity
-  ✓ Central server is reachable (HTTP 200)
-
-...
-
-============================================================
-                          Summary
-============================================================
-
-All checks passed!
-```
+The first command reports daemon and log state. The second fails closed unless the
+complete production runtime and credential contract is valid; it performs no MCP
+handler or daemon network call during validation.
 
 ### Client can't connect to server
 

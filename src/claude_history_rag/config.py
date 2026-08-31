@@ -1,9 +1,11 @@
 """Configuration management."""
 
+import json
 import logging
 import os
 import re
 import socket
+import stat
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -24,22 +26,25 @@ OPTIMIZE_INTERVAL = 900
 # LanceDB/Ollama defaults is the failure this contract exists to catch, so these are still
 # exact equality checks against the constants below.
 #
-# IDENTITY fields — which GCP project, which Spanner instance, which key file — are
-# deployment-specific. They are checked for PRESENCE, not against a fixed value. There is
+# IDENTITY fields — which GCP project and which Spanner instance — are deployment-specific.
+# They are checked for PRESENCE, not against a fixed value. There is
 # no correct literal for them in a general-purpose tool, and hardcoding one is what
 # published this operator's project id, instance id and account name from a public
 # repository.
 #
 # Presence-checking keeps the whole point of the contract: a production daemon still
 # cannot start pointed at LanceDB, still cannot start with an unconfigured Spanner target,
-# and still cannot start without credentials. It just no longer asserts WHICH target,
-# which was never this file's business.
-#
-# Practical consequence, and the reason it is done this way: an operator whose launch
-# agent already sets CLAUDE_HISTORY_RAG_SPANNER_PROJECT / _INSTANCE / _DATABASE and
-# GOOGLE_APPLICATION_CREDENTIALS needs to change NOTHING. No new variables, no parallel
-# set of expectations to keep in sync with the real ones.
+# and still cannot start with an implicit or file-selected credential path. It just no
+# longer asserts WHICH target, which was never this file's business.
 PRODUCTION_RUNTIME_CONTRACT = "production"
+PRODUCTION_CREDENTIALS_SOURCE = "application_default"
+PRODUCTION_CREDENTIALS_PROFILES = frozenset(
+    {"attached_service_account", "impersonated_service_account"}
+)
+SERVICE_ACCOUNT_EMAIL_PATTERN = re.compile(
+    r"^[a-z][a-z0-9-]{4,28}[a-z0-9]@"
+    r"[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$"
+)
 PRODUCTION_SPANNER_EMBEDDING_MODEL_ID = "ConversationEmbeddingModel"
 PRODUCTION_EMBEDDING_PROVIDER = "vertex"
 PRODUCTION_EMBEDDING_MODEL = "gemini-embedding-001"
@@ -157,6 +162,9 @@ class Settings(BaseSettings):
     # General Settings
     # ============================================================
     runtime_contract: str = ""
+    credentials_source: str = ""
+    credentials_profile: str = ""
+    credentials_identity: str = ""
     log_level: str = "INFO"
     debounce_delay: int = 5000  # Debounce delay in milliseconds
     batch_size: int = 32  # Embedding batch size
@@ -295,6 +303,34 @@ class Settings(BaseSettings):
         if contract not in {"", PRODUCTION_RUNTIME_CONTRACT}:
             raise ValueError("runtime_contract must be empty or production")
         return contract
+
+    @field_validator("credentials_source")
+    @classmethod
+    def validate_credentials_source(cls, v: str) -> str:
+        """Keep the credential selector closed; production narrows it to keyless ADC."""
+        source = v.strip()
+        if source not in {"", PRODUCTION_CREDENTIALS_SOURCE}:
+            raise ValueError("credentials_source must be empty or application_default")
+        return source
+
+    @field_validator("credentials_profile")
+    @classmethod
+    def validate_credentials_profile(cls, v: str) -> str:
+        """Keep the production ADC realization profile closed."""
+        profile = v.strip()
+        if profile not in {"", *PRODUCTION_CREDENTIALS_PROFILES}:
+            allowed = ", ".join(sorted(PRODUCTION_CREDENTIALS_PROFILES))
+            raise ValueError(f"credentials_profile must be empty or one of: {allowed}")
+        return profile
+
+    @field_validator("credentials_identity")
+    @classmethod
+    def validate_credentials_identity(cls, v: str) -> str:
+        """Validate an optional exact Google service-account identity."""
+        identity = v.strip()
+        if identity and not SERVICE_ACCOUNT_EMAIL_PATTERN.fullmatch(identity):
+            raise ValueError("credentials_identity must be a service-account email")
+        return identity
 
     @field_validator("embedding_dimension")
     @classmethod
@@ -627,12 +663,73 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def _contains_private_key_fields(value: object) -> bool:
+    """Detect exportable private-key markers anywhere in a credential document."""
+    if isinstance(value, dict):
+        if {"private_key", "private_key_id"} & {str(key) for key in value}:
+            return True
+        return any(_contains_private_key_fields(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_private_key_fields(child) for child in value)
+    return False
+
+
+def _validate_impersonated_adc_file(path_value: str, expected_identity: str) -> list[str]:
+    """Validate that an ADC carrier is keyless and targets one exact service account."""
+    errors: list[str] = []
+    credential_path = Path(path_value).expanduser()
+    try:
+        resolved_path = credential_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return [f"GOOGLE_APPLICATION_CREDENTIALS cannot be resolved: {exc}"]
+
+    try:
+        mode = stat.S_IMODE(resolved_path.stat().st_mode)
+    except OSError as exc:
+        return [f"GOOGLE_APPLICATION_CREDENTIALS cannot be inspected: {exc}"]
+    if mode & 0o077:
+        errors.append("GOOGLE_APPLICATION_CREDENTIALS must be owner-readable only")
+
+    try:
+        payload = json.loads(resolved_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [*errors, f"GOOGLE_APPLICATION_CREDENTIALS is not valid JSON: {exc}"]
+    if not isinstance(payload, dict):
+        return [*errors, "GOOGLE_APPLICATION_CREDENTIALS must contain a JSON object"]
+
+    if payload.get("type") != "impersonated_service_account":
+        errors.append(
+            "GOOGLE_APPLICATION_CREDENTIALS must be an impersonated_service_account ADC profile"
+        )
+    if _contains_private_key_fields(payload):
+        errors.append("GOOGLE_APPLICATION_CREDENTIALS must not contain private key material")
+
+    source = payload.get("source_credentials")
+    if not isinstance(source, dict) or source.get("type") != "authorized_user":
+        errors.append(
+            "impersonated ADC source_credentials must be the keyless authorized_user profile "
+            "emitted by gcloud ADC impersonation"
+        )
+    elif not all(source.get(field) for field in ("client_id", "client_secret", "refresh_token")):
+        errors.append("impersonated ADC authorized_user source is incomplete")
+
+    if payload.get("delegates") not in (None, []):
+        errors.append("impersonated ADC delegates must be absent")
+
+    expected_url = (
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+        f"{expected_identity}:generateAccessToken"
+    )
+    if payload.get("service_account_impersonation_url") != expected_url:
+        errors.append("impersonated ADC target identity does not match credentials_identity")
+    return errors
+
+
 def validate_production_runtime_contract(
     settings_obj: Settings | None = None,
     environ: dict[str, str] | None = None,
-    credential_path: Path | None = None,
 ) -> None:
-    """Fail loudly when the production launch contract drifts or omits credentials."""
+    """Fail loudly when production drifts from keyless Application Default Credentials."""
     current = settings_obj or settings
     if current.runtime_contract != PRODUCTION_RUNTIME_CONTRACT:
         return
@@ -662,6 +759,7 @@ def validate_production_runtime_contract(
         "embedding_dimension": (PRODUCTION_EMBEDDING_DIMENSION, current.embedding_dimension),
         "status_server_host": (PRODUCTION_STATUS_SERVER_HOST, current.status_server_host),
         "status_server_port": (PRODUCTION_STATUS_SERVER_PORT, current.status_server_port),
+        "credentials_source": (PRODUCTION_CREDENTIALS_SOURCE, current.credentials_source),
     }
     for field_name, expected_path in PRODUCTION_SOURCE_PATHS.items():
         expected_values[field_name] = (str(expected_path), str(getattr(current, field_name)))
@@ -670,18 +768,30 @@ def validate_production_runtime_contract(
         if actual != expected:
             errors.append(f"{field_name}={actual!r} expected {expected!r}")
 
-    # Credentials: require that a key is configured and that the file is really there.
-    # Which path it is remains the deployment's business. `credential_path` is still an
-    # explicit override so tests can point at a temp file.
-    credential = (
-        str(credential_path) if credential_path else env.get("GOOGLE_APPLICATION_CREDENTIALS")
-    )
-    if not credential:
+    if current.credentials_profile not in PRODUCTION_CREDENTIALS_PROFILES:
         errors.append(
-            "GOOGLE_APPLICATION_CREDENTIALS must be set for runtime_contract='production'"
+            "credentials_profile must select attached_service_account or "
+            "impersonated_service_account for runtime_contract='production'"
         )
-    elif not Path(credential).exists():
-        errors.append(f"credential file missing: {credential}")
+    if not current.credentials_identity:
+        errors.append("credentials_identity must be set for runtime_contract='production'")
+
+    # CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE changes gcloud itself and bypasses the ADC
+    # search contract. The application accepts only GOOGLE_APPLICATION_CREDENTIALS as the
+    # standard ADC carrier, and only when its JSON is a keyless, exact-target impersonated
+    # profile. Attached workloads use the metadata server and carry no file selector.
+    if env.get("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"):
+        errors.append(
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE must be unset for runtime_contract='production'"
+        )
+    adc_path = env.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if current.credentials_profile == "impersonated_service_account":
+        if not adc_path:
+            errors.append("GOOGLE_APPLICATION_CREDENTIALS must select the impersonated ADC profile")
+        elif current.credentials_identity:
+            errors.extend(_validate_impersonated_adc_file(adc_path, current.credentials_identity))
+    elif current.credentials_profile == "attached_service_account" and adc_path:
+        errors.append("GOOGLE_APPLICATION_CREDENTIALS must be unset for attached_service_account")
 
     if env.get("CLAUDE_HISTORY_RAG_DB_PATH"):
         errors.append("CLAUDE_HISTORY_RAG_DB_PATH must be unset in production Spanner runtime")

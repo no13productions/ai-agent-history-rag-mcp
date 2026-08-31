@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import google.auth
 from google.auth import credentials
 from google.auth.exceptions import DefaultCredentialsError
+from google.auth.impersonated_credentials import Credentials as ImpersonatedCredentials
 
 GCLOUD_TOKEN_CMD = [
     "gcloud",
@@ -65,17 +66,81 @@ class GcloudCliCredentials(credentials.Credentials):
         return GcloudCliCredentials(scopes)
 
 
-def default_project_and_credentials(scopes: list[str] | tuple[str, ...]):
-    """Resolve project and credentials, falling back to active gcloud auth.
+def _is_impersonated_credentials(candidate: credentials.Credentials) -> bool:
+    """Return whether ADC resolved Google's public impersonated credential type."""
+    return isinstance(candidate, ImpersonatedCredentials)
 
-    ADC remains the preferred path. The fallback lets local developer runs work
-    when `gcloud auth login` exists but `gcloud auth application-default login`
-    has not been configured.
+
+def _validate_production_credentials(
+    candidate: credentials.Credentials,
+    profile: str,
+    expected_service_account: str,
+) -> None:
+    """Bind resolved ADC credentials to the declared keyless production profile."""
+    if not expected_service_account:
+        raise RuntimeError("Production credential identity must be explicit")
+    if profile == "impersonated_service_account":
+        if not _is_impersonated_credentials(candidate):
+            raise RuntimeError(
+                "Production ADC did not resolve impersonated credentials for the declared profile"
+            )
+        actual_identity = getattr(candidate, "service_account_email", "")
+        if actual_identity != expected_service_account:
+            raise RuntimeError(
+                "Production ADC resolved service account "
+                f"{actual_identity!r}; expected {expected_service_account!r}"
+            )
+        return
+    if profile == "attached_service_account":
+        from google.auth.compute_engine.credentials import Credentials as ComputeCredentials
+
+        if not isinstance(candidate, ComputeCredentials):
+            raise RuntimeError(
+                "Production ADC did not resolve attached workload credentials for the "
+                "declared profile"
+            )
+        actual_identity = getattr(candidate, "service_account_email", "")
+        if actual_identity in {"", "default"}:
+            from google.auth.transport.requests import Request
+
+            candidate.refresh(Request())
+            actual_identity = getattr(candidate, "service_account_email", "")
+        if actual_identity != expected_service_account:
+            raise RuntimeError(
+                "Production ADC resolved service account "
+                f"{actual_identity!r}; expected {expected_service_account!r}"
+            )
+        return
+    raise RuntimeError(f"Unsupported production credential profile: {profile!r}")
+
+
+def default_project_and_credentials(
+    scopes: list[str] | tuple[str, ...],
+    *,
+    production: bool = False,
+    credential_profile: str = "",
+    expected_service_account: str = "",
+):
+    """Resolve project and credentials, with a development-only gcloud fallback.
+
+    Production accepts only the declared ADC profile and exact service-account
+    identity. The fallback lets non-production local developer runs work when
+    `gcloud auth login` exists but ADC has not been configured.
     """
     try:
         creds, project = google.auth.default(scopes=scopes)
+        if production:
+            _validate_production_credentials(
+                creds,
+                credential_profile,
+                expected_service_account,
+            )
         return project, creds
     except DefaultCredentialsError as err:
+        if production:
+            raise RuntimeError(
+                "Production Application Default Credentials could not be resolved"
+            ) from err
         project = subprocess.run(
             ["gcloud", "config", "get-value", "project"],
             check=True,
